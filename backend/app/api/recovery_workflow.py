@@ -438,9 +438,9 @@ def _plan_data(db: Session, plan: RecoveryPlan) -> dict[str, Any]:
 def _attempt_aggregate(
     db: Session,
     applicable_students: dict[int, set[int]],
-) -> tuple[int, float | None]:
+) -> tuple[int, float]:
     if not any(applicable_students.values()):
-        return 0, None
+        return 0, 0.0
     plan_scope = or_(*[
         and_(
             RecoveryPlan.subject_id == subject_id,
@@ -474,7 +474,7 @@ def _attempt_aggregate(
     average = (
         round(float(totals[0]) / float(totals[1]) * 100, 1)
         if totals[0] is not None and totals[1]
-        else None
+        else 0.0
     )
     return int(assigned_quizzes), average
 

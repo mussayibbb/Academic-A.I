@@ -1,9 +1,17 @@
 from datetime import date, datetime
 import json
+from pathlib import Path
 
 import pytest
+from alembic import command
+from alembic.config import Config
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from backend.app.config import Settings
+from backend.app.database import Base, get_db
+from backend.app.main import app
 from backend.app.models import (
     Course,
     QuizAttempt,
@@ -19,6 +27,7 @@ from backend.app.models import (
     Teacher,
     User,
 )
+from backend.app.services.auth import hash_password
 from backend.app.services.recovery_quizzes import (
     aggregate_recovery_score,
     is_backlog,
@@ -75,6 +84,73 @@ def test_backlog_detection_normalizes_to_configured_scale():
 def test_recovery_pass_mark_cannot_exceed_the_configured_maximum():
     with pytest.raises(ValueError, match='RECOVERY_PASS_MARK'):
         Settings(recovery_pass_mark=26, recovery_maximum_marks=25)
+
+
+def test_recovery_settings_have_safe_defaults_without_env_file(monkeypatch):
+    for name in (
+        'RECOVERY_PASS_MARK',
+        'RECOVERY_MAXIMUM_MARKS',
+        'RECOVERY_AI_RATE_LIMIT_PER_HOUR',
+    ):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.recovery_pass_mark == 12
+    assert settings.recovery_maximum_marks == 25
+    assert settings.recovery_ai_rate_limit_per_hour == 10
+
+
+def test_freshly_migrated_empty_database_returns_zero_stats_and_no_students(tmp_path, monkeypatch):
+    database_path = tmp_path / 'empty-recovery.sqlite'
+    database_url = f'sqlite:///{database_path.as_posix()}'
+    monkeypatch.setenv('DATABASE_URL', database_url)
+    config_path = Path(__file__).resolve().parents[1] / 'alembic.ini'
+    command.upgrade(Config(str(config_path)), 'head')
+
+    engine = create_engine(database_url, connect_args={'check_same_thread': False})
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    with session_factory() as db:
+        teacher_user = User(
+            email='maya@example.com',
+            full_name='Dr. Maya Chen',
+            role='TEACHER',
+            password_hash=hash_password('local-test-password'),
+        )
+        db.add(teacher_user)
+        db.flush()
+        db.add(Teacher(user_id=teacher_user.id, department='Science'))
+        db.commit()
+
+    original_overrides = app.dependency_overrides.copy()
+
+    def override_get_db():
+        with session_factory() as db:
+            yield db
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        with TestClient(app) as client:
+            login = client.post(
+                '/api/v1/auth/login',
+                json={'email': 'maya@example.com', 'password': 'local-test-password'},
+            )
+            assert login.status_code == 200
+            response = client.get(
+                '/api/v1/teacher/recovery/overview',
+                headers=auth(login.json()['access_token']),
+            )
+        assert response.status_code == 200
+        assert response.json()['stats'] == {
+            'students_with_backlogs': 0,
+            'backlog_subjects': 0,
+            'quizzes_assigned': 0,
+            'average_recovery_score': 0.0,
+        }
+        assert response.json()['subjects'] == []
+        assert response.json()['students'] == []
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(original_overrides)
+        engine.dispose()
 
 
 def test_recovery_score_aggregates_using_attempt_maxima():
