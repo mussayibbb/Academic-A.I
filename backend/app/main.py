@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from backend.app.api.auth import router as auth_router
+from backend.app.api.recovery_workflow import router as recovery_workflow_router
 from backend.app.config import BASE_DIR, get_settings
 from backend.app.core.security import CurrentAdmin, CurrentStudent, CurrentTeacher, CurrentUser, get_current_user
 from backend.app.database import get_db
@@ -209,6 +210,7 @@ app.add_middleware(
     allow_headers=['Authorization', 'Content-Type'],
 )
 app.include_router(auth_router, prefix=settings.api_v1_prefix)
+app.include_router(recovery_workflow_router, prefix=settings.api_v1_prefix)
 
 
 def audit(db: Session, user: User, action: str, resource_type: str, resource_id: int | None = None) -> None:

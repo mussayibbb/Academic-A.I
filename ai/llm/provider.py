@@ -12,6 +12,7 @@ from ai.llm.grounding import (
     build_recovery_blueprint_prompt,
     build_risk_summary_prompt,
     build_short_answer_evaluation_prompt,
+    build_recovery_quiz_prompt,
     build_topic_assessment_prompt,
     build_topic_map_prompt,
 )
@@ -71,6 +72,8 @@ class LLMProvider(Protocol):
     def generate_recovery_tutor(self, context: RecoveryTutorContext) -> str: ...
 
     def generate_topic_assessment(self, context: dict[str, Any]) -> str: ...
+
+    def generate_recovery_quiz(self, context: dict[str, Any]) -> str: ...
 
     def generate_topic_map(self, context: dict[str, Any]) -> str: ...
 
@@ -235,6 +238,26 @@ class LocalLLMProvider:
         generated = result.get('response') if isinstance(result, dict) else None
         if not isinstance(generated, str) or not generated.strip():
             raise RuntimeError('Ollama returned an empty assessment response.')
+        return generated.strip()
+
+    def generate_recovery_quiz(self, context: dict[str, Any]) -> str:
+        health = self.get_health_status()
+        if not health['reachable'] or not health['model_available']:
+            raise RuntimeError(health.get('error') or 'Configured Ollama model is unavailable.')
+        payload = json.dumps({
+            'model': self.model_name,
+            'prompt': build_recovery_quiz_prompt(context),
+            'format': 'json',
+            'options': {'temperature': 0},
+            'stream': False,
+        }).encode('utf-8')
+        try:
+            result = self._request_json('/api/generate', method='POST', payload=payload, timeout=self.timeout_seconds)
+        except (HTTPError, URLError, TimeoutError, OSError, ConnectionError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f'Ollama recovery quiz generation failed: {exc}') from exc
+        generated = result.get('response') if isinstance(result, dict) else None
+        if not isinstance(generated, str) or not generated.strip():
+            raise RuntimeError('Ollama returned an empty recovery quiz response.')
         return generated.strip()
 
     def generate_topic_map(self, context: dict[str, Any]) -> str:
@@ -435,6 +458,9 @@ class GeminiProvider:
     def generate_topic_assessment(self, context: dict[str, Any]) -> str:
         return self._generate_structured(build_topic_assessment_prompt(context), 'assessment generation')
 
+    def generate_recovery_quiz(self, context: dict[str, Any]) -> str:
+        return self._generate_structured(build_recovery_quiz_prompt(context), 'recovery quiz generation')
+
     def generate_topic_map(self, context: dict[str, Any]) -> str:
         return self._generate_structured(build_topic_map_prompt(context), 'topic extraction')
 
@@ -490,6 +516,9 @@ class DevelopmentDraftProvider:
 
     def generate_topic_assessment(self, context: dict[str, Any]) -> str:
         raise RuntimeError('No language-model provider is configured for assessment generation.')
+
+    def generate_recovery_quiz(self, context: dict[str, Any]) -> str:
+        raise RuntimeError('No language-model provider is configured for recovery quiz generation.')
 
     def generate_topic_map(self, context: dict[str, Any]) -> str:
         raise RuntimeError('No language-model provider is configured for topic extraction.')

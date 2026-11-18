@@ -79,6 +79,22 @@ The future-only observation export and readiness report are available at `GET /a
 
 Phase 3 adds teacher-only real-data validation, coverage, deterministic dataset fingerprints, safe candidate CSV export, temporal candidate-training utilities, candidate evaluation/SHAP contracts, and blocked promotion/rollback controls. See [docs/phase3.md](docs/phase3.md). Candidate training is separate from the production model; current measured data does not pass readiness, so no real-data candidate is trained.
 
+## Subject Recovery
+
+The teacher Recovery workspace uses existing classes, subjects, students, and FA-1 marks. Apply the Alembic migrations with `alembic upgrade head`; teachers can then upload text-searchable PDFs to the shared subject module library, review extracted topics and generated quizzes, and assign dated practice. Students see due quizzes on **Student → Recovery**. Assignment notices use the existing in-app notification system.
+
+The defaults are a pass mark of 12 on a 25-mark scale. Configure `RECOVERY_PASS_MARK`, `RECOVERY_MAXIMUM_MARKS`, and `RECOVERY_AI_RATE_LIMIT_PER_HOUR` in `.env` to change the thresholds or per-teacher hourly AI request limit. AI calls run only on the backend, using the configured local Ollama provider or Gemini credentials; keep `GEMINI_API_KEY` private. PDFs without extractable text (including image-only scans) are rejected; OCR is not provided. Quiz validation requires generated answer evidence to occur in the selected module text. Short-answer grading is deterministic and requires a normalized exact match, while multiple-choice answers are graded by option key.
+
+Generation jobs expose queued/running/completed/failed status, poll persisted state, retry failures up to three times, and allow teachers to retry a job that remains stalled beyond the configured provider timeout. They run in FastAPI background tasks rather than a separate durable queue. Focused workflow checks are:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q tests\test_recovery_quizzes.py
+Push-Location frontend
+npm test -- app/teacher/recovery/page.test.tsx components/StudentRecoveryQuizzes.test.tsx
+npm run typecheck
+Pop-Location
+```
+
 ## Research and Demo Interface
 
 The optional Streamlit app calls the existing FastAPI endpoints for faculty authentication, risk distribution, student records, canonical prediction, SHAP explanation, momentum, and intervention drafts. Install its optional dependencies and run from the repository root:

@@ -1,6 +1,6 @@
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     )
     upload_directory: Path = BASE_DIR / 'data' / 'uploads'
     max_upload_size: int = Field(default=10 * 1024 * 1024, ge=1)
+    recovery_pass_mark: float = Field(default=12, gt=0)
+    recovery_maximum_marks: float = Field(default=25, gt=0)
+    recovery_ai_rate_limit_per_hour: int = Field(default=10, ge=1, le=1000)
     llm_model_name: str = Field(default='ollama:qwen3:8b', validation_alias=AliasChoices('LLM_MODEL_NAME'))
     llm_provider: str = Field(default='ollama', validation_alias=AliasChoices('LLM_PROVIDER'))
     ollama_base_url: str = Field(default='http://127.0.0.1:11434', validation_alias=AliasChoices('OLLAMA_BASE_URL', 'LLM_BASE_URL'))
@@ -32,6 +35,12 @@ class Settings(BaseSettings):
     allow_external_tutor_data: bool = Field(default=False, validation_alias=AliasChoices('ALLOW_EXTERNAL_TUTOR_DATA'))
     embedding_model_name: str = 'sentence-transformers/all-MiniLM-L6-v2'
     vector_store_path: Path = BASE_DIR / 'knowledge_base' / 'vector_store'
+
+    @model_validator(mode='after')
+    def validate_recovery_marks(self) -> 'Settings':
+        if self.recovery_pass_mark > self.recovery_maximum_marks:
+            raise ValueError('RECOVERY_PASS_MARK cannot exceed RECOVERY_MAXIMUM_MARKS.')
+        return self
 
     @field_validator('jwt_secret')
     @classmethod

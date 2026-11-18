@@ -882,6 +882,10 @@ class RecoveryTask(Timestamps, Base):
     roadmap_version_id: Mapped[int] = mapped_column(ForeignKey('support_plan_versions.id', ondelete='CASCADE'), index=True)
     student_id: Mapped[int] = mapped_column(ForeignKey('students.id', ondelete='CASCADE'), index=True)
     subject_id: Mapped[int | None] = mapped_column(ForeignKey('subjects.id', ondelete='RESTRICT'), index=True)
+    recovery_plan_id: Mapped[int | None] = mapped_column(ForeignKey('recovery_plans.id', ondelete='CASCADE'), index=True)
+    recovery_topic_id: Mapped[int | None] = mapped_column(ForeignKey('recovery_topics.id', ondelete='CASCADE'), index=True)
+    recovery_quiz_id: Mapped[int | None] = mapped_column(ForeignKey('recovery_quizzes.id', ondelete='CASCADE'), index=True)
+    day_no: Mapped[int | None] = mapped_column(Integer)
     subject_scope_review_required: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     scheduled_date: Mapped[date | None] = mapped_column(Date, index=True)
     source_blueprint_plan_id: Mapped[int | None] = mapped_column(ForeignKey('support_plan_versions.id', ondelete='SET NULL'), index=True)
@@ -1027,6 +1031,121 @@ class Notification(Timestamps, Base):
     read_at: Mapped[datetime | None] = mapped_column(DateTime)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     user: Mapped[User] = relationship(back_populates='notifications')
+
+
+class RecoveryModuleLibrary(Timestamps, Base):
+    __tablename__ = 'module_library'
+    __table_args__ = (
+        UniqueConstraint('subject_id', 'module_no', name='uq_module_library_subject_module'),
+        Index('ix_module_library_subject_status', 'subject_id', 'status'),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subject_id: Mapped[int] = mapped_column(ForeignKey('subjects.id', ondelete='CASCADE'), index=True)
+    module_no: Mapped[int] = mapped_column(Integer)
+    original_filename: Mapped[str] = mapped_column(String(255))
+    file_path: Mapped[str] = mapped_column(String(512))
+    extracted_text: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default='READY', index=True)
+    uploaded_by: Mapped[int] = mapped_column(ForeignKey('teachers.id', ondelete='RESTRICT'), index=True)
+
+
+class RecoveryPlan(Timestamps, Base):
+    __tablename__ = 'recovery_plans'
+    __table_args__ = (
+        UniqueConstraint('student_id', 'subject_id', 'source_exam', name='uq_recovery_plan_student_subject_exam'),
+        Index('ix_recovery_plan_subject_status', 'subject_id', 'status'),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey('students.id', ondelete='CASCADE'), index=True)
+    subject_id: Mapped[int] = mapped_column(ForeignKey('subjects.id', ondelete='RESTRICT'), index=True)
+    source_exam: Mapped[str] = mapped_column(String(20), default='FA-1')
+    marks: Mapped[float] = mapped_column(Float)
+    selected_modules: Mapped[list[int]] = mapped_column(JSON, default=list)
+    topics_per_day: Mapped[int] = mapped_column(Integer, default=3)
+    status: Mapped[str] = mapped_column(String(20), default='draft', index=True)
+    start_date: Mapped[date | None] = mapped_column(Date)
+    created_by: Mapped[int] = mapped_column(ForeignKey('users.id', ondelete='RESTRICT'), index=True)
+    support_plan_version_id: Mapped[int | None] = mapped_column(
+        ForeignKey('support_plan_versions.id', ondelete='SET NULL'),
+        index=True,
+    )
+
+
+class RecoveryTopic(Timestamps, Base):
+    __tablename__ = 'recovery_topics'
+    __table_args__ = (
+        UniqueConstraint('plan_id', 'module_no', 'name', name='uq_recovery_topic_plan_module_name'),
+        Index('ix_recovery_topic_plan_included', 'plan_id', 'included'),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[int] = mapped_column(ForeignKey('recovery_plans.id', ondelete='CASCADE'), index=True)
+    module_no: Mapped[int] = mapped_column(Integer)
+    name: Mapped[str] = mapped_column(String(200))
+    included: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class RecoveryQuiz(Timestamps, Base):
+    __tablename__ = 'recovery_quizzes'
+    __table_args__ = (
+        UniqueConstraint('plan_id', 'quiz_key', name='uq_recovery_quiz_plan_key'),
+        Index('ix_recovery_quiz_plan_topic', 'plan_id', 'topic_id'),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[int] = mapped_column(ForeignKey('recovery_plans.id', ondelete='CASCADE'), index=True)
+    topic_id: Mapped[int | None] = mapped_column(ForeignKey('recovery_topics.id', ondelete='CASCADE'), index=True)
+    quiz_key: Mapped[str] = mapped_column(String(100))
+    questions: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
+    max_score: Mapped[float] = mapped_column(Float, default=10.0, nullable=False)
+
+
+class RecoveryGenerationJob(Timestamps, Base):
+    __tablename__ = 'recovery_generation_jobs'
+    __table_args__ = (
+        UniqueConstraint('idempotency_key', name='uq_recovery_generation_job_idempotency'),
+        Index('ix_recovery_generation_job_plan_status', 'plan_id', 'status'),
+        Index('ix_recovery_generation_job_actor_created', 'created_by', 'created_at'),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[int] = mapped_column(ForeignKey('recovery_plans.id', ondelete='CASCADE'), index=True)
+    kind: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(20), default='queued', index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    idempotency_key: Mapped[str] = mapped_column(String(128))
+    created_by: Mapped[int] = mapped_column(ForeignKey('users.id', ondelete='CASCADE'), index=True)
+
+
+class RecoveryGenerationRateEvent(Base):
+    __tablename__ = 'recovery_generation_rate_events'
+    __table_args__ = (
+        Index('ix_recovery_generation_rate_actor_created', 'user_id', 'created_at'),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.id', ondelete='CASCADE'), index=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey('recovery_generation_jobs.id', ondelete='CASCADE'), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False, index=True)
+
+
+class QuizAttempt(Timestamps, Base):
+    __tablename__ = 'quiz_attempts'
+    __table_args__ = (
+        UniqueConstraint('task_id', 'student_id', name='uq_quiz_attempt_task_student'),
+        Index('ix_quiz_attempt_student_submitted', 'student_id', 'submitted_at'),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey('recovery_tasks.id', ondelete='CASCADE'), index=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey('students.id', ondelete='CASCADE'), index=True)
+    score: Mapped[float] = mapped_column(Float)
+    max_score: Mapped[float] = mapped_column(Float)
+    answers: Mapped[dict[str, str]] = mapped_column(JSON)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime, index=True)
 
 
 class AuditLog(Timestamps, Base):
