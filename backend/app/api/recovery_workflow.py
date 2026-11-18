@@ -132,11 +132,15 @@ def _teacher_subject(db: Session, teacher: Teacher, subject_id: int) -> Subject:
     subject = db.query(Subject).filter(Subject.id == subject_id).first()
     if subject is None:
         raise HTTPException(status_code=404, detail='Subject not found.')
-    if db.query(Course.id).filter(
+    course_exists = db.query(Course.id).filter(
         Course.teacher_id == teacher.id,
         Course.subject_id == subject_id,
-    ).first() is None:
-        raise HTTPException(status_code=404, detail='Subject is not available in your classes.')
+    ).first() is not None
+    if not course_exists:
+        _, students = _teacher_scope(db, teacher)
+        student_ids = [student.id for student in students]
+        if subject_id not in _fa1_subject_ids(db, student_ids):
+            raise HTTPException(status_code=404, detail='Subject is not available in your classes.')
     return subject
 
 
@@ -171,7 +175,7 @@ def _teacher_student_subject(
         course_query = course_query.filter(Course.section == student.section)
     else:
         course_query = course_query.filter(False)
-    if course_query.first() is None:
+    if course_query.first() is None and not _fa1_values(db, [student.id], [subject_id]):
         raise HTTPException(status_code=404, detail='Student is not assigned to this subject in your classes.')
 
 
@@ -184,6 +188,34 @@ def _teacher_scope(db: Session, teacher: Teacher) -> tuple[list[Course], list[St
         assigned_students.append(and_(Student.course_id.is_(None), Student.section.in_(sections)))
     students = db.query(Student).filter(or_(*assigned_students)).order_by(Student.full_name, Student.id).all() if assigned_students else []
     return courses, students
+
+
+def _fa1_subject_ids(db: Session, student_ids: list[int]) -> list[int]:
+    if not student_ids:
+        return []
+    subject_ids = {
+        subject_id
+        for (subject_id,) in db.query(StudentSubjectAcademicRecord.subject_id).filter(
+            StudentSubjectAcademicRecord.student_id.in_(student_ids),
+            StudentSubjectAcademicRecord.fa1.is_not(None),
+        ).distinct().all()
+    }
+    assessment_rows = db.query(Course.subject_id, Assessment.title).join(
+        Assessment,
+        Assessment.course_id == Course.id,
+    ).join(
+        Mark,
+        Mark.assessment_id == Assessment.id,
+    ).filter(
+        Mark.student_id.in_(student_ids),
+        Course.subject_id.is_not(None),
+    ).all()
+    subject_ids.update(
+        subject_id
+        for subject_id, title in assessment_rows
+        if title and _FIRST_INTERNAL_ASSESSMENT.search(title)
+    )
+    return sorted(subject_ids)
 
 
 def _fa1_values(
@@ -382,19 +414,28 @@ def _backlog_aggregate(
 
 
 def _module_list(db: Session, subject_ids: list[int]) -> dict[int, list[dict[str, Any]]]:
-    by_subject: dict[int, list[dict[str, Any]]] = {subject_id: [] for subject_id in subject_ids}
+    by_subject: dict[int, list[dict[str, Any]]] = {
+        subject_id: [{
+            'module_no': module_no,
+            'status': 'EMPTY',
+            'filename': '',
+            'uploaded': False,
+        } for module_no in range(1, 6)]
+        for subject_id in subject_ids
+    }
     if not subject_ids:
         return by_subject
     modules = db.query(RecoveryModuleLibrary).filter(
         RecoveryModuleLibrary.subject_id.in_(subject_ids),
+        RecoveryModuleLibrary.module_no.in_((1, 2, 3, 4, 5)),
     ).order_by(RecoveryModuleLibrary.subject_id, RecoveryModuleLibrary.module_no).all()
     for module in modules:
-        by_subject[module.subject_id].append({
+        by_subject[module.subject_id][module.module_no - 1] = {
             'module_no': module.module_no,
             'status': module.status,
             'filename': module.original_filename,
             'uploaded': module.status == 'READY' and bool(module.extracted_text),
-        })
+        }
     return by_subject
 
 
@@ -485,44 +526,38 @@ def teacher_recovery_overview(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     teacher = _teacher(db, user)
-    courses, students = _teacher_scope(db, teacher)
+    _, students = _teacher_scope(db, teacher)
     student_ids = [student.id for student in students]
-    subject_ids = sorted({course.subject_id for course in courses if course.subject_id is not None})
+    subject_ids = _fa1_subject_ids(db, student_ids)
     subjects = db.query(Subject).filter(Subject.id.in_(subject_ids)).order_by(Subject.name).all() if subject_ids else []
     subject_by_id = {subject.id: subject for subject in subjects}
     values = _fa1_values(db, student_ids, subject_ids)
     student_subjects: dict[int, list[dict[str, Any]]] = {student.id: [] for student in students}
     applicable_students: dict[int, set[int]] = {subject_id: set() for subject_id in subject_ids}
-    for course in courses:
-        if course.subject_id is None:
-            continue
-        for student in students:
-            if student.course_id == course.id or (
-                student.course_id is None and course.section and student.section == course.section
-            ):
-                applicable_students[course.subject_id].add(student.id)
+    for student_id, subject_id in values:
+        applicable_students[subject_id].add(student_id)
     plan_rows = db.query(RecoveryPlan).filter(
         RecoveryPlan.student_id.in_(student_ids),
         RecoveryPlan.subject_id.in_(subject_ids),
         RecoveryPlan.source_exam == 'FA-1',
     ).all() if student_ids and subject_ids else []
     plans = {(plan.student_id, plan.subject_id): plan for plan in plan_rows}
-    for subject_id in subject_ids:
-        subject = subject_by_id[subject_id]
-        for student_id in applicable_students[subject_id]:
-            value = values.get((student_id, subject_id))
-            plan = plans.get((student_id, subject_id))
-            student_subjects[student_id].append({
-                'id': subject_id,
-                'name': subject.name,
-                'code': subject.code,
-                'fa1': value['score'] if value else None,
-                'maximum': value['maximum'] or settings.recovery_maximum_marks if value else settings.recovery_maximum_marks,
-                'academic_period': value['period'] if value else None,
-                'backlog': _is_below_pass(value),
-                'evidence_source': value['source'] if value else None,
-                'plan': _plan_data(db, plan) if plan else None,
-            })
+    for (student_id, subject_id), value in values.items():
+        subject = subject_by_id.get(subject_id)
+        if subject is None:
+            continue
+        plan = plans.get((student_id, subject_id))
+        student_subjects[student_id].append({
+            'id': subject_id,
+            'name': subject.name,
+            'code': subject.code,
+            'fa1': value['score'],
+            'maximum': value['maximum'] or settings.recovery_maximum_marks,
+            'academic_period': value['period'],
+            'backlog': _is_below_pass(value),
+            'evidence_source': value['source'],
+            'plan': _plan_data(db, plan) if plan else None,
+        })
     for student in students:
         student_subjects[student.id].sort(key=lambda item: item['name'].casefold())
     students_with_backlogs, backlog_subjects = _backlog_aggregate(db, applicable_students)

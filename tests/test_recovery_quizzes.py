@@ -99,6 +99,79 @@ def test_recovery_settings_have_safe_defaults_without_env_file(monkeypatch):
     assert settings.recovery_ai_rate_limit_per_hour == 10
 
 
+def test_overview_uses_every_fa1_subject_for_marks_backlogs_and_library(client, teacher_token):
+    student_id, biology_id = add_recovery_class(client)
+    factory = client.app.state.test_session_factory
+    with factory() as db:
+        db.query(StudentSubjectAcademicRecord).filter_by(
+            student_id=student_id,
+            subject_id=biology_id,
+        ).one().fa1 = 9
+        chemistry = Subject(name='Chemistry', code='CHEM-REC', department='Science')
+        physics = Subject(name='Physics', code='PHYS-REC', department='Science')
+        db.add_all([chemistry, physics])
+        db.flush()
+        db.add_all([
+            StudentSubjectAcademicRecord(
+                student_id=student_id,
+                subject_id=chemistry.id,
+                academic_period='2026-S1',
+                fa1=14,
+                fa1_maximum_marks=25,
+                fa1_maximum_verified=True,
+            ),
+            StudentSubjectAcademicRecord(
+                student_id=student_id,
+                subject_id=physics.id,
+                academic_period='2026-S1',
+                fa1=11,
+                fa1_maximum_marks=25,
+                fa1_maximum_verified=True,
+            ),
+        ])
+        db.commit()
+        physics_id = physics.id
+
+    response = client.get('/api/v1/teacher/recovery/overview', headers=auth(teacher_token))
+    assert response.status_code == 200
+    data = response.json()
+    assert {subject['code'] for subject in data['subjects']} == {
+        'BIO-REC',
+        'CHEM-REC',
+        'PHYS-REC',
+    }
+    assert all(
+        [module['module_no'] for module in subject['modules']] == [1, 2, 3, 4, 5]
+        for subject in data['subjects']
+    )
+    assert all(not module['uploaded'] for subject in data['subjects'] for module in subject['modules'])
+
+    assert len(data['students']) == 1
+    subjects = {subject['code']: subject for subject in data['students'][0]['subjects']}
+    assert {
+        code: (subject['fa1'], subject['maximum'], subject['backlog'])
+        for code, subject in subjects.items()
+    } == {
+        'BIO-REC': (9, 25, True),
+        'CHEM-REC': (14, 25, False),
+        'PHYS-REC': (11, 25, True),
+    }
+    assert data['stats'] == {
+        'students_with_backlogs': 1,
+        'backlog_subjects': 2,
+        'quizzes_assigned': 0,
+        'average_recovery_score': 0.0,
+    }
+
+    plan_response = client.post(
+        f'/api/v1/teacher/recovery/students/{student_id}/subjects/{physics_id}/plans',
+        json={},
+        headers=auth(teacher_token),
+    )
+    assert plan_response.status_code == 200
+    assert plan_response.json()['marks'] == 11
+
+
 def test_freshly_migrated_empty_database_returns_zero_stats_and_no_students(tmp_path, monkeypatch):
     database_path = tmp_path / 'empty-recovery.sqlite'
     database_url = f'sqlite:///{database_path.as_posix()}'
@@ -373,7 +446,7 @@ def test_teacher_overview_aggregates_real_backlogs_and_quiz_attempts(client, tea
     }
 
 
-def test_backlog_aggregates_only_for_subjects_enrolled_in_by_each_student(client, teacher_token):
+def test_backlog_aggregates_all_fa1_subjects_for_students_in_teacher_classes(client, teacher_token):
     student_id, biology_id = add_recovery_class(client)
     other_student_id = client.app.state.test_other_student_id
     with client.app.state.test_session_factory() as db:
@@ -437,9 +510,9 @@ def test_backlog_aggregates_only_for_subjects_enrolled_in_by_each_student(client
 
     response = client.get('/api/v1/teacher/recovery/overview', headers=auth(teacher_token))
     assert response.status_code == 200
-    assert response.json()['stats']['students_with_backlogs'] == 1
-    assert response.json()['stats']['backlog_subjects'] == 1
-    assert response.json()['stats']['quizzes_assigned'] == 0
+    assert response.json()['stats']['students_with_backlogs'] == 2
+    assert response.json()['stats']['backlog_subjects'] == 3
+    assert response.json()['stats']['quizzes_assigned'] == 1
 
 
 def test_student_cannot_update_teacher_recovery_plan(client, teacher_token, student_token):

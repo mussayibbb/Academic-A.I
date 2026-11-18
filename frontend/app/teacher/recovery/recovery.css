@@ -114,7 +114,7 @@
 .recovery-button:hover:not(:disabled) { transform: translateY(-1px); border-color: var(--rec-red); }
 .recovery-button--primary { border-color: var(--rec-red); background: var(--rec-red); color: #fff !important; }
 .recovery-button:disabled { cursor: not-allowed; opacity: .55; }
-.recovery-search { width: 100%; margin-top: .55rem; border: 1px solid var(--rec-line); border-radius: .65rem; background: var(--rec-soft); padding: .65rem .75rem; }
+.recovery-page .recovery-search { width: 100%; margin-top: .55rem; border: 1px solid var(--rec-line); border-radius: .65rem; background: var(--rec-soft); padding: .65rem .75rem .65rem 2.5rem; }
 .recovery-hidden-file { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; clip-path: inset(50%); }
 
 @media (max-width: 900px) {
