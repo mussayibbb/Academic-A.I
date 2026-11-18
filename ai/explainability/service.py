@@ -49,7 +49,9 @@ def explain_student(features: dict[str, float], artifact_path: Path = DEFAULT_AR
     explanation, _ = _explain(frame, artifact_path, target_class)
     ranked = sorted(explanation['contributions'].items(), key=lambda item: abs(item[1]), reverse=True)
     explanation['summary'] = [
-        f'{name.replace("_", " ").capitalize()} increased the predicted risk.' if contribution > 0 else f'{name.replace("_", " ").capitalize()} reduced the predicted risk.'
+        f'{name.replace("_", " ").capitalize()} increased P({explanation["target_class"]}).' if contribution > 0
+        else f'{name.replace("_", " ").capitalize()} reduced P({explanation["target_class"]}).' if contribution < 0
+        else f'{name.replace("_", " ").capitalize()} did not change P({explanation["target_class"]}) in this explanation.'
         for name, contribution in ranked[:5]
     ]
     explanation['waterfall'] = [

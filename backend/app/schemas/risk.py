@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic import StrictInt
 from typing import Literal
 
@@ -94,13 +94,37 @@ class Phase3PolicyApprovalRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     explicit_approval: bool
-    aggregation_strategy: Literal['equal_subject_mean']
-    feature_contract: list[Literal['fa1_mean', 'fa2_mean', 'assignment_mean', 'attendance_mean']] = Field(min_length=1, max_length=4)
+    aggregation_strategy: Literal['equal_subject_mean', 'production_feature_snapshot']
+    feature_contract: list[str] = Field(min_length=1, max_length=10)
     approval_note: str = Field(min_length=10, max_length=1000)
+
+    @model_validator(mode='after')
+    def validate_contract(self):
+        if len(self.feature_contract) != len(set(self.feature_contract)):
+            raise ValueError('The feature contract cannot contain duplicates.')
+        if self.aggregation_strategy == 'equal_subject_mean':
+            supported = {'fa1_mean', 'fa2_mean', 'assignment_mean', 'attendance_mean'}
+            if not set(self.feature_contract) <= supported:
+                raise ValueError('equal_subject_mean supports only the four subject aggregate features.')
+        elif self.feature_contract != FEATURES:
+            raise ValueError('production_feature_snapshot requires the exact ordered live production feature contract.')
+        return self
 
 
 class Phase3TrainingRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
-    aggregation_strategy: Literal['equal_subject_mean']
-    feature_contract: list[Literal['fa1_mean', 'fa2_mean', 'assignment_mean', 'attendance_mean']] = Field(min_length=1)
+    aggregation_strategy: Literal['equal_subject_mean', 'production_feature_snapshot']
+    feature_contract: list[str] = Field(min_length=1, max_length=10)
+
+    @model_validator(mode='after')
+    def validate_contract(self):
+        if len(self.feature_contract) != len(set(self.feature_contract)):
+            raise ValueError('The feature contract cannot contain duplicates.')
+        if self.aggregation_strategy == 'equal_subject_mean':
+            supported = {'fa1_mean', 'fa2_mean', 'assignment_mean', 'attendance_mean'}
+            if not set(self.feature_contract) <= supported:
+                raise ValueError('equal_subject_mean supports only the four subject aggregate features.')
+        elif self.feature_contract != FEATURES:
+            raise ValueError('production_feature_snapshot requires the exact ordered live production feature contract.')
+        return self

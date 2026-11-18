@@ -6,7 +6,7 @@ import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
-import { Empty, ErrorNotice, PageHeading } from '@/components/ui';
+import { Empty, ErrorNotice, Metric, PageHeading } from '@/components/ui';
 import { api } from '@/lib/api';
 
 const assignmentSchema = z.object({
@@ -88,8 +88,15 @@ export default function TeacherAssignmentsPage() {
     catch (requestError) { setError((requestError as Error).message); }
   };
 
+  const publishedCount = assignments.filter((item) => item.status === 'active').length;
+  const draftCount = assignments.filter((item) => item.status === 'draft').length;
   return <div className="fade-up">
     <PageHeading eyebrow="Coursework · faculty" title="Assignments" description="Create coursework and follow each submission through review." action={<span className="rounded-full border border-emerald-200/15 bg-emerald-200/5 px-3 py-1.5 text-[10px] font-semibold tracking-[.1em] text-emerald-100">DEMO DATA</span>} />
+    <section aria-label="Assignment summary" className="mb-4 grid gap-3 sm:grid-cols-3">
+      <Metric label="Course assignments" value={assignments.length} detail="Records available in this workspace" color="amber" />
+      <Metric label="Published" value={publishedCount} detail="Visible to eligible students" color="rose" />
+      <Metric label="Drafts" value={draftCount} detail="Not yet published" color="mint" />
+    </section>
     {error && <div className="mb-4"><ErrorNotice message={error} /></div>}{notice && <div role="status" className="mb-4 rounded-lg border border-emerald-200/20 bg-emerald-200/5 px-4 py-3 text-sm text-emerald-100">{notice}</div>}
     <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1.35fr)_minmax(330px,.65fr)]">
       <section className="surface rounded-xl p-4 sm:p-5"><div className="mb-4 flex items-center justify-between"><h2 className="text-sm font-semibold">Course assignments</h2><span className="text-xs text-slate-500">{assignments.length} total</span></div><div className="space-y-2">{assignments.map((item) => <article key={item.id} className="rounded-lg border border-white/7 bg-black/10 p-4"><div className="flex flex-wrap items-start justify-between gap-3"><div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><h3 className="font-medium text-white">{item.title}</h3><span className={`rounded-full px-2 py-1 text-[9px] uppercase tracking-[.1em] ${item.status === 'active' ? 'bg-emerald-300/10 text-emerald-100' : item.status === 'archived' ? 'bg-slate-500/15 text-slate-400' : 'bg-amber-200/10 text-amber-100'}`}>{item.status}</span></div><p className="mt-1 text-xs text-slate-500">{item.course ?? item.subject}{item.section ? ` · Section ${item.section}` : ' · All students'} · {item.max_marks} marks</p><p className="mt-2 text-[11px] text-slate-400">Due {item.due_date ? new Date(item.due_date).toLocaleString() : 'not scheduled'} · {item.allowed_file_types.join(', ')}</p></div><Link href={`/teacher/assignments/${item.id}/submissions`} className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-cyan-200/20 px-2.5 py-2 text-[10px] text-cyan-100 hover:bg-cyan-200/5"><UsersRound size={13} /> Review submissions</Link></div><div className="mt-4 flex flex-wrap gap-2 border-t border-white/6 pt-3"><button type="button" onClick={() => edit(item)} className="inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-[10px] text-slate-300 hover:bg-white/5"><Pencil size={12} /> Edit</button><button type="button" onClick={() => void duplicate(item)} className="inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-[10px] text-slate-300 hover:bg-white/5"><Copy size={12} /> Duplicate</button>{item.status === 'active' ? <button type="button" onClick={() => void setStatus(item, 'archived')} className="inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-[10px] text-amber-100 hover:bg-white/5"><Archive size={12} /> Archive</button> : <button type="button" onClick={() => void setStatus(item, 'active')} className="inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-[10px] text-emerald-100 hover:bg-white/5"><Send size={12} /> Publish</button>}</div></article>)}{!assignments.length && <Empty title="No assignments yet" detail="Create the first course task using the form." />}</div></section>

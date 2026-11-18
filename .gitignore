@@ -1,24 +1,26 @@
-node_modules
-.next
-out
-coverage
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
 .pytest_cache/
 .mypy_cache/
-.ruff_cache/
-*.tsbuildinfo
-.env
-.env.local
-*.pyc
-__pycache__/
-.venv
-venv
-*.sqlite3
-.DS_Store
-backend/data/*.db
-data/uploads/
-data/processed/DSstudents_processed.csv
-knowledge_base/vector_store/
-models/risk/*.joblib
-models/risk/*.metrics.json
-frontend/.next
-frontend/node_modules
+
+# Node.js
+node_modules/
+frontend/node_modules/
+
+# Next.js
+.next/
+out/
+.turbo/
+
+
+# Logs and caches
+*.log
+npm-debug.log*
+.cache/
+
+# Database backups
+*.db.bak
+*.sqlite3.bak

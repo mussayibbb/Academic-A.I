@@ -1,9 +1,10 @@
 'use client';
 
-import { Activity, Download, Info } from 'lucide-react';
+import { Activity, ArrowRight, Info } from 'lucide-react';
+import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
-import { ErrorNotice, Metric, PageHeading, RiskBadge } from '@/components/ui';
+import { Empty, ErrorNotice, Metric, PageHeading, RiskBadge } from '@/components/ui';
 import { api } from '@/lib/api';
 
 type Dashboard = { summary: { students: number; high_risk: number; medium_risk: number; low_risk: number } };
@@ -15,12 +16,63 @@ export default function TeacherAnalyticsPage() {
   const [importance, setImportance] = useState<Importance | null>(null);
   const [monitor, setMonitor] = useState<Monitor | null>(null);
   const [error, setError] = useState('');
-  useEffect(() => { Promise.all([api<Dashboard>('/api/v1/dashboard/teacher'), api<Importance>('/api/v1/risk/feature-importance'), api<Monitor>('/api/v1/risk/monitoring')]).then(([summary, factors, risk]) => { setDashboard(summary); setImportance(factors); setMonitor(risk); }).catch((requestError: Error) => setError(requestError.message)); }, []);
+
+  useEffect(() => {
+    Promise.all([
+      api<Dashboard>('/api/v1/dashboard/teacher'),
+      api<Importance>('/api/v1/risk/feature-importance'),
+      api<Monitor>('/api/v1/risk/monitoring'),
+    ]).then(([summary, factors, risk]) => {
+      setDashboard(summary);
+      setImportance(factors);
+      setMonitor(risk);
+    }).catch((requestError: Error) => setError(requestError.message));
+  }, []);
+
   if (error) return <ErrorNotice message={error} />;
-  if (!dashboard || !importance || !monitor) return <div className="skeleton h-96 rounded-xl" />;
-  return <div className="fade-up"><PageHeading eyebrow="Academic signals · demo model" title="Analytics" description="Explainable indicators that help faculty decide where to look more closely." />
-    <div className="grid gap-3 sm:grid-cols-3"><Metric label="Students represented" value={dashboard.summary.students} detail="Fictional demo records" color="cyan" /><Metric label="Model-elevated" value={dashboard.summary.high_risk + dashboard.summary.medium_risk} detail="Current saved student levels" color="amber" /><Metric label="Recorded transitions" value={monitor.transitions.length} detail="Between consecutive snapshots" color="mint" /></div>
-    <div className="mt-4 grid gap-4 xl:grid-cols-[1.1fr_.9fr]"><section className="surface rounded-xl p-5"><div className="flex items-start justify-between gap-3"><div><h2 className="text-sm font-semibold">Global feature contribution</h2><p className="mt-1 text-xs text-slate-500">Mean absolute SHAP value from the trained model.</p></div><Activity size={16} className="text-cyan-200" /></div><div className="mt-5 h-[340px]"><ResponsiveContainer width="100%" height="100%"><BarChart data={importance.features} layout="vertical" margin={{ left: 12, right: 20, top: 4, bottom: 4 }}><CartesianGrid stroke="rgba(148,167,189,.1)" horizontal={false} /><XAxis type="number" tick={{ fill: '#71839a', fontSize: 10 }} axisLine={false} tickLine={false} /><YAxis type="category" dataKey="name" width={132} tickFormatter={(value: string) => value.replaceAll('_', ' ')} tick={{ fill: '#a1b0c3', fontSize: 10 }} axisLine={false} tickLine={false} /><Tooltip contentStyle={{ background: '#101929', border: '1px solid #26364d', borderRadius: 8, fontSize: 11 }} /><Bar dataKey="importance" fill="#65d7df" radius={[0, 4, 4, 0]} /></BarChart></ResponsiveContainer></div><div className="mt-3 flex gap-2 rounded-lg border border-indigo-200/10 bg-indigo-200/[.03] p-3 text-[10px] leading-5 text-slate-500"><Info size={13} className="mt-0.5 shrink-0 text-indigo-100" />Feature contributions describe this trained demonstration model; they are not causal findings or validated institutional thresholds.</div></section>
-      <section className="surface rounded-xl p-5"><h2 className="text-sm font-semibold">Recent risk transitions</h2><p className="mt-1 text-xs text-slate-500">Snapshot-to-snapshot changes for faculty review.</p><div className="mt-4 space-y-2">{monitor.transitions.slice(-12).reverse().map((item, index) => <div key={`${item.name}-${index}`} className="flex items-center gap-3 border-t border-white/6 py-3"><div className="min-w-0 flex-1"><div className="truncate text-xs font-medium text-slate-200">{item.name}</div><div className="mt-1 text-[10px] text-slate-500">{new Date(item.recorded_at).toLocaleDateString()}</div></div><div className="flex items-center gap-1"><RiskBadge level={item.from} /><span className="text-slate-600">→</span><RiskBadge level={item.to} /></div></div>)}{!monitor.transitions.length && <p className="py-6 text-xs text-slate-500">No risk transitions have been recorded.</p>}</div></section></div>
+  if (!dashboard || !importance || !monitor) return <div aria-label="Loading analytics" className="space-y-4"><div className="skeleton h-32 rounded-xl" /><div className="skeleton h-96 rounded-xl" /></div>;
+
+  const elevated = dashboard.summary.high_risk + dashboard.summary.medium_risk;
+  return <div className="page-content">
+    <PageHeading eyebrow="Academic signals · demonstration model" title="Analytics" description="Explainable indicators help faculty decide where to look more closely." action={<Link href="/teacher/risk-monitoring" className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-white/10 px-3 text-xs text-slate-200 transition hover:border-rose-300/30 hover:text-white">Risk history <ArrowRight size={14} /></Link>} />
+
+    <section aria-label="Analytics summary" className="mb-4 grid gap-3 sm:grid-cols-3">
+      <Metric label="Students represented" value={dashboard.summary.students} detail="Current saved student records" color="amber" />
+      <Metric label="Elevated classifications" value={elevated} detail="High or medium · review signals" color="rose" />
+      <Metric label="Recorded transitions" value={monitor.transitions.length} detail="Between consecutive snapshots" color="amber" />
+    </section>
+
+    <div className="grid gap-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(300px,.9fr)]">
+      <section aria-labelledby="importance-heading" className="surface min-w-0 rounded-xl p-5 sm:p-6">
+        <div className="flex items-start justify-between gap-3">
+          <div><p className="eyebrow">Model explainability</p><h2 id="importance-heading" className="mt-1 text-base font-semibold text-white">Global feature contribution</h2><p className="mt-1 text-xs text-slate-500">Mean absolute SHAP value from the trained model.</p></div>
+          <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-rose-300/15 bg-rose-300/[.05] text-rose-200"><Activity size={16} /></span>
+        </div>
+        {importance.features.length ? <div role="img" aria-label="Bar chart of global model feature contribution" className="mt-5 h-[340px]">
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={importance.features} layout="vertical" margin={{ left: 12, right: 20, top: 4, bottom: 4 }}>
+              <CartesianGrid stroke="rgba(255,255,255,.08)" horizontal={false} />
+              <XAxis type="number" tick={{ fill: '#9299a2', fontSize: 10 }} axisLine={false} tickLine={false} />
+              <YAxis type="category" dataKey="name" width={132} tickFormatter={(value: string) => value.replaceAll('_', ' ')} tick={{ fill: '#d1d4d8', fontSize: 10 }} axisLine={false} tickLine={false} />
+              <Tooltip contentStyle={{ background: '#25282d', border: '1px solid #454a52', borderRadius: 8, color: '#f7f8fa', fontSize: 11 }} />
+              <Bar dataKey="importance" fill="#e11d32" radius={[0, 4, 4, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div> : <div className="py-8"><Empty title="Feature contributions unavailable" detail="No model feature contribution values were returned." /></div>}
+        <div className="mt-3 flex gap-2 rounded-lg border border-white/[.08] bg-white/[.025] p-3 text-[10px] leading-5 text-slate-400"><Info size={13} className="mt-0.5 shrink-0 text-rose-200" />Feature contributions describe this trained demonstration model. They are not causal findings or validated institutional thresholds.</div>
+      </section>
+
+      <section aria-labelledby="transitions-heading" className="surface rounded-xl p-5 sm:p-6">
+        <p className="eyebrow">Recorded snapshots</p><h2 id="transitions-heading" className="mt-1 text-base font-semibold text-white">Recent risk transitions</h2><p className="mt-1 text-xs text-slate-500">Snapshot-to-snapshot changes for faculty review.</p>
+        <div className="mt-4 divide-y divide-white/[.07]">
+          {monitor.transitions.slice(-12).reverse().map((item, index) => <div key={`${item.name}-${index}`} className="flex items-center gap-3 py-3 first:pt-0">
+            <div className="min-w-0 flex-1"><div className="truncate text-xs font-medium text-slate-200">{item.name}</div><div className="mt-1 text-[10px] text-slate-500">{new Date(item.recorded_at).toLocaleDateString()}</div></div>
+            <div className="flex shrink-0 items-center gap-1"><RiskBadge level={item.from} /><span aria-hidden="true" className="text-slate-600">→</span><RiskBadge level={item.to} /></div>
+          </div>)}
+          {!monitor.transitions.length && <div className="py-6"><Empty title="No risk transitions yet" detail="Changes will appear when consecutive risk snapshots are recorded." /></div>}
+        </div>
+        <Link href="/teacher/risk-monitoring" className="mt-3 inline-flex min-h-10 items-center gap-2 border-t border-white/[.07] pt-3 text-xs text-rose-200 transition hover:text-white">Explore risk monitoring <ArrowRight size={14} /></Link>
+      </section>
+    </div>
   </div>;
 }

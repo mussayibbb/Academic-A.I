@@ -1,19 +1,31 @@
 'use client';
 
 import { BookOpenCheck } from 'lucide-react';
+import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import { Empty, ErrorNotice, PageHeading } from '@/components/ui';
+import StudentRecoveryRoadmapCards from '@/components/StudentRecoveryRoadmapCards';
 import { api } from '@/lib/api';
 
-type Subject = { course: string; course_code: string; section?: string; subject: string; teacher?: string | null; attendance?: number | null; assessments: { assessment: string; score?: number | null; maximum: number; recorded_at?: string | null }[] };
+type Subject = { course: string; course_code: string; subject_id?: number | null; section?: string; subject: string; teacher?: string | null; attendance?: number | null; assessments: { assessment: string; score?: number | null; maximum: number; recorded_at?: string | null }[] };
 type AcademicSubject = { name: string; fa1: number | null; fa2: number | null; fa_average: number | null; assignment_mark: number | null; internal_mark: number | null; attendance_rate: number | null };
 type AcademicRecords = { subjects: Record<string, AcademicSubject>; total_internal: number | null; average_internal: number | null; academic_period: string | null; academic_periods: string[] };
+type SubjectWorkspace = { id: number; code: string; name: string; status: string };
+type SubjectFocus = { subjects: SubjectWorkspace[] };
 
 export default function StudentSubjectsPage() {
   const [subjects, setSubjects] = useState<Subject[]>([]);
   const [academic, setAcademic] = useState<AcademicRecords | null>(null);
+  const [workspaces, setWorkspaces] = useState<SubjectWorkspace[]>([]);
   const [error, setError] = useState('');
-  useEffect(() => { Promise.all([api<Subject[]>('/api/v1/subjects/me'), api<AcademicRecords>('/api/v1/students/me/academic-records')]).then(([courseSubjects, records]) => { setSubjects(courseSubjects); setAcademic(records); }).catch((requestError: Error) => setError(requestError.message)); }, []);
+  useEffect(() => {
+    Promise.all([api<Subject[]>('/api/v1/subjects/me'), api<AcademicRecords>('/api/v1/students/me/academic-records')])
+      .then(([courseSubjects, records]) => { setSubjects(courseSubjects); setAcademic(records); })
+      .catch((requestError: Error) => setError(requestError.message));
+    api<SubjectFocus>('/api/v1/students/me/subject-focus')
+      .then((result) => setWorkspaces(result.subjects))
+      .catch((requestError: Error) => setError(requestError.message));
+  }, []);
   const changePeriod = async (period: string) => {
     try {
       const query = period ? `?academic_period=${encodeURIComponent(period)}` : '';
@@ -23,6 +35,7 @@ export default function StudentSubjectsPage() {
   return (
     <div className="fade-up">
       <PageHeading eyebrow="Your study plan" title="Subjects" description="Subject-wise marks and course records visible only to your student account." />
+      <div className="mb-5"><StudentRecoveryRoadmapCards /></div>
       {academic && <label className="mb-4 block max-w-xs text-xs text-slate-400">Academic period<select value={academic.academic_period ?? ''} onChange={(event) => void changePeriod(event.target.value)} className="form-input"><option value="">No period records</option>{academic.academic_periods.map((period) => <option key={period} value={period}>{period}</option>)}</select></label>}
       {error && <ErrorNotice message={error} />}
       {academic && <section className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3">
@@ -31,12 +44,16 @@ export default function StudentSubjectsPage() {
         <div className="surface rounded-lg p-4 col-span-2 sm:col-span-1"><div className="text-xs text-slate-500">Risk model scope</div><div className="mt-2 text-xs text-slate-300">Global; these marks are academic context.</div></div>
       </section>}
       <div className="grid gap-4 lg:grid-cols-2">
-        {academic && Object.entries(academic.subjects).map(([code, item]) => <section key={code} className="surface rounded-xl p-5">
-          <div className="flex items-center gap-3"><span className="grid size-9 place-items-center rounded-lg bg-cyan-200/10 text-cyan-100"><BookOpenCheck size={17} /></span><div><h2 className="text-sm font-semibold text-white">{code} · {item.name}</h2><p className="mt-1 text-[10px] text-slate-500">Formative marks are not inputs to the current global risk model.</p></div></div>
-          <div className="mt-4 grid grid-cols-3 gap-2 text-xs">{[['FA1 /25', item.fa1], ['FA2 /25', item.fa2], ['FA average /25', item.fa_average], ['Assignment /25', item.assignment_mark], ['Internal /50', item.internal_mark], ['Attendance', item.attendance_rate == null ? null : `${item.attendance_rate}%`]].map(([label, value]) => <div key={label} className="border-t border-white/8 py-2"><div className="text-[10px] text-slate-500">{label}</div><div className="mt-1 text-slate-100">{value == null ? 'Not available' : value}</div></div>)}</div>
-        </section>)}
+        {academic && Object.entries(academic.subjects).map(([code, item]) => {
+          const workspace = workspaces.find((candidate) => candidate.code === code);
+          return <section key={code} className="surface rounded-xl p-5">
+            <div className="flex items-center gap-3"><span className="grid size-9 place-items-center rounded-lg bg-cyan-200/10 text-cyan-100"><BookOpenCheck size={17} /></span><div><h2 className="text-sm font-semibold text-white">{code} · {item.name}</h2><p className="mt-1 text-[10px] text-slate-500">Formative marks are not inputs to the current global risk model.</p></div></div>
+            <div className="mt-4 grid grid-cols-3 gap-2 text-xs">{[['FA1 /25', item.fa1], ['FA2 /25', item.fa2], ['FA average /25', item.fa_average], ['Assignment /25', item.assignment_mark], ['Internal /50', item.internal_mark], ['Attendance', item.attendance_rate == null ? null : `${item.attendance_rate}%`]].map(([label, value]) => <div key={label} className="border-t border-white/8 py-2"><div className="text-[10px] text-slate-500">{label}</div><div className="mt-1 text-slate-100">{value == null ? 'Not available' : value}</div></div>)}</div>
+            {workspace && <Link href={`/student/subjects/${workspace.id}`} className="mt-4 inline-flex min-h-9 items-center gap-2 rounded-lg bg-rose-600 px-3 text-[10px] font-semibold text-white hover:bg-rose-500">Open subject workspace <BookOpenCheck size={12} /></Link>}
+          </section>;
+        })}
       </div>
-      <div className="mt-4 grid gap-4 lg:grid-cols-2">{subjects.map((item) => <section key={item.course_code} className="surface rounded-xl p-5"><div><h2 className="text-sm font-semibold text-white">{item.subject}</h2><p className="mt-1 text-xs text-slate-500">{item.course_code} · Section {item.section ?? '—'} · Teacher: {item.teacher ?? 'Not assigned'}</p></div><div className="mt-4 flex justify-between border-y border-white/7 py-3 text-xs"><span className="text-slate-500">Course attendance</span><span className="text-slate-200">{item.attendance == null ? 'No course record' : `${item.attendance.toFixed(0)}%`}</span></div><h3 className="mt-4 text-xs font-medium text-slate-300">Course assessments</h3><div className="mt-2 divide-y divide-white/6">{item.assessments.map((assessment, index) => <div key={`${assessment.assessment}-${index}`} className="flex justify-between py-2 text-xs"><span className="text-slate-400">{assessment.assessment}</span><span className="text-slate-200">{assessment.score == null ? 'Not graded' : `${assessment.score} / ${assessment.maximum}`}</span></div>)}</div></section>)}</div>
+      <div className="mt-4 grid gap-4 lg:grid-cols-2">{subjects.map((item) => <section key={item.course_code} className="surface rounded-xl p-5"><div><h2 className="text-sm font-semibold text-white">{item.subject}</h2><p className="mt-1 text-xs text-slate-500">{item.course_code} · Section {item.section ?? '—'} · Teacher: {item.teacher ?? 'Not assigned'}</p></div><div className="mt-4 flex justify-between border-y border-white/7 py-3 text-xs"><span className="text-slate-500">Course attendance</span><span className="text-slate-200">{item.attendance == null ? 'No course record' : `${item.attendance.toFixed(0)}%`}</span></div><h3 className="mt-4 text-xs font-medium text-slate-300">Course assessments</h3><div className="mt-2 divide-y divide-white/6">{item.assessments.map((assessment, index) => <div key={`${assessment.assessment}-${index}`} className="flex justify-between py-2 text-xs"><span className="text-slate-400">{assessment.assessment}</span><span className="text-slate-200">{assessment.score == null ? 'Not graded' : `${assessment.score} / ${assessment.maximum}`}</span></div>)}</div>{item.subject_id && <Link href={`/student/subjects/${item.subject_id}`} className="mt-4 inline-flex min-h-9 items-center gap-2 rounded-lg bg-rose-600 px-3 text-[10px] font-semibold text-white hover:bg-rose-500">Open subject workspace <BookOpenCheck size={12} /></Link>}</section>)}</div>
       {!error && !subjects.length && !academic && <div className="surface rounded-xl p-5"><Empty title="No subject records yet" detail="Your course team can add records when they are available." /></div>}
     </div>
   );

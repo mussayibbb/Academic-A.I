@@ -5,9 +5,30 @@ import pytest
 
 from backend.app.database import get_db
 from backend.app.main import app
-from backend.app.models import AcademicDataImportBatch, Assignment, AuditLog, Student, StudentSubjectAcademicRecord, Submission, Subject
+from backend.app.models import AcademicDataImportBatch, Assignment, AuditLog, Student, StudentSubjectAcademicRecord, Submission, Subject, User
+from backend.app.services.academic_records import internal_mark
 
 PERIOD = '2026-S1'
+
+
+def test_internal_mark_normalizes_only_a_verified_nonstandard_fa1_scale():
+    verified = StudentSubjectAcademicRecord(
+        fa1=22,
+        fa1_maximum_marks=50,
+        fa1_maximum_verified=True,
+        fa2=20,
+        assignment_mark=20,
+    )
+    unverified = StudentSubjectAcademicRecord(
+        fa1=22,
+        fa1_maximum_marks=50,
+        fa1_maximum_verified=False,
+        fa2=20,
+        assignment_mark=20,
+    )
+
+    assert internal_mark(verified) == pytest.approx(35.5)
+    assert internal_mark(unverified) is None
 
 
 def auth(token):
@@ -122,11 +143,62 @@ def test_subject_import_tracks_provenance_and_exports_calculated_register(client
     exported = client.get('/api/v1/reports/export.csv?report_type=internal_marks', headers=auth(teacher_token))
     assert exported.status_code == 200
     parsed = list(csv.reader(io.StringIO(exported.text)))
-    assert 'CN FA1 /25' in parsed[0]
+    assert 'CN FA1 raw' in parsed[0]
+    assert 'CN FA1 maximum marks' in parsed[0]
     assert 'Total Internal /250' in parsed[0]
     assert parsed[1][0] == PERIOD
     assert parsed[1][1] == 'T-001'
     assert parsed[1][parsed[0].index('CN Internal /50')] == '41.5'
+
+
+def test_student_academic_records_return_all_persisted_subjects_with_provenance(client, teacher_token):
+    ensure_subjects(client)
+    override = app.dependency_overrides[get_db]
+    with next(override()) as db:
+        student = db.query(Student).filter_by(id=client.app.state.test_student_id).one()
+        user = db.query(User).filter_by(email='teacher@example.com').one()
+        subject = Subject(code='EXTRA-FA1', name='Additional Subject', department='Engineering')
+        batch = AcademicDataImportBatch(
+            dataset_type='subject_records',
+            source_filename='additional-subject.csv',
+            file_checksum='b' * 64,
+            imported_by_user_id=user.id,
+        )
+        db.add_all([subject, batch])
+        db.flush()
+        record = StudentSubjectAcademicRecord(
+            student_id=student.id,
+            subject_id=subject.id,
+            academic_period=PERIOD,
+            fa1=11,
+            import_batch_id=batch.id,
+        )
+        db.add(record)
+        db.commit()
+        expected = {
+            'record_id': record.id,
+            'student_id': student.id,
+            'subject_id': subject.id,
+            'code': subject.code,
+            'name': subject.name,
+            'academic_period': PERIOD,
+            'fa1': 11,
+            'fa1_observed_at': None,
+            'temporal_evidence_verified': False,
+            'fa1_maximum_marks': None,
+            'fa1_maximum_verified': False,
+            'fa1_maximum_source_reference': None,
+            'import_batch_id': batch.id,
+            'source_filename': batch.source_filename,
+        }
+
+    response = client.get(
+        f'/api/v1/students/{client.app.state.test_student_id}/academic-records?academic_period={PERIOD}',
+        headers=auth(teacher_token),
+    )
+
+    assert response.status_code == 200, response.text
+    assert expected in response.json()['records']
 
 
 def test_subject_import_rejects_unknown_subject_and_teacher_assignment_is_subject_linked(client, teacher_token, student_token):

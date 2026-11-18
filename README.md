@@ -107,7 +107,7 @@ The bundled seed data is intentionally separable synthetic data. Its perfect hol
 
 ## Explanations and Momentum
 
-SHAP uses the saved classifier, that student's actual model features, and persisted training background. Student 360 exposes the computed local contributions and a model-version tag. Momentum uses timestamped attendance, assessment, activity, and submission observations; fewer than four observations are classified as `INSUFFICIENT_DATA`.
+SHAP uses the saved classifier, that student's actual model features, and persisted training background. Student 360 exposes the computed local contributions and a model-version tag; the contribution chart is scaled to the largest absolute value and describes changes to `P(risk_level)`, not causes. Its AI Risk Summary sends only the class probability and top verified feature evidence to the configured LLM, accepts only a structured selection of those feature names, and displays their original values and contributions. Risk-summary generation is capped at 15 seconds so a slow provider cannot hold the SHAP request for the general LLM timeout; if an LLM is unavailable, times out, or returns an invalid selection, the SHAP explanation remains available and the summary is explicitly marked unavailable. Momentum uses timestamped attendance, assessment, activity, and submission observations; fewer than four observations are classified as `INSUFFICIENT_DATA`.
 
 ## Institutional Retrieval and Local LLM
 

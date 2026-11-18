@@ -1,4 +1,5 @@
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -15,6 +16,10 @@ class Settings(BaseSettings):
     jwt_algorithm: str = 'HS256'
     access_token_expire_minutes: int = Field(default=480, ge=1, le=10080)
     cors_origins: str = 'http://localhost:3000,http://127.0.0.1:3000'
+    institutional_timezone: str = Field(
+        default='Asia/Kolkata',
+        validation_alias=AliasChoices('INSTITUTIONAL_TIMEZONE'),
+    )
     upload_directory: Path = BASE_DIR / 'data' / 'uploads'
     max_upload_size: int = Field(default=10 * 1024 * 1024, ge=1)
     llm_model_name: str = Field(default='ollama:qwen3:8b', validation_alias=AliasChoices('LLM_MODEL_NAME'))
@@ -23,6 +28,8 @@ class Settings(BaseSettings):
     gemini_api_key: str = Field(default='', validation_alias=AliasChoices('GEMINI_API_KEY'))
     gemini_model_name: str = Field(default='gemini-2.0-flash', validation_alias=AliasChoices('GEMINI_MODEL_NAME'))
     llm_timeout_seconds: int = Field(default=300, ge=1, validation_alias=AliasChoices('LLM_TIMEOUT_SECONDS'))
+    # Academic records are sent to external providers only after an explicit institutional opt-in.
+    allow_external_tutor_data: bool = Field(default=False, validation_alias=AliasChoices('ALLOW_EXTERNAL_TUTOR_DATA'))
     embedding_model_name: str = 'sentence-transformers/all-MiniLM-L6-v2'
     vector_store_path: Path = BASE_DIR / 'knowledge_base' / 'vector_store'
 
@@ -38,6 +45,15 @@ class Settings(BaseSettings):
     def validate_cors_origins(cls, value: str) -> str:
         if '*' in value:
             raise ValueError('CORS_ORIGINS cannot contain a wildcard when credentials are enabled')
+        return value
+
+    @field_validator('institutional_timezone')
+    @classmethod
+    def validate_institutional_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError('INSTITUTIONAL_TIMEZONE must be a valid IANA timezone.') from exc
         return value
 
     @property

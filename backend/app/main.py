@@ -1,36 +1,52 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import csv
 import io
 import json
+import logging
 import math
 import mimetypes
+import re
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from ai.risk.features import FEATURE_CONTRACT_VERSION, FEATURES
 from ai.explainability.service import explain_student, global_importance
-from ai.llm.grounding import validate_intervention_draft
-from ai.llm.provider import InterventionContext, build_provider
+from ai.llm.grounding import validate_intervention_draft, validate_risk_summary_selection
+from ai.llm.provider import (
+    InterventionContext,
+    RecoveryTutorContext,
+    RiskSummaryContext,
+    RiskSummaryEvidence,
+    build_provider,
+)
 from ai.risk.predict import DEFAULT_ARTIFACT, load_artifact, predict as predict_risk
-from ai.rag.index import retrieve
+from ai.rag.index import retrieve, retrieve_scoped
 from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from sqlalchemy import func, or_, select
+from pydantic import ValidationError
+from sqlalchemy import and_, func, inspect, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from backend.app.api.auth import router as auth_router
 from backend.app.config import BASE_DIR, get_settings
-from backend.app.core.security import CurrentStudent, CurrentTeacher, CurrentUser, get_current_user
+from backend.app.core.security import CurrentAdmin, CurrentStudent, CurrentTeacher, CurrentUser, get_current_user
 from backend.app.database import get_db
 from backend.app.models import (
     AcademicMomentum,
     AcademicDataImportBatch,
     AcademicDataImportRow,
     AcademicRiskOutcome,
+    ApprovedTopic,
     Assessment,
+    AssessmentAttempt,
+    AssessmentAttemptAnswer,
+    AssessmentQuestion,
     Assignment,
     AssignmentStudent,
     Attendance,
@@ -39,43 +55,150 @@ from backend.app.models import (
     Intervention,
     InterventionDraft,
     InterventionReview,
+    LearningAssessment,
+    LearningStudySession,
     ModelDeploymentEvent,
     ModelDeploymentState,
     ModelRegistryEntry,
-    Phase3PolicyApproval,
     Notification,
+    Phase3PolicyApproval,
     Mark,
     RiskPrediction,
     RiskSnapshot,
+    RecoveryAdaptationDecision,
+    RecoveryTask,
+    RecoveryTaskEvent,
     RubricCriterion,
     Rubric,
     RubricScore,
     Student,
     StudentSubjectAcademicRecord,
     StudentSubjectAcademicRecordHistory,
+    SubjectFocusPolicy,
     Subject,
+    SubjectModule,
+    SubjectModuleResource,
     Submission,
     SubmissionVersion,
     SupportAction,
     SupportFollowUp,
     SupportPlanVersion,
     Teacher,
+    TopicLearningAssignment,
     User,
 )
 from backend.app.schemas import AssignmentCreate, AssignmentOut, AssignmentStatusUpdate, GradeRequest, RubricCreate, StudentOut, StudentSelfOut, SubmissionOut
-from backend.app.schemas.academic import SubjectAcademicRecordUpdate
+from backend.app.schemas.academic import Fa1MaximumEvidenceReview, SubjectAcademicRecordUpdate
 from backend.app.schemas.interventions import InterventionEditRequest, InterventionGenerateRequest
+from backend.app.schemas.learning import (
+    AssessmentAttemptSubmit,
+    LearningAnswerReview,
+    LearningAssessmentReview,
+    SubjectModuleCreate,
+    SubjectModuleResourceOut,
+    SubjectModuleUpdate,
+    TopicApprovalRequest,
+    TopicAssignmentCreate,
+    TopicAssignmentOut,
+)
+from backend.app.services.learning_assessments import validate_assessment_response, validate_short_answer_evaluation, validate_topic_map_response
+from backend.app.schemas.recovery import (
+    RecoveryActivity,
+    RecoveryPlanDecisionRequest,
+    RecoveryPlanEditRequest,
+    RecoveryPlanGenerateRequest,
+    RecoveryPlanOut,
+    RecoveryBlueprintEditRequest,
+    RecoveryBlueprintGenerateRequest,
+    RecoveryAdaptationDecisionOut,
+    RecoveryTutorModelResponse,
+    RecoveryTutorOut,
+    RecoveryTutorRequest,
+    RecoveryTaskAssessmentRequest,
+    RecoveryTaskEventOut,
+    RecoveryTaskOut,
+    RecoveryTaskProgressRequest,
+    RecoveryTaskActivityEditRequest,
+    RecoveryTaskActivityApprovalRequest,
+    RecoveryTaskDraftSaveRequest,
+    RecoveryTaskSubmitRequest,
+)
 from backend.app.schemas.risk import ModelApprovalRequest, ModelPromotionRequest, ModelRegistryEntryInput, ModelRejectionRequest, ModelRollbackRequest, Phase3PolicyApprovalRequest, Phase3TrainingRequest, RiskFeatureInput, RiskSimulationInput
-from backend.app.services.academic_records import SUBJECTS, academic_periods, academic_totals, build_register_row, normalize_academic_period, selected_academic_period, serialize_record, subject_records_by_student
+from backend.app.schemas.risk_overview import RiskOverviewOut
+from backend.app.schemas.subject_focus import SubjectFocusPolicyUpdate
+from backend.app.services.academic_records import SUBJECTS, academic_periods, academic_totals, build_register_row, normalize_academic_period, selected_academic_period, serialize_record, subject_record_evidence, subject_records_by_student
+from backend.app.services.risk_overview import build_teacher_risk_overview
+from backend.app.services.subject_focus import (
+    build_student_subject_focus,
+    build_teacher_subject_focus,
+    current_subject_focus_policy,
+    evaluate_subject_assessments,
+    serialize_subject_focus_policy,
+)
 from backend.app.services.uploads import store_submission
 from backend.app.services.momentum import calculate_momentum
-from backend.app.services.model_deployment import DeploymentArtifactError, active_artifact_path, candidate_artifact_path, sha256_file, verify_candidate_artifact
+from backend.app.services.recovery import (
+    PLAN_APPROVED,
+    PLAN_DRAFT,
+    PLAN_PUBLISHED,
+    PLAN_REJECTED,
+    TASK_AVAILABLE,
+    TASK_COMPLETED,
+    TASK_DRAFT,
+    TASK_IN_PROGRESS,
+    TASK_NEEDS_REVISION,
+    TASK_SUBMITTED,
+    TASK_SUPERSEDED,
+    add_task_event,
+    build_recovery_evidence,
+    build_recovery_blueprint_schedule,
+    create_draft,
+    edit_draft,
+    legacy_recovery_activity,
+    publish_plan,
+    record_adaptation_decision,
+    stable_generation_key,
+    validate_recovery_blueprint_response,
+    validate_recovery_tutor_response,
+)
+from backend.app.services.model_deployment import (
+    DeploymentArtifactError,
+    active_artifact_path,
+    candidate_artifact_path,
+    independent_candidate_approval_error,
+    sha256_file,
+    verify_candidate_artifact,
+)
 from backend.app.services.academic_imports import ImportValidationError, import_academic_data
 from ai.risk.academic_dataset import DATASET_FIELDS, build_observation_rows, readiness_report
-from ai.risk.phase3 import DATASET_FIELDS as PHASE3_DATASET_FIELDS, build_phase3_dataset
-from ai.risk.candidate import explain_candidate, train_candidate
+from ai.risk.phase3 import (
+    DATASET_FIELDS as PHASE3_DATASET_FIELDS,
+    FEATURE_SNAPSHOT_AGGREGATION_STRATEGY,
+    build_phase3_dataset,
+)
+from ai.risk.candidate import evaluate_common_test_set, explain_candidate, train_candidate
+
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
+LEARNING_ASSESSMENT_QUESTION_MARKS = 5
+LEARNING_ASSESSMENT_TOTAL_MARKS = 100
+
+
+def _institutional_today() -> date:
+    return datetime.now(ZoneInfo(settings.institutional_timezone)).date()
+
+
+def _attempt_maximum_marks(attempt: AssessmentAttempt) -> float:
+    questions = (attempt.question_set or {}).get('questions', [])
+    return sum(
+        float(question['marks'])
+        for question in questions
+        if isinstance(question, dict)
+        and isinstance(question.get('marks'), (int, float))
+        and not isinstance(question.get('marks'), bool)
+        and question['marks'] > 0
+    )
 CANDIDATE_ARTIFACT_DIRECTORY = BASE_DIR / 'models' / 'candidates'
 app = FastAPI(title=settings.app_name, version='2.0.0')
 app.add_middleware(
@@ -157,6 +280,128 @@ def normalize_support_status(value: Any, *, default: str = 'PENDING_FACULTY_REVI
         'DRAFT': 'DRAFT',
     }
     return aliases.get(text, text)
+
+
+MODULE_ALLOWED_EXTENSIONS = {'.pdf', '.docx', '.pptx', '.txt'}
+
+
+def _teacher_subject_access(db: Session, *, teacher_user: User, subject_id: int) -> tuple[Subject, Teacher]:
+    teacher = db.query(Teacher).filter(Teacher.user_id == teacher_user.id).first()
+    if teacher is None:
+        raise HTTPException(status_code=403, detail='Teacher profile not found')
+    subject = db.query(Subject).filter(Subject.id == subject_id).first()
+    if subject is None:
+        raise HTTPException(status_code=404, detail='Subject not found')
+    connected = db.query(Course).filter(Course.subject_id == subject.id, Course.teacher_id == teacher.id).first()
+    if connected is None:
+        raise HTTPException(status_code=403, detail='Teacher is not authorized for this subject')
+    return subject, teacher
+
+
+def _extract_document_text(file_path: Path, file_type: str) -> tuple[str, list[dict[str, Any]], str | None]:
+    def escape_source_location_marker(value: str) -> str:
+        return value.replace('[[[SOURCE_PAGE:', '[[[SOURCE PAGE:').replace('[[[SOURCE_SLIDE:', '[[[SOURCE SLIDE:')
+
+    try:
+        if file_type == '.txt':
+            text = file_path.read_text(encoding='utf-8', errors='replace')
+            return text.strip(), [], None
+        if file_type == '.pdf':
+            from pypdf import PdfReader
+            reader = PdfReader(str(file_path))
+            pages = []
+            for index, page in enumerate(reader.pages, start=1):
+                page_text = page.extract_text() or ''
+                if page_text.strip():
+                    pages.append(f'[[[SOURCE_PAGE:{index}]]]\n{escape_source_location_marker(page_text.strip())}')
+            text = '\n\n'.join(pages)
+            if not text.strip():
+                raise ValueError('PDF file was uploaded but no readable text could be extracted.')
+            return text, [], None
+        if file_type == '.docx':
+            from docx import Document
+            document = Document(str(file_path))
+            paragraphs = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text and paragraph.text.strip()]
+            text = '\n\n'.join(paragraphs)
+            if not text.strip():
+                raise ValueError('DOCX file was uploaded but no readable text could be extracted.')
+            return text, [], None
+        if file_type == '.pptx':
+            try:
+                from pptx import Presentation
+            except ImportError as exc:
+                raise ValueError('PPTX support is not available in the current environment.') from exc
+            presentation = Presentation(str(file_path))
+            slides = []
+            for index, slide in enumerate(presentation.slides, start=1):
+                lines = []
+                for shape in slide.shapes:
+                    if hasattr(shape, 'text') and shape.text:
+                        lines.append(escape_source_location_marker(shape.text.strip()))
+                text = '\n'.join(line for line in lines if line)
+                if text:
+                    slides.append(f'[[[SOURCE_SLIDE:{index}]]]\n{text}')
+            combined = '\n\n'.join(slides)
+            if not combined.strip():
+                raise ValueError('PPTX file was uploaded but the slides contain no readable text.')
+            return combined, [], None
+        raise ValueError(f'Unsupported document type: {file_type}')
+    except Exception as exc:  # pragma: no cover - the specific parsing error is surfaced to the caller.
+        return '', [], str(exc)
+
+
+def _merge_topic_candidate_maps(
+    previous: list[dict[str, Any]],
+    refreshed: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    refreshed_by_id = {
+        item.get('candidate_id'): item
+        for item in refreshed
+        if isinstance(item, dict) and isinstance(item.get('candidate_id'), str)
+    }
+    merged: list[dict[str, Any]] = []
+    consumed: set[str] = set()
+    for prior in previous:
+        if not isinstance(prior, dict):
+            continue
+        candidate_id = prior.get('candidate_id')
+        current = refreshed_by_id.get(candidate_id)
+        if current is None:
+            omitted = dict(prior)
+            omitted['requires_review'] = True
+            omitted['review_reason'] = '; '.join(filter(None, [
+                omitted.get('review_reason'),
+                'Candidate was omitted from the repair response; confirm whether it belongs in the syllabus.',
+            ]))[:1000]
+            omitted['children'] = _merge_topic_candidate_maps(
+                list(prior.get('children') or []),
+                [],
+            )
+            merged.append(omitted)
+            continue
+        consumed.add(candidate_id)
+        combined = {**prior, **current}
+        combined['order_uncertain'] = bool(prior.get('order_uncertain') or current.get('order_uncertain'))
+        combined['hierarchy_uncertain'] = bool(prior.get('hierarchy_uncertain') or current.get('hierarchy_uncertain'))
+        combined['requires_review'] = bool(prior.get('requires_review') or current.get('requires_review'))
+        reasons = list(dict.fromkeys(filter(None, [
+            prior.get('review_reason'),
+            current.get('review_reason'),
+        ])))
+        combined['review_reason'] = '; '.join(reasons)[:1000] or None
+        combined['children'] = _merge_topic_candidate_maps(
+            list(prior.get('children') or []),
+            list(current.get('children') or []),
+        )
+        merged.append(combined)
+    merged.extend(
+        item for item in refreshed
+        if isinstance(item, dict) and item.get('candidate_id') not in consumed
+    )
+    return sorted(
+        merged,
+        key=lambda item: item.get('source_order') if isinstance(item.get('source_order'), int) else 999,
+    )
 
 
 def coerce_datetime(value: Any) -> datetime | None:
@@ -548,8 +793,1513 @@ def list_academic_imports(user: CurrentTeacher, db: Session = Depends(get_db)) -
 
 @app.get(f'{settings.api_v1_prefix}/subjects')
 def list_subjects(user: CurrentTeacher, db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    subjects = db.query(Subject).filter(Subject.code.in_(SUBJECTS)).order_by(Subject.code).all()
-    return [{'id': subject.id, 'code': subject.code, 'name': subject.name} for subject in subjects]
+    teacher = db.query(Teacher).filter(Teacher.user_id == user.id).first()
+    if teacher is None:
+        raise HTTPException(status_code=403, detail='Teacher profile not found')
+    subjects = db.query(Subject).order_by(Subject.code).all()
+    visible = []
+    for subject in subjects:
+        connected = db.query(Course.id).filter(Course.subject_id == subject.id, Course.teacher_id == teacher.id).first()
+        if connected is None and subject.department and teacher.department and subject.department != teacher.department:
+            continue
+        visible.append({'id': subject.id, 'code': subject.code, 'name': subject.name})
+    return visible
+
+
+@app.get(f'{settings.api_v1_prefix}/teacher/student-risk-overview', response_model=RiskOverviewOut)
+def teacher_student_risk_overview(
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+    student_id: int | None = Query(default=None, gt=0),
+    search: str | None = Query(default=None, max_length=120),
+    section: str | None = Query(default=None, max_length=40),
+    academic_period: str | None = Query(default=None, max_length=30),
+    risk_category: str | None = Query(default=None, max_length=30),
+) -> dict[str, Any]:
+    try:
+        return build_teacher_risk_overview(
+            db,
+            user,
+            student_id=student_id,
+            search=search,
+            section=section,
+            academic_period=academic_period,
+            risk_category=risk_category,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get(f'{settings.api_v1_prefix}/teacher/subject-focus')
+def teacher_subject_focus(
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+    subject_id: int | None = Query(default=None, gt=0),
+    student_id: int | None = Query(default=None, gt=0),
+    first_internal_only: bool = Query(default=False),
+) -> dict[str, Any]:
+    try:
+        return build_teacher_subject_focus(
+            db,
+            user,
+            subject_id=subject_id,
+            student_id=student_id,
+            first_internal_only=first_internal_only,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get(f'{settings.api_v1_prefix}/students/me/subject-focus')
+def my_subject_focus(
+    student: CurrentStudent,
+    db: Session = Depends(get_db),
+    first_internal_only: bool = Query(default=False),
+) -> dict[str, Any]:
+    return build_student_subject_focus(
+        db,
+        student,
+        first_internal_only=first_internal_only,
+    )
+
+
+@app.get(f'{settings.api_v1_prefix}/admin/subject-focus-policy')
+def get_subject_focus_policy(user: CurrentAdmin, db: Session = Depends(get_db)) -> dict[str, Any]:
+    policies = db.query(SubjectFocusPolicy).order_by(SubjectFocusPolicy.version.desc()).all()
+    return {
+        'current': serialize_subject_focus_policy(policies[0] if policies else None),
+        'history': [{
+            **(serialize_subject_focus_policy(policy) or {}),
+            'actor_user_id': policy.actor_user_id,
+            'actor_name': policy.actor.full_name if policy.actor else 'Project configuration',
+        } for policy in policies],
+    }
+
+
+@app.put(f'{settings.api_v1_prefix}/admin/subject-focus-policy')
+def update_subject_focus_policy(
+    payload: SubjectFocusPolicyUpdate,
+    user: CurrentAdmin,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    current = current_subject_focus_policy(db)
+    if current is None:
+        raise HTTPException(status_code=503, detail='The subject-focus policy has not been initialized.')
+    if current.version != payload.expected_version:
+        raise HTTPException(status_code=409, detail='The subject-focus policy changed. Reload its history and retry.')
+
+    updated = SubjectFocusPolicy(
+        version=current.version + 1,
+        threshold_score=payload.threshold_score,
+        threshold_maximum=payload.threshold_maximum,
+        actor_user_id=user.id,
+        change_reason=payload.change_reason.strip(),
+    )
+    db.add(updated)
+    db.add(AuditLog(
+        actor_user_id=user.id,
+        action='subject_focus_policy.changed',
+        resource_type='subject_focus_policy',
+        resource_id=str(updated.version),
+        detail={
+            'previous_version': current.version,
+            'previous_threshold': {
+                'score': current.threshold_score,
+                'maximum': current.threshold_maximum,
+            },
+            'new_threshold': {
+                'score': payload.threshold_score,
+                'maximum': payload.threshold_maximum,
+            },
+            'reason': payload.change_reason.strip(),
+        },
+    ))
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail='The subject-focus policy changed concurrently. Reload and retry.') from exc
+    db.refresh(updated)
+    return serialize_subject_focus_policy(updated) or {}
+
+
+@app.get(f'{settings.api_v1_prefix}/subjects/{{subject_id}}/modules')
+def list_subject_modules(subject_id: int, user: CurrentTeacher, db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    subject, _ = _teacher_subject_access(db, teacher_user=user, subject_id=subject_id)
+    modules = db.query(SubjectModule).filter(SubjectModule.subject_id == subject.id).order_by(SubjectModule.module_number).all()
+    return [{
+        'id': module.id,
+        'subject_id': module.subject_id,
+        'module_number': module.module_number,
+        'title': module.title,
+        'description': module.description,
+        'status': module.status,
+        'resource_count': len(module.resources),
+    } for module in modules]
+
+
+@app.post(f'{settings.api_v1_prefix}/subjects/{{subject_id}}/modules', status_code=201)
+def create_subject_module(subject_id: int, payload: SubjectModuleCreate, user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
+    subject, _ = _teacher_subject_access(db, teacher_user=user, subject_id=subject_id)
+    existing = db.query(SubjectModule).filter_by(subject_id=subject.id, module_number=payload.module_number).first()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail='A module with that number already exists for this subject.')
+    module = SubjectModule(subject_id=subject.id, module_number=payload.module_number, title=payload.title, description=payload.description, status='ACTIVE')
+    db.add(module)
+    db.commit()
+    db.refresh(module)
+    return {
+        'id': module.id,
+        'subject_id': module.subject_id,
+        'module_number': module.module_number,
+        'title': module.title,
+        'description': module.description,
+        'status': module.status,
+    }
+
+
+@app.put(f'{settings.api_v1_prefix}/subjects/{{subject_id}}/modules/{{module_id}}')
+def update_subject_module(subject_id: int, module_id: int, payload: SubjectModuleUpdate, user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
+    _teacher_subject_access(db, teacher_user=user, subject_id=subject_id)
+    module = db.query(SubjectModule).filter_by(id=module_id, subject_id=subject_id).first()
+    if module is None:
+        raise HTTPException(status_code=404, detail='Module not found for this subject')
+    if payload.title is not None:
+        module.title = payload.title
+    if payload.description is not None:
+        module.description = payload.description
+    db.commit()
+    db.refresh(module)
+    return {
+        'id': module.id, 'subject_id': module.subject_id, 'module_number': module.module_number,
+        'title': module.title, 'description': module.description, 'status': module.status,
+    }
+
+
+@app.post(f'{settings.api_v1_prefix}/subjects/{{subject_id}}/modules/{{module_id}}/resources')
+async def upload_subject_module_resource(
+    subject_id: int,
+    module_id: int,
+    user: CurrentTeacher,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    subject, teacher = _teacher_subject_access(db, teacher_user=user, subject_id=subject_id)
+    module = db.query(SubjectModule).filter_by(id=module_id, subject_id=subject.id).first()
+    if module is None:
+        raise HTTPException(status_code=404, detail='Module not found for this subject')
+    original_name = Path(file.filename or 'module-resource').name
+    suffix = Path(original_name).suffix.lower()
+    if not suffix or suffix not in MODULE_ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=415, detail='Only PDF, DOCX, PPTX and TXT files are supported for module resources.')
+    content = await file.read(settings.max_upload_size + 1)
+    await file.close()
+    if len(content) > settings.max_upload_size:
+        raise HTTPException(status_code=413, detail=f'File exceeds the {settings.max_upload_size}-byte upload limit.')
+    storage_root = (settings.upload_directory / 'subject-modules' / str(subject.id) / str(module.id)).resolve()
+    storage_root.mkdir(parents=True, exist_ok=True)
+    safe_name = f'{uuid4().hex}{suffix}'
+    target = storage_root / safe_name
+    target.write_bytes(content)
+    digest = hashlib.sha256(content).hexdigest()
+    cached_resource = db.query(SubjectModuleResource).filter_by(
+        subject_id=subject.id,
+        content_hash=digest,
+        file_type=suffix.lstrip('.').upper(),
+        processing_status='PROCESSED',
+    ).first()
+    if cached_resource is not None and cached_resource.extracted_text:
+        extracted_text = cached_resource.extracted_text
+        extracted_topics = cached_resource.extracted_topics
+        extraction_error = None
+    else:
+        extracted_text, extracted_topics, extraction_error = _extract_document_text(target, suffix)
+    if not extraction_error and not extracted_text.strip():
+        extraction_error = 'No readable text could be extracted from this resource.'
+    resource = SubjectModuleResource(
+        module_id=module.id,
+        subject_id=subject.id,
+        teacher_id=teacher.id,
+        title=Path(original_name).stem[:200] or 'Uploaded resource',
+        original_filename=original_name[:255],
+        storage_path=str(target),
+        file_type=suffix.lstrip('.').upper(),
+        file_size=len(content),
+        content_hash=digest,
+        processing_status='FAILED' if extraction_error else 'PROCESSED',
+        error_message=extraction_error,
+        extracted_text=extracted_text or None,
+        extracted_topics=extracted_topics,
+        provenance={'storage_path': str(target), 'uploaded_by': user.email, 'source': 'teacher_upload'},
+    )
+    db.add(resource)
+    db.commit()
+    db.refresh(resource)
+    return {
+        'id': resource.id,
+        'module_id': resource.module_id,
+        'subject_id': resource.subject_id,
+        'teacher_id': resource.teacher_id,
+        'title': resource.title,
+        'original_filename': resource.original_filename,
+        'file_type': resource.file_type,
+        'file_size': resource.file_size,
+        'content_hash': resource.content_hash,
+        'processing_status': resource.processing_status,
+        'error_message': resource.error_message,
+        'extracted_topics': resource.extracted_topics,
+        'provenance': resource.provenance,
+        'uploaded_at': resource.created_at.isoformat(),
+    }
+
+
+@app.get(f'{settings.api_v1_prefix}/subjects/{{subject_id}}/modules/{{module_id}}/resources')
+def list_subject_module_resources(subject_id: int, module_id: int, user: CurrentTeacher, db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    _teacher_subject_access(db, teacher_user=user, subject_id=subject_id)
+    module = db.query(SubjectModule).filter_by(id=module_id, subject_id=subject_id).first()
+    if module is None:
+        raise HTTPException(status_code=404, detail='Module not found')
+    return [{
+        'id': item.id,
+        'module_id': item.module_id,
+        'title': item.title,
+        'original_filename': item.original_filename,
+        'file_type': item.file_type,
+        'file_size': item.file_size,
+        'content_hash': item.content_hash,
+        'processing_status': item.processing_status,
+        'error_message': item.error_message,
+        'extracted_text': item.extracted_text,
+        'extracted_topics': item.extracted_topics,
+        'provenance': item.provenance,
+        'created_at': item.created_at.isoformat(),
+    } for item in module.resources]
+
+
+@app.get(f'{settings.api_v1_prefix}/subjects/{{subject_id}}/modules/{{module_id}}/resources/{{resource_id}}/file')
+def view_subject_module_resource(
+    subject_id: int,
+    module_id: int,
+    resource_id: int,
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    _teacher_subject_access(db, teacher_user=user, subject_id=subject_id)
+    resource = db.query(SubjectModuleResource).filter_by(
+        id=resource_id,
+        subject_id=subject_id,
+        module_id=module_id,
+    ).first()
+    if resource is None:
+        raise HTTPException(status_code=404, detail='Resource not found for this module.')
+    storage_root = (settings.upload_directory / 'subject-modules').resolve()
+    path = Path(resource.storage_path).resolve()
+    if not path.is_relative_to(storage_root) or not path.is_file():
+        raise HTTPException(status_code=404, detail='Stored module file is unavailable.')
+    suffix = Path(resource.original_filename).suffix.lower()
+    inline = suffix in {'.pdf', '.txt'}
+    return FileResponse(
+        path,
+        filename=resource.original_filename,
+        media_type=mimetypes.guess_type(resource.original_filename)[0] or 'application/octet-stream',
+        content_disposition_type='inline' if inline else 'attachment',
+    )
+
+
+@app.post(f'{settings.api_v1_prefix}/subjects/{{subject_id}}/modules/{{module_id}}/resources/{{resource_id}}/extract-topics')
+def extract_subject_module_topics(
+    subject_id: int,
+    module_id: int,
+    resource_id: int,
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    _teacher_subject_access(db, teacher_user=user, subject_id=subject_id)
+    resource = db.query(SubjectModuleResource).filter_by(
+        id=resource_id, subject_id=subject_id, module_id=module_id,
+    ).first()
+    if resource is None:
+        raise HTTPException(status_code=404, detail='Resource not found for this module.')
+    if resource.processing_status != 'PROCESSED' or not resource.extracted_text:
+        raise HTTPException(status_code=409, detail='Readable source text is required before topic extraction.')
+    if resource.extracted_topics and resource.provenance.get('topic_map_status') == 'PROCESSED':
+        return {
+            'id': resource.id, 'processing_status': resource.processing_status,
+            'topic_map_status': 'PROCESSED', 'error_message': resource.error_message,
+            'extracted_topics': resource.extracted_topics, 'provenance': resource.provenance,
+        }
+    context = {
+        'subject': {'id': subject_id, 'name': resource.module.subject.name},
+        'module': {'id': module_id, 'number': resource.module.module_number, 'title': resource.module.title},
+        'source': {
+            'resource_id': resource.id,
+            'filename': resource.original_filename,
+            'file_type': resource.file_type,
+            'available_locator_types': {'PDF': ['page'], 'PPTX': ['slide']}.get(resource.file_type.upper(), []),
+            'sha256': resource.content_hash,
+        },
+        'source_text': resource.extracted_text[:60000],
+        'truncated': len(resource.extracted_text) > 60000,
+    }
+    issues: list[str] = []
+    limitation = None
+    topics: list[dict[str, Any]] = []
+    try:
+        provider = build_provider(settings)
+        raw = provider.generate_topic_map(context)
+        topics, issues, limitation = validate_topic_map_response(raw, context['source_text'], context)
+        if issues:
+            previous_topics = topics
+            previous_issues = list(issues)
+            context['validation_issues'] = issues
+            context['repair_instruction'] = (
+                'Repair only schema or source-evidence errors once. Do not remove genuine ambiguity flags, '
+                'do not suppress review reasons, and preserve every supported candidate and its source order.'
+            )
+            raw = provider.generate_topic_map(context)
+            refreshed_topics, refreshed_issues, limitation = validate_topic_map_response(
+                raw,
+                context['source_text'],
+                context,
+            )
+            if refreshed_topics:
+                topics = _merge_topic_candidate_maps(previous_topics, refreshed_topics)
+                issues = refreshed_issues
+            else:
+                topics = previous_topics
+                issues = list(dict.fromkeys(previous_issues + refreshed_issues))
+    except (RuntimeError, ValueError) as exc:
+        issues.append(f'Topic extraction is unavailable: {exc}')
+    if context['truncated']:
+        issues.append('Only the first 60000 characters were submitted for topic mapping; review the remainder of the source.')
+    def has_review_flag(items: list[dict[str, Any]]) -> bool:
+        return any(
+            bool(item.get('requires_review'))
+            or has_review_flag(item.get('children', []))
+            for item in items
+            if isinstance(item, dict)
+        )
+
+    def collect_review_reasons(items: list[dict[str, Any]]) -> list[str]:
+        reasons = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get('requires_review'):
+                reasons.append(
+                    f"Candidate {item.get('candidate_id') or item.get('title', 'topic')} requires teacher review: "
+                    f"{item.get('review_reason') or 'Confirm its source grounding and syllabus placement.'}"
+                )
+            reasons.extend(collect_review_reasons(item.get('children', [])))
+        return reasons
+
+    issues = list(dict.fromkeys(issues + collect_review_reasons(topics)))
+    valid = bool(topics) and not issues and not has_review_flag(topics)
+    provenance = dict(resource.provenance or {})
+    topic_map_metadata = {
+        'course_title': next((topic.get('course_title') for topic in topics if topic.get('course_title')), None),
+        'module_number': resource.module.module_number,
+        'module_title': resource.module.title,
+        'source_filename': resource.original_filename,
+        'source_hash': resource.content_hash,
+    }
+    provenance.update({
+        'topic_map_status': 'PROCESSED' if valid else 'REVIEW_REQUIRED',
+        'topic_map_provider': getattr(locals().get('provider'), 'provider_name', 'unavailable'),
+        'topic_map_errors': issues,
+        'topic_map_limitation': limitation,
+        'topic_map_metadata': topic_map_metadata,
+        'topic_map_attempted_at': datetime.utcnow().isoformat(),
+    })
+    if topics:
+        resource.extracted_topics = topics
+    if valid:
+        resource.error_message = None
+    else:
+        resource.error_message = 'Topic map requires teacher review. ' + ' '.join(issues or [limitation or 'No supported topics were returned.'])
+    resource.provenance = provenance
+    _recovery_audit(db, user, 'subject_module.topic_map_generated', 'subject_module_resource', resource.id, new_state=provenance['topic_map_status'], reason='; '.join(issues)[:2000] or limitation)
+    db.commit()
+    db.refresh(resource)
+    return {
+        'id': resource.id, 'processing_status': resource.processing_status,
+        'topic_map_status': provenance['topic_map_status'], 'error_message': resource.error_message,
+        'extracted_topics': resource.extracted_topics, 'provenance': resource.provenance,
+    }
+
+
+@app.post(f'{settings.api_v1_prefix}/subjects/{{subject_id}}/topics/approve')
+def approve_teaching_topic(subject_id: int, payload: TopicApprovalRequest, user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
+    _, teacher = _teacher_subject_access(db, teacher_user=user, subject_id=subject_id)
+    resource = db.query(SubjectModuleResource).filter_by(id=payload.resource_id, subject_id=subject_id).first()
+    if resource is None:
+        raise HTTPException(status_code=404, detail='Resource not found for this subject')
+    module = db.query(SubjectModule).filter_by(id=resource.module_id).first()
+    if module is None:
+        raise HTTPException(status_code=404, detail='Resource module not found')
+    candidate: dict[str, Any] | None = None
+    if payload.candidate_id:
+        pending = list(resource.extracted_topics or [])
+        while pending:
+            item = pending.pop(0)
+            if isinstance(item, dict):
+                if item.get('candidate_id') == payload.candidate_id:
+                    candidate = item
+                    break
+                children = item.get('children')
+                if isinstance(children, list):
+                    pending[0:0] = children
+        if candidate is None:
+            raise HTTPException(status_code=409, detail='The selected topic candidate is no longer available for this source.')
+
+    candidate_provenance = {
+        'candidate_id': candidate.get('candidate_id') if candidate else None,
+        'candidate_path': candidate.get('candidate_path') if candidate else None,
+        'original_number': candidate.get('original_number') if candidate else None,
+        'source_order': candidate.get('source_order') if candidate else payload.source_order,
+        'source_excerpt': candidate.get('source_excerpt') if candidate else None,
+        'source_locator': candidate.get('source_locator') if candidate else None,
+        'course_title': candidate.get('course_title') if candidate else None,
+        'module_number': module.module_number,
+        'module_title': module.title,
+        'order_uncertain': candidate.get('order_uncertain', False) if candidate else payload.order_uncertain,
+        'hierarchy_uncertain': candidate.get('hierarchy_uncertain', False) if candidate else False,
+        'requires_review': candidate.get('requires_review', False) if candidate else False,
+        'review_reason': candidate.get('review_reason') if candidate else None,
+        'parent_candidate_id': (
+            '.'.join(str(value) for value in candidate['candidate_path'][:-1])
+            if candidate and isinstance(candidate.get('candidate_path'), list) and len(candidate['candidate_path']) > 1
+            else None
+        ),
+    }
+    for existing in resource.topics:
+        provenance = existing.source_provenance if isinstance(existing.source_provenance, dict) else {}
+        same_candidate = bool(payload.candidate_id and provenance.get('candidate_id') == payload.candidate_id)
+        same_source_identity = (
+            provenance.get('source_order') is not None
+            and provenance.get('source_order') == candidate_provenance['source_order']
+            and provenance.get('original_number') == candidate_provenance['original_number']
+        )
+        legacy_match = (
+            not provenance.get('candidate_id')
+            and re.sub(r'\s+', ' ', existing.title).strip().casefold()
+            == re.sub(r'\s+', ' ', payload.title).strip().casefold()
+            and (
+                provenance.get('source_order') is None
+                or candidate_provenance['source_order'] is None
+                or provenance.get('source_order') == candidate_provenance['source_order']
+            )
+            and (
+                provenance.get('original_number') is None
+                or candidate_provenance['original_number'] is None
+                or provenance.get('original_number') == candidate_provenance['original_number']
+            )
+        )
+        if same_candidate or same_source_identity or legacy_match:
+            if existing.approval_status != 'APPROVED':
+                raise HTTPException(status_code=409, detail='This source candidate already has a teacher review record.')
+            return {
+                'id': existing.id,
+                'subject_id': existing.subject_id,
+                'module_id': existing.module_id,
+                'resource_id': existing.source_resource_id,
+                'title': existing.title,
+                'summary': existing.summary,
+                'learning_objectives': existing.learning_objectives,
+                'concepts': existing.concepts,
+                'approval_status': existing.approval_status,
+                'source_provenance': existing.source_provenance,
+                'duplicate': True,
+            }
+    topic = ApprovedTopic(
+        subject_id=subject_id,
+        module_id=module.id,
+        source_resource_id=resource.id,
+        teacher_id=teacher.id,
+        title=payload.title,
+        summary=payload.summary,
+        learning_objectives=payload.learning_objectives,
+        concepts=payload.concepts,
+        approval_status=payload.approval_status,
+        approved_by_user_id=user.id,
+        source_provenance={
+            'resource_id': resource.id,
+            'resource_title': resource.title,
+            'source_filename': resource.original_filename,
+            'module': module.title,
+            'hash': resource.content_hash,
+            **candidate_provenance,
+        },
+    )
+    db.add(topic)
+    db.commit()
+    db.refresh(topic)
+    return {
+        'id': topic.id,
+        'subject_id': topic.subject_id,
+        'module_id': topic.module_id,
+        'resource_id': topic.source_resource_id,
+        'title': topic.title,
+        'summary': topic.summary,
+        'learning_objectives': topic.learning_objectives,
+        'concepts': topic.concepts,
+        'approval_status': topic.approval_status,
+        'source_provenance': topic.source_provenance,
+        'duplicate': False,
+    }
+
+
+def _approved_topic_sequence_key(topic: ApprovedTopic) -> tuple[int, int, datetime, int]:
+    module_number = topic.module.module_number if topic.module else 999
+    provenance = topic.source_provenance if isinstance(topic.source_provenance, dict) else {}
+    source_order = provenance.get('source_order')
+    if isinstance(source_order, bool) or not isinstance(source_order, int):
+        source_order = 999
+    return module_number, source_order, topic.created_at, topic.id
+
+
+def _strict_recovery_subject_ids(focus: dict[str, Any], student_id: int) -> set[int]:
+    policy = focus.get('policy')
+    if (
+        focus.get('evidence_scope') != 'FIRST_INTERNAL'
+        or not isinstance(policy, dict)
+        or not policy.get('active_for_classification')
+        or policy.get('threshold_maximum') != 25
+    ):
+        return set()
+
+    eligible_subject_ids: set[int] = set()
+    for subject in focus.get('subjects', []):
+        student = next(
+            (item for item in subject.get('students', []) if item.get('id') == student_id),
+            None,
+        )
+        assessment = student.get('latest_assessment') if student else None
+        if (
+            assessment
+            and assessment.get('evidence_status') == 'VERIFIED'
+            and assessment.get('maximum_marks_verified') is True
+            and isinstance(assessment.get('normalized_score'), (int, float))
+            and not isinstance(assessment.get('normalized_score'), bool)
+            and assessment['normalized_score'] < 12
+        ):
+            eligible_subject_ids.add(subject['id'])
+    return eligible_subject_ids
+
+
+@app.get(f'{settings.api_v1_prefix}/subjects/{{subject_id}}/topics')
+def list_subject_topics(subject_id: int, user: CurrentTeacher, db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    _teacher_subject_access(db, teacher_user=user, subject_id=subject_id)
+    topics = (
+        db.query(ApprovedTopic)
+        .join(SubjectModule, SubjectModule.id == ApprovedTopic.module_id)
+        .filter(ApprovedTopic.subject_id == subject_id)
+        .order_by(SubjectModule.module_number, ApprovedTopic.created_at, ApprovedTopic.id)
+        .all()
+    )
+    topics.sort(key=_approved_topic_sequence_key)
+    return [{
+        'id': topic.id,
+        'module_id': topic.module_id,
+        'title': topic.title,
+        'summary': topic.summary,
+        'learning_objectives': topic.learning_objectives,
+        'concepts': topic.concepts,
+        'approval_status': topic.approval_status,
+        'source_provenance': topic.source_provenance,
+    } for topic in topics]
+
+
+@app.post(f'{settings.api_v1_prefix}/students/{{student_id}}/topic-learning-assignments')
+def create_topic_learning_assignment(student_id: int, payload: TopicAssignmentCreate, user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if student is None:
+        raise HTTPException(status_code=404, detail='Student not found')
+    _recovery_student_access(student.id, user, db)
+    topic = db.query(ApprovedTopic).filter(ApprovedTopic.id == payload.approved_topic_id).first()
+    if topic is None:
+        raise HTTPException(status_code=404, detail='Approved topic not found')
+    if topic.approval_status != 'APPROVED':
+        raise HTTPException(status_code=409, detail='Only teacher-approved topics can be assigned for recovery.')
+    _teacher_subject_access(db, teacher_user=user, subject_id=topic.subject_id)
+    teacher = db.query(Teacher).filter(Teacher.user_id == user.id).first()
+    existing_assignment = db.query(TopicLearningAssignment).filter_by(
+        student_id=student.id, approved_topic_id=topic.id,
+    ).first()
+    if existing_assignment is not None:
+        if not _topic_assignment_scope_is_valid(existing_assignment, db):
+            raise HTTPException(status_code=409, detail='The existing learning assignment has inconsistent subject provenance.')
+        return _topic_assignment_out(db, existing_assignment, include_private=True)
+    if topic.module and topic.module.module_number == 4:
+        focus = build_teacher_subject_focus(db, user, student_id=student.id, first_internal_only=True)
+        eligible_subject_ids = _strict_recovery_subject_ids(focus, student.id)
+        if topic.subject_id in eligible_subject_ids:
+            module_three_topics = (
+                db.query(ApprovedTopic.id, ApprovedTopic.subject_id)
+                .join(SubjectModule, SubjectModule.id == ApprovedTopic.module_id)
+                .filter(
+                    ApprovedTopic.subject_id.in_(eligible_subject_ids),
+                    ApprovedTopic.approval_status == 'APPROVED',
+                    SubjectModule.module_number == 3,
+                )
+                .all()
+            )
+            module_three_subject_ids = {subject_id for _, subject_id in module_three_topics}
+            if not eligible_subject_ids.issubset(module_three_subject_ids):
+                raise HTTPException(
+                    status_code=409,
+                    detail='Module 3 needs approved topics in every FA-1-eligible subject before Module 4 assignments can begin.',
+                )
+            module_three_topic_ids = {topic_id for topic_id, _ in module_three_topics}
+            mastered_topic_ids = {
+                topic_id for (topic_id,) in db.query(TopicLearningAssignment.approved_topic_id)
+                .filter(
+                    TopicLearningAssignment.student_id == student.id,
+                    TopicLearningAssignment.subject_id.in_(eligible_subject_ids),
+                    TopicLearningAssignment.approved_topic_id.in_(module_three_topic_ids),
+                    TopicLearningAssignment.status == 'MASTERED',
+                )
+                .all()
+            }
+            if not module_three_topic_ids.issubset(mastered_topic_ids):
+                raise HTTPException(
+                    status_code=409,
+                    detail='Complete every approved Module 3 topic across all FA-1-eligible subjects before assigning a Module 4 topic.',
+                )
+    ordered_topics = (
+        db.query(ApprovedTopic)
+        .join(SubjectModule, SubjectModule.id == ApprovedTopic.module_id)
+        .filter(ApprovedTopic.subject_id == topic.subject_id, ApprovedTopic.approval_status == 'APPROVED')
+        .order_by(SubjectModule.module_number, ApprovedTopic.created_at, ApprovedTopic.id)
+        .all()
+    )
+    ordered_topics.sort(key=_approved_topic_sequence_key)
+    student_assignments = db.query(TopicLearningAssignment).filter_by(student_id=student.id, subject_id=topic.subject_id).all()
+    mastered_topic_ids = {item.approved_topic_id for item in student_assignments if item.status == 'MASTERED'}
+    next_topic = next((item for item in ordered_topics if item.id not in mastered_topic_ids), None)
+    if next_topic is not None and next_topic.id != topic.id:
+        raise HTTPException(status_code=409, detail=f'Complete the next topic in source order first: {next_topic.title}.')
+    assignment = TopicLearningAssignment(
+        student_id=student.id,
+        subject_id=topic.subject_id,
+        module_id=topic.module_id,
+        approved_topic_id=topic.id,
+        teacher_id=teacher.id if teacher else None,
+        title=(payload.title or topic.title)[:200],
+        learning_objective=(payload.learning_objective or (topic.learning_objectives[0] if topic.learning_objectives else topic.summary))[:2000],
+        lesson_content=(payload.lesson_content or f"Use the approved topic '{topic.title}' to review the key concept, definitions, and examples from the linked module resources. Focus on the learning objective and the fundamentals needed for the assessment.")[:10000],
+        expected_duration_minutes=payload.expected_duration_minutes,
+        scheduled_at=payload.scheduled_at,
+        available_from=payload.available_from,
+        status='ACTIVE',
+        mastery_criteria=(payload.mastery_criteria or 'Earn at least 80% on the topic assessment and demonstrate the listed learning objective in your explanation.')[:2000],
+        source_provenance={'topic_id': topic.id, 'topic_title': topic.title, 'resource_id': topic.source_resource_id, 'module_id': topic.module_id},
+    )
+    db.add(assignment)
+    db.commit()
+    db.refresh(assignment)
+    return {
+        'id': assignment.id,
+        'student_id': assignment.student_id,
+        'subject_id': assignment.subject_id,
+        'module_id': assignment.module_id,
+        'approved_topic_id': assignment.approved_topic_id,
+        'teacher_id': assignment.teacher_id,
+        'title': assignment.title,
+        'learning_objective': assignment.learning_objective,
+        'lesson_content': assignment.lesson_content,
+        'expected_duration_minutes': assignment.expected_duration_minutes,
+        'scheduled_at': assignment.scheduled_at.isoformat() if assignment.scheduled_at else None,
+        'available_from': assignment.available_from.isoformat() if assignment.available_from else None,
+        'status': assignment.status,
+        'mastery_criteria': assignment.mastery_criteria,
+        'source_provenance': assignment.source_provenance,
+    }
+
+
+@app.get(f'{settings.api_v1_prefix}/students/{{student_id:int}}/topic-learning-assignments')
+def list_student_topic_assignments(student_id: int, user: CurrentTeacher, db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if student is None:
+        raise HTTPException(status_code=404, detail='Student not found')
+    _recovery_student_access(student.id, user, db)
+    subject_ids = _teacher_assigned_subject_ids(db, user)
+    assignments = db.query(TopicLearningAssignment).filter(
+        TopicLearningAssignment.student_id == student.id,
+        TopicLearningAssignment.subject_id.in_(subject_ids),
+    ).order_by(TopicLearningAssignment.created_at.desc()).all() if subject_ids else []
+    assignments = [
+        assignment for assignment in assignments
+        if _topic_assignment_scope_is_valid(assignment, db)
+    ]
+    return [_topic_assignment_out(db, assignment, include_private=True) for assignment in assignments]
+
+
+@app.get(f'{settings.api_v1_prefix}/students/me/topic-learning-assignments')
+def my_topic_learning_assignments(student: CurrentStudent, db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    assignments = db.query(TopicLearningAssignment).filter(
+        TopicLearningAssignment.student_id == student.id,
+        TopicLearningAssignment.status.in_(['ACTIVE', 'MASTERED', 'REVISION_REQUIRED']),
+    ).order_by(TopicLearningAssignment.created_at.desc()).all()
+    assignments = [
+        assignment for assignment in assignments
+        if _topic_assignment_scope_is_valid(assignment, db)
+    ]
+    return [_topic_assignment_out(db, assignment, include_private=False) for assignment in assignments]
+
+
+def _topic_assignment_out(db: Session, assignment: TopicLearningAssignment, *, include_private: bool) -> dict[str, Any]:
+    topic = db.query(ApprovedTopic).filter(ApprovedTopic.id == assignment.approved_topic_id).first()
+    subject = db.query(Subject).filter(Subject.id == assignment.subject_id).first()
+    module = db.query(SubjectModule).filter(SubjectModule.id == assignment.module_id).first()
+    session = db.query(LearningStudySession).filter_by(assignment_id=assignment.id, student_id=assignment.student_id).first()
+    assessments = db.query(LearningAssessment).filter(LearningAssessment.assignment_id == assignment.id).order_by(LearningAssessment.version.desc()).all()
+    published = next((item for item in assessments if item.status == 'PUBLISHED'), None)
+    attempts = db.query(AssessmentAttempt).filter(AssessmentAttempt.assignment_id == assignment.id).order_by(AssessmentAttempt.created_at.desc()).all()
+    resources = db.query(SubjectModuleResource).filter_by(module_id=assignment.module_id, subject_id=assignment.subject_id, processing_status='PROCESSED').order_by(SubjectModuleResource.created_at).all()
+    latest_attempt = attempts[0] if attempts else None
+    result: dict[str, Any] = {
+        'id': assignment.id,
+        'subject_id': assignment.subject_id,
+        'subject_name': subject.name if subject else 'Subject',
+        'module_id': assignment.module_id,
+        'module_number': module.module_number if module else None,
+        'module_title': module.title if module else 'Module',
+        'approved_topic_id': assignment.approved_topic_id,
+        'topic_title': topic.title if topic else assignment.title,
+        'topic_summary': topic.summary if topic else '',
+        'title': assignment.title,
+        'learning_objective': assignment.learning_objective,
+        'lesson_content': assignment.lesson_content,
+        'expected_duration_minutes': assignment.expected_duration_minutes,
+        'status': assignment.status,
+        'scheduled_at': assignment.scheduled_at.isoformat() if assignment.scheduled_at else None,
+        'available_from': assignment.available_from.isoformat() if assignment.available_from else None,
+        'study_session': {
+            'id': session.id,
+            'started_at': session.started_at.isoformat(),
+            'required_duration_minutes': session.required_duration_minutes,
+            'completed_at': session.completed_at.isoformat() if session.completed_at else None,
+            'elapsed_seconds': max(0, int((datetime.utcnow() - session.started_at).total_seconds())),
+            'remaining_seconds': max(0, session.required_duration_minutes * 60 - int((datetime.utcnow() - session.started_at).total_seconds())),
+            'ready': int((datetime.utcnow() - session.started_at).total_seconds()) >= session.required_duration_minutes * 60,
+        } if session else None,
+        'assessment': {
+            'id': published.id,
+            'version': published.version,
+            'status': published.status,
+            'question_count': published.question_count,
+        } if published else None,
+        'latest_attempt': {
+            'id': attempts[0].id,
+            'status': attempts[0].status,
+            'percentage': attempts[0].percentage,
+            'submitted_at': attempts[0].submitted_at.isoformat() if attempts[0].submitted_at else None,
+            'review_pending': db.query(AssessmentAttemptAnswer).filter_by(attempt_id=attempts[0].id, review_required=True).count() > 0,
+        } if attempts else None,
+        'attempt_count': len(attempts),
+        'resources': [{
+            'id': resource.id, 'title': resource.title, 'original_filename': resource.original_filename,
+            'file_type': resource.file_type, 'file_size': resource.file_size,
+        } for resource in resources],
+        'source_provenance': assignment.source_provenance,
+    }
+    if latest_attempt:
+        result['latest_attempt'].update({
+            'total_marks': latest_attempt.total_marks,
+            'question_set': latest_attempt.question_set if latest_attempt.status == 'IN_PROGRESS' else None,
+            'responses': [{
+                'question_id': answer.question_id,
+                'marks_awarded': answer.marks_awarded,
+                'feedback': answer.feedback,
+                'review_pending': answer.review_required,
+            } for answer in latest_attempt.responses],
+        })
+    if include_private:
+        result.update({
+            'student_id': assignment.student_id,
+            'student_name': assignment.student.full_name if assignment.student else '',
+            'mastery_criteria': assignment.mastery_criteria,
+            'assessments': [{'id': item.id, 'version': item.version, 'status': item.status, 'question_count': item.question_count, 'validation_results': item.validation_results, 'error_message': item.error_message} for item in assessments],
+            'latest_attempt_id': attempts[0].id if attempts else None,
+        })
+    elif published:
+        questions = db.query(AssessmentQuestion).filter(AssessmentQuestion.assessment_id == published.id).order_by(AssessmentQuestion.id).all()
+        result['assessment']['questions'] = [_learning_question_out(question, include_answer=False) for question in questions]
+    return result
+
+
+def _student_learning_assignment_access(assignment_id: int, student: Student, db: Session) -> TopicLearningAssignment:
+    assignment = db.query(TopicLearningAssignment).filter_by(id=assignment_id, student_id=student.id).first()
+    if assignment is None:
+        raise HTTPException(status_code=404, detail='Learning assignment not found')
+    if assignment.status not in {'ACTIVE', 'MASTERED', 'REVISION_REQUIRED'}:
+        raise HTTPException(status_code=404, detail='Learning assignment not found')
+    if not _topic_assignment_scope_is_valid(assignment, db):
+        raise HTTPException(status_code=404, detail='Learning assignment not found')
+    if assignment.available_from and assignment.available_from > datetime.utcnow():
+        raise HTTPException(status_code=409, detail='This learning activity is not available yet.')
+    return assignment
+
+
+def _topic_assignment_scope_is_valid(assignment: TopicLearningAssignment, db: Session) -> bool:
+    topic_exists = db.query(ApprovedTopic.id).filter(
+        ApprovedTopic.id == assignment.approved_topic_id,
+        ApprovedTopic.subject_id == assignment.subject_id,
+        ApprovedTopic.module_id == assignment.module_id,
+        ApprovedTopic.approval_status == 'APPROVED',
+    ).first()
+    module_exists = db.query(SubjectModule.id).filter(
+        SubjectModule.id == assignment.module_id,
+        SubjectModule.subject_id == assignment.subject_id,
+    ).first()
+    return topic_exists is not None and module_exists is not None
+
+
+def _study_session_out(session: LearningStudySession) -> dict[str, Any]:
+    elapsed = max(0, int((datetime.utcnow() - session.started_at).total_seconds()))
+    required = session.required_duration_minutes * 60
+    return {
+        'id': session.id,
+        'started_at': session.started_at.isoformat(),
+        'required_duration_minutes': session.required_duration_minutes,
+        'elapsed_seconds': elapsed,
+        'remaining_seconds': max(0, required - elapsed),
+        'completed_at': session.completed_at.isoformat() if session.completed_at else None,
+        'ready': elapsed >= required,
+    }
+
+
+@app.post(f'{settings.api_v1_prefix}/topic-learning-assignments/{{assignment_id}}/study-session')
+def start_topic_study_session(assignment_id: int, student: CurrentStudent, db: Session = Depends(get_db)) -> dict[str, Any]:
+    assignment = _student_learning_assignment_access(assignment_id, student, db)
+    session = db.query(LearningStudySession).filter_by(assignment_id=assignment.id, student_id=student.id).first()
+    if session is None:
+        session = LearningStudySession(
+            assignment_id=assignment.id,
+            student_id=student.id,
+            started_at=datetime.utcnow(),
+            required_duration_minutes=assignment.expected_duration_minutes,
+        )
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+    return _study_session_out(session)
+
+
+@app.get(f'{settings.api_v1_prefix}/topic-learning-assignments/{{assignment_id}}/study-session')
+def get_topic_study_session(assignment_id: int, student: CurrentStudent, db: Session = Depends(get_db)) -> dict[str, Any]:
+    assignment = _student_learning_assignment_access(assignment_id, student, db)
+    session = db.query(LearningStudySession).filter_by(assignment_id=assignment.id, student_id=student.id).first()
+    if session is None:
+        raise HTTPException(status_code=404, detail='Study session has not started.')
+    return _study_session_out(session)
+
+
+@app.post(f'{settings.api_v1_prefix}/topic-learning-assignments/{{assignment_id}}/study-session/complete')
+def complete_topic_study_session(assignment_id: int, student: CurrentStudent, db: Session = Depends(get_db)) -> dict[str, Any]:
+    assignment = _student_learning_assignment_access(assignment_id, student, db)
+    session = db.query(LearningStudySession).filter_by(assignment_id=assignment.id, student_id=student.id).first()
+    if session is None:
+        raise HTTPException(status_code=409, detail='Start the learning activity before completing its timer.')
+    timer = _study_session_out(session)
+    if not timer['ready']:
+        raise HTTPException(status_code=409, detail={'message': 'Required elapsed study time has not passed.', 'remaining_seconds': timer['remaining_seconds']})
+    if session.completed_at is None:
+        session.completed_at = datetime.utcnow()
+        db.commit()
+        db.refresh(session)
+    return _study_session_out(session)
+
+
+@app.get(f'{settings.api_v1_prefix}/topic-learning-assignments/{{assignment_id}}/resources/{{resource_id}}')
+def download_topic_learning_resource(assignment_id: int, resource_id: int, student: CurrentStudent, db: Session = Depends(get_db)) -> FileResponse:
+    assignment = _student_learning_assignment_access(assignment_id, student, db)
+    topic = db.query(ApprovedTopic).filter_by(
+        id=assignment.approved_topic_id,
+        subject_id=assignment.subject_id,
+        module_id=assignment.module_id,
+        approval_status='APPROVED',
+    ).first()
+    if topic is None or topic.source_resource_id != resource_id:
+        raise HTTPException(status_code=404, detail='Resource not found for this learning activity.')
+    resource = db.query(SubjectModuleResource).filter_by(
+        id=resource_id, module_id=assignment.module_id, subject_id=assignment.subject_id, processing_status='PROCESSED',
+    ).first()
+    if resource is None:
+        raise HTTPException(status_code=404, detail='Resource not found for this learning activity.')
+    path = Path(resource.storage_path).resolve()
+    allowed_root = (settings.upload_directory / 'subject-modules' / str(assignment.subject_id) / str(assignment.module_id)).resolve()
+    try:
+        path.relative_to(allowed_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail='Resource file is unavailable.') from exc
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail='Resource file is unavailable.')
+    return FileResponse(path, filename=resource.original_filename, media_type=mimetypes.guess_type(resource.original_filename)[0] or 'application/octet-stream')
+
+
+def _teacher_learning_attempt_access(attempt_id: int, user: User, db: Session) -> tuple[AssessmentAttempt, LearningAssessment, TopicLearningAssignment]:
+    attempt = db.query(AssessmentAttempt).filter(AssessmentAttempt.id == attempt_id).first()
+    if attempt is None or attempt.assessment_id is None:
+        raise HTTPException(status_code=404, detail='Assessment attempt not found')
+    assessment, assignment = _teacher_learning_assessment_access(attempt.assessment_id, user, db)
+    if attempt.assignment_id != assignment.id or attempt.student_id != assignment.student_id:
+        raise HTTPException(status_code=404, detail='Assessment attempt not found')
+    return attempt, assessment, assignment
+
+
+@app.get(f'{settings.api_v1_prefix}/assessment-attempts/{{attempt_id}}/review')
+def review_learning_attempt(attempt_id: int, user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
+    attempt, assessment, assignment = _teacher_learning_attempt_access(attempt_id, user, db)
+    questions = db.query(AssessmentQuestion).filter(AssessmentQuestion.assessment_id == assessment.id).order_by(AssessmentQuestion.id).all()
+    answers = db.query(AssessmentAttemptAnswer).filter(AssessmentAttemptAnswer.attempt_id == attempt.id).all()
+    answer_by_question = {answer.question_id: answer for answer in answers}
+    return {
+        'id': attempt.id, 'assignment_id': assignment.id, 'assessment_id': assessment.id,
+        'student_id': assignment.student_id, 'student_name': assignment.student.full_name if assignment.student else '',
+        'subject_id': assignment.subject_id, 'status': attempt.status, 'percentage': attempt.percentage,
+        'total_marks': attempt.total_marks,
+        'questions': [{
+            **_learning_question_out(question, include_answer=True),
+            'answer': {
+                'response_text': answer_by_question[question.id].response_text,
+                'selected_choice': answer_by_question[question.id].selected_choice,
+                'marks_awarded': answer_by_question[question.id].marks_awarded,
+                'original_marks_awarded': answer_by_question[question.id].original_marks_awarded,
+                'feedback': answer_by_question[question.id].feedback,
+                'review_required': answer_by_question[question.id].review_required,
+                'review_reason': answer_by_question[question.id].review_reason,
+                'rubric_evaluation': answer_by_question[question.id].rubric_evaluation,
+                'reviewed_by_user_id': answer_by_question[question.id].reviewed_by_user_id,
+            } if question.id in answer_by_question else None,
+        } for question in questions],
+    }
+
+
+@app.put(f'{settings.api_v1_prefix}/assessment-attempts/{{attempt_id}}/answers/{{question_id}}/review')
+def review_learning_answer(
+    attempt_id: int,
+    question_id: int,
+    payload: LearningAnswerReview,
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    attempt, _, assignment = _teacher_learning_attempt_access(attempt_id, user, db)
+    answer = db.query(AssessmentAttemptAnswer).filter_by(attempt_id=attempt.id, question_id=question_id).first()
+    if answer is None:
+        raise HTTPException(status_code=404, detail='Answer not found for this attempt.')
+    question = db.query(AssessmentQuestion).filter_by(id=question_id).first()
+    if question is None or question.question_type != 'SHORT_ANSWER':
+        raise HTTPException(status_code=409, detail='Only short-answer responses can be manually reviewed.')
+    previous_marks = answer.marks_awarded
+    if payload.decision == 'override':
+        if payload.marks_awarded is None or not payload.reason:
+            raise HTTPException(status_code=422, detail='A mark and reason are required for a grade override.')
+        if payload.marks_awarded > question.marks:
+            raise HTTPException(status_code=422, detail=f'The override cannot exceed this question’s {question.marks:g} marks.')
+        answer.original_marks_awarded = answer.original_marks_awarded if answer.original_marks_awarded is not None else previous_marks
+        answer.marks_awarded = payload.marks_awarded
+        answer.feedback = payload.feedback or answer.feedback
+        answer.review_reason = payload.reason
+    elif answer.review_required:
+        answer.review_reason = payload.reason
+    answer.review_required = False
+    answer.reviewed_by_user_id = user.id
+    answer.reviewed_at = datetime.utcnow()
+    db.flush()
+    remaining = db.query(AssessmentAttemptAnswer).filter_by(attempt_id=attempt.id, review_required=True).count()
+    answers = db.query(AssessmentAttemptAnswer).filter_by(attempt_id=attempt.id).all()
+    attempt.total_marks = sum(item.marks_awarded for item in answers)
+    maximum_marks = _attempt_maximum_marks(attempt)
+    attempt.percentage = round(attempt.total_marks / maximum_marks * 100, 2) if maximum_marks else 0
+    if remaining == 0:
+        attempt.status = 'SUBMITTED'
+        assignment.status = 'MASTERED' if attempt.percentage >= 80 else 'REVISION_REQUIRED'
+    _recovery_audit(
+        db, user,
+        'learning_answer.overridden' if payload.decision == 'override' else 'learning_answer.reviewed',
+        'assessment_attempt_answer', answer.id,
+        previous_state=str(previous_marks), new_state=str(answer.marks_awarded), reason=payload.reason,
+    )
+    db.commit()
+    return {
+        'question_id': question_id, 'marks_awarded': answer.marks_awarded,
+        'original_marks_awarded': answer.original_marks_awarded,
+        'review_pending': answer.review_required, 'attempt_status': attempt.status,
+        'percentage': attempt.percentage,
+    }
+
+
+@app.post(f'{settings.api_v1_prefix}/topic-learning-assignments/{{assignment_id}}/generate-assessment')
+def generate_topic_assessment(assignment_id: int, user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
+    assignment = db.query(TopicLearningAssignment).filter(TopicLearningAssignment.id == assignment_id).first()
+    if assignment is None or not _topic_assignment_scope_is_valid(assignment, db):
+        raise HTTPException(status_code=404, detail='Topic learning assignment not found')
+    _recovery_student_access(assignment.student_id, user, db)
+    topic = db.query(ApprovedTopic).filter(ApprovedTopic.id == assignment.approved_topic_id).first()
+    if topic is None:
+        raise HTTPException(status_code=404, detail='Approved topic not found for this assignment')
+    _teacher_subject_access(db, teacher_user=user, subject_id=assignment.subject_id)
+    teacher = db.query(Teacher).filter(Teacher.user_id == user.id).first()
+    resources = (
+        db.query(SubjectModuleResource)
+        .join(ApprovedTopic, ApprovedTopic.source_resource_id == SubjectModuleResource.id)
+        .filter(
+            ApprovedTopic.id == topic.id,
+            ApprovedTopic.subject_id == topic.subject_id,
+            ApprovedTopic.module_id == topic.module_id,
+            ApprovedTopic.approval_status == 'APPROVED',
+            SubjectModuleResource.processing_status == 'PROCESSED',
+        )
+        .order_by(SubjectModuleResource.created_at, SubjectModuleResource.id)
+        .all()
+    )
+    documents = [
+        {'ref': f'resource:{resource.id}', 'source': resource.original_filename, 'checksum': resource.content_hash, 'text': resource.extracted_text or ''}
+        for resource in {item.id: item for item in resources}.values()
+        if resource.extracted_text and resource.extracted_text.strip()
+    ]
+    query = ' '.join([topic.title, topic.summary, *topic.learning_objectives, *topic.concepts])
+    passages = retrieve_scoped(query, documents, top_k=8) if documents else []
+    existing_version = db.query(func.max(LearningAssessment.version)).filter(LearningAssessment.assignment_id == assignment.id).scalar() or 0
+    assessment = LearningAssessment(
+        assignment_id=assignment.id,
+        version=existing_version + 1,
+        status='REVIEW_REQUIRED',
+        source_evidence=passages,
+        validation_results={},
+        teacher_id=teacher.id if teacher else None,
+    )
+    db.add(assessment)
+    db.flush()
+    issues: list[str] = []
+    limitation = None
+    generated: list[dict[str, Any]] = []
+    error_message = None
+    if not passages:
+        issues.append('No readable evidence was retrieved from teacher-approved resources for this module and topic.')
+        limitation = 'Approved resources contain no retrievable text for this topic.'
+    else:
+        context = {
+            'subject': {'id': assignment.subject_id, 'name': topic.module.subject.name if topic.module and topic.module.subject else ''},
+            'module': {'id': assignment.module_id, 'title': topic.module.title if topic.module else ''},
+            'topic': {'title': topic.title, 'summary': topic.summary, 'learning_objectives': topic.learning_objectives, 'concepts': topic.concepts},
+            'passages': passages,
+            'assessment_policy': {
+                'mcq_count': 15,
+                'short_answer_count': 5,
+                'marks_per_question': LEARNING_ASSESSMENT_QUESTION_MARKS,
+                'total_marks': LEARNING_ASSESSMENT_TOTAL_MARKS,
+                'source_required': True,
+            },
+        }
+        try:
+            provider = build_provider(settings)
+            raw = provider.generate_topic_assessment(context)
+            generated, issues, limitation = validate_assessment_response(raw, passages)
+            if issues:
+                context['validation_issues'] = issues
+                context['repair_instruction'] = 'Repair the rejected output once. Follow every validation issue and retain only questions supported by the provided source passages.'
+                repaired_raw = provider.generate_topic_assessment(context)
+                repaired_questions, repaired_issues, repaired_limitation = validate_assessment_response(repaired_raw, passages)
+                generated = repaired_questions
+                issues = repaired_issues
+                limitation = repaired_limitation
+        except (RuntimeError, ValueError) as exc:
+            error_message = str(exc)
+            issues.append(f'Assessment generation is unavailable: {error_message}')
+    for item in generated:
+        evidence_refs = item['source_evidence']
+        source_reference = ', '.join(dict.fromkeys(citation['ref'] for citation in evidence_refs))[:255]
+        db.add(AssessmentQuestion(
+            assessment_id=assessment.id,
+            subject_id=assignment.subject_id,
+            module_id=assignment.module_id,
+            topic_id=topic.id,
+            question_type=item['question_type'],
+            question=item['question'],
+            options=item['options'],
+            correct_answer=item['correct_answer'],
+            explanation=item['explanation'],
+            learning_objective=item['learning_objective'],
+            source_reference=source_reference,
+            rubric=item['rubric'],
+            marks=float(LEARNING_ASSESSMENT_QUESTION_MARKS),
+            source_provenance={'evidence': evidence_refs, 'difficulty': item['difficulty'], 'approved_topic_id': topic.id},
+        ))
+    assessment.question_count = len(generated)
+    assessment.error_message = error_message
+    mcq_count = sum(item['question_type'] == 'MCQ' for item in generated)
+    short_answer_count = sum(item['question_type'] == 'SHORT_ANSWER' for item in generated)
+    total_marks = len(generated) * LEARNING_ASSESSMENT_QUESTION_MARKS
+    if mcq_count != 15 or short_answer_count != 5 or total_marks != LEARNING_ASSESSMENT_TOTAL_MARKS:
+        issues.append(
+            'The assessment must contain 15 MCQs and 5 short-answer questions worth 5 marks each (100 total).'
+        )
+    assessment.validation_results = {
+        'valid': not issues and mcq_count == 15 and short_answer_count == 5 and total_marks == LEARNING_ASSESSMENT_TOTAL_MARKS,
+        'issues': issues,
+        'limitation': limitation,
+        'mcq_count': mcq_count,
+        'short_answer_count': short_answer_count,
+        'total_marks': total_marks,
+    }
+    _recovery_audit(db, user, 'learning_assessment.generated', 'learning_assessment', assessment.id, new_state='REVIEW_REQUIRED', reason='; '.join(issues)[:2000] or None)
+    db.commit()
+    db.refresh(assessment)
+    questions = db.query(AssessmentQuestion).filter(AssessmentQuestion.assessment_id == assessment.id).order_by(AssessmentQuestion.id).all()
+    return {
+        'id': assessment.id,
+        'assignment_id': assessment.assignment_id,
+        'version': assessment.version,
+        'status': assessment.status,
+        'question_count': assessment.question_count,
+        'total_marks': total_marks,
+        'validation_results': assessment.validation_results,
+        'source_evidence': assessment.source_evidence,
+        'error_message': assessment.error_message,
+        'questions': [_learning_question_out(question, include_answer=True) for question in questions],
+    }
+
+
+@app.post(f'{settings.api_v1_prefix}/topic-learning-assignments/{{assignment_id}}/assessment')
+def topic_learning_assignment_assessment(assignment_id: int, user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
+    return generate_topic_assessment(assignment_id=assignment_id, user=user, db=db)
+
+
+def _learning_question_out(question: AssessmentQuestion, *, include_answer: bool) -> dict[str, Any]:
+    provenance = question.source_provenance if isinstance(question.source_provenance, dict) else {}
+    result = {
+        'id': question.id,
+        'question_type': question.question_type,
+        'question': question.question,
+        'options': question.options,
+        'marks': question.marks,
+        'explanation': question.explanation,
+        'learning_objective': question.learning_objective,
+        'difficulty': provenance.get('difficulty', 'UNSPECIFIED'),
+        'rubric': question.rubric,
+        'source_evidence': provenance.get('evidence', []),
+    }
+    if include_answer:
+        result['correct_answer'] = question.correct_answer
+    return result
+
+
+def _teacher_learning_assessment_access(assessment_id: int, user: User, db: Session) -> tuple[LearningAssessment, TopicLearningAssignment]:
+    assessment = db.query(LearningAssessment).filter(LearningAssessment.id == assessment_id).first()
+    if assessment is None:
+        raise HTTPException(status_code=404, detail='Learning assessment not found')
+    assignment = db.query(TopicLearningAssignment).filter(TopicLearningAssignment.id == assessment.assignment_id).first()
+    if assignment is None or not _topic_assignment_scope_is_valid(assignment, db):
+        raise HTTPException(status_code=404, detail='Learning assignment not found')
+    _teacher_subject_access(db, teacher_user=user, subject_id=assignment.subject_id)
+    _recovery_student_access(assignment.student_id, user, db)
+    return assessment, assignment
+
+
+@app.get(f'{settings.api_v1_prefix}/topic-learning-assignments/{{assignment_id}}/assessments')
+def list_learning_assessments(assignment_id: int, user: CurrentTeacher, db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    assignment = db.query(TopicLearningAssignment).filter(TopicLearningAssignment.id == assignment_id).first()
+    if assignment is None or not _topic_assignment_scope_is_valid(assignment, db):
+        raise HTTPException(status_code=404, detail='Learning assignment not found')
+    _teacher_subject_access(db, teacher_user=user, subject_id=assignment.subject_id)
+    _recovery_student_access(assignment.student_id, user, db)
+    assessments = db.query(LearningAssessment).filter(LearningAssessment.assignment_id == assignment_id).order_by(LearningAssessment.version.desc()).all()
+    output = []
+    for assessment in assessments:
+        questions = db.query(AssessmentQuestion).filter(AssessmentQuestion.assessment_id == assessment.id).order_by(AssessmentQuestion.id).all()
+        output.append({
+            'id': assessment.id, 'version': assessment.version, 'status': assessment.status,
+            'question_count': assessment.question_count, 'validation_results': assessment.validation_results,
+            'total_marks': sum(float(question.marks) for question in questions),
+            'error_message': assessment.error_message, 'source_evidence': assessment.source_evidence,
+            'questions': [_learning_question_out(question, include_answer=True) for question in questions],
+            'created_at': assessment.created_at.isoformat(),
+        })
+    return output
+
+
+@app.post(f'{settings.api_v1_prefix}/learning-assessments/{{assessment_id}}/approve')
+def approve_learning_assessment(assessment_id: int, payload: LearningAssessmentReview, user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
+    assessment, assignment = _teacher_learning_assessment_access(assessment_id, user, db)
+    if assessment.status != 'REVIEW_REQUIRED':
+        raise HTTPException(status_code=409, detail='Only assessments awaiting review can be approved.')
+    validation = assessment.validation_results or {}
+    questions = db.query(AssessmentQuestion).filter_by(
+        assessment_id=assessment.id,
+    ).order_by(AssessmentQuestion.id).all()
+    mcq_count = sum(question.question_type == 'MCQ' for question in questions)
+    short_answer_count = sum(question.question_type == 'SHORT_ANSWER' for question in questions)
+    total_marks = sum(float(question.marks) for question in questions)
+    issues = list(validation.get('issues') or [])
+    if len(questions) != 20 or assessment.question_count != 20:
+        issues.append('The persisted assessment must contain exactly 20 questions.')
+    if mcq_count != 15 or short_answer_count != 5:
+        issues.append('The persisted assessment must contain exactly 15 MCQs and 5 short-answer questions.')
+    if any(question.question_type not in {'MCQ', 'SHORT_ANSWER'} for question in questions):
+        issues.append('The persisted assessment contains an unsupported question type.')
+    if any(
+        not math.isclose(
+            float(question.marks),
+            float(LEARNING_ASSESSMENT_QUESTION_MARKS),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        for question in questions
+    ):
+        issues.append('Every persisted assessment question must be worth exactly five marks.')
+    if not math.isclose(
+        total_marks,
+        float(LEARNING_ASSESSMENT_TOTAL_MARKS),
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        issues.append('The persisted assessment must total exactly 100 marks.')
+    if not validation.get('valid') or validation.get('total_marks') != LEARNING_ASSESSMENT_TOTAL_MARKS:
+        issues.append('The generated assessment validation did not pass.')
+    if any(
+        question.subject_id != assignment.subject_id
+        or question.module_id != assignment.module_id
+        or question.topic_id != assignment.approved_topic_id
+        for question in questions
+    ):
+        issues.append('Persisted questions must belong to the assigned subject, module, and approved topic.')
+    if issues:
+        raise HTTPException(status_code=422, detail={
+            'message': 'Assessment validation must pass before approval.',
+            'issues': list(dict.fromkeys(issues)),
+        })
+    assessment.status = 'APPROVED'
+    assessment.approved_by_user_id = user.id
+    assessment.approved_at = datetime.utcnow()
+    assessment.review_reason = payload.reason
+    _recovery_audit(db, user, 'learning_assessment.approved', 'learning_assessment', assessment.id, previous_state='REVIEW_REQUIRED', new_state='APPROVED', reason=payload.reason)
+    db.commit()
+    return {'id': assessment.id, 'status': assessment.status, 'approved_at': assessment.approved_at.isoformat()}
+
+
+@app.post(f'{settings.api_v1_prefix}/learning-assessments/{{assessment_id}}/reject')
+def reject_learning_assessment(assessment_id: int, payload: LearningAssessmentReview, user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
+    assessment, _ = _teacher_learning_assessment_access(assessment_id, user, db)
+    if assessment.status not in {'REVIEW_REQUIRED', 'APPROVED'}:
+        raise HTTPException(status_code=409, detail='This assessment can no longer be rejected.')
+    if not payload.reason or len(payload.reason.strip()) < 5:
+        raise HTTPException(status_code=422, detail='Provide a reason of at least five characters.')
+    previous = assessment.status
+    assessment.status = 'REJECTED'
+    assessment.review_reason = payload.reason.strip()
+    _recovery_audit(db, user, 'learning_assessment.rejected', 'learning_assessment', assessment.id, previous_state=previous, new_state='REJECTED', reason=assessment.review_reason)
+    db.commit()
+    return {'id': assessment.id, 'status': assessment.status, 'review_reason': assessment.review_reason}
+
+
+@app.post(f'{settings.api_v1_prefix}/learning-assessments/{{assessment_id}}/publish')
+def publish_learning_assessment(assessment_id: int, user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
+    assessment, _ = _teacher_learning_assessment_access(assessment_id, user, db)
+    if assessment.status != 'APPROVED':
+        raise HTTPException(status_code=409, detail='Approve a validated assessment before publishing it.')
+    assessment.status = 'PUBLISHED'
+    assessment.published_at = datetime.utcnow()
+    _recovery_audit(db, user, 'learning_assessment.published', 'learning_assessment', assessment.id, previous_state='APPROVED', new_state='PUBLISHED')
+    db.commit()
+    return {'id': assessment.id, 'status': assessment.status, 'published_at': assessment.published_at.isoformat()}
+
+
+@app.post(f'{settings.api_v1_prefix}/topic-learning-assignments/{{assignment_id}}/attempts')
+def create_topic_learning_attempt(assignment_id: int, student: CurrentStudent, db: Session = Depends(get_db)) -> dict[str, Any]:
+    assignment = _student_learning_assignment_access(assignment_id, student, db)
+    if assignment.status == 'MASTERED':
+        raise HTTPException(status_code=409, detail='This topic is already mastered.')
+    session = db.query(LearningStudySession).filter_by(assignment_id=assignment.id, student_id=student.id).first()
+    if session is None or session.completed_at is None or (datetime.utcnow() - session.started_at).total_seconds() < session.required_duration_minutes * 60:
+        raise HTTPException(status_code=409, detail='Complete the required server-timed study duration before starting the assessment.')
+    assessment = db.query(LearningAssessment).filter_by(assignment_id=assignment.id, status='PUBLISHED').order_by(LearningAssessment.version.desc()).first()
+    if assessment is None:
+        raise HTTPException(status_code=409, detail='No teacher-published assessment is available for this topic.')
+    existing_attempt = db.query(AssessmentAttempt).filter_by(
+        assignment_id=assignment.id, assessment_id=assessment.id, student_id=student.id, status='IN_PROGRESS',
+    ).first()
+    if existing_attempt:
+        return {
+            'id': existing_attempt.id, 'assignment_id': existing_attempt.assignment_id,
+            'student_id': existing_attempt.student_id, 'status': existing_attempt.status,
+            'question_count': len(existing_attempt.question_set.get('questions', [])),
+            'question_set': existing_attempt.question_set,
+        }
+    questions = db.query(AssessmentQuestion).filter(AssessmentQuestion.assessment_id == assessment.id).order_by(AssessmentQuestion.id).all()
+    if len(questions) != 20:
+        raise HTTPException(status_code=409, detail='The published assessment is incomplete and needs teacher review.')
+    if any(
+        question.subject_id != assignment.subject_id
+        or question.module_id != assignment.module_id
+        or question.topic_id != assignment.approved_topic_id
+        for question in questions
+    ):
+        raise HTTPException(status_code=409, detail='The published assessment contains questions outside this subject topic.')
+    attempt = AssessmentAttempt(
+        assignment_id=assignment.id,
+        assessment_id=assessment.id,
+        study_session_id=session.id,
+        student_id=student.id,
+        question_set_version=assessment.version,
+        status='IN_PROGRESS',
+        question_set={'questions': [{
+            'id': q.id, 'question_type': q.question_type, 'question': q.question,
+            'options': q.options, 'marks': q.marks, 'learning_objective': q.learning_objective,
+            'rubric': q.rubric, 'source_evidence': (q.source_provenance or {}).get('evidence', []),
+        } for q in questions]},
+        answer_key={str(q.id): {'correct_answer': q.correct_answer, 'marks': q.marks, 'question_type': q.question_type} for q in questions},
+    )
+    db.add(attempt)
+    db.commit()
+    db.refresh(attempt)
+    return {
+        'id': attempt.id,
+        'assignment_id': attempt.assignment_id,
+        'student_id': attempt.student_id,
+        'status': attempt.status,
+        'question_count': len(questions),
+        'question_set': attempt.question_set,
+    }
+
+
+@app.post(f'{settings.api_v1_prefix}/assessment-attempts/{{attempt_id}}/submit')
+def submit_topic_learning_attempt(attempt_id: int, payload: dict[str, Any], student: CurrentStudent, db: Session = Depends(get_db)) -> dict[str, Any]:
+    attempt = db.query(AssessmentAttempt).filter(AssessmentAttempt.id == attempt_id, AssessmentAttempt.student_id == student.id).first()
+    if attempt is None:
+        raise HTTPException(status_code=404, detail='Attempt not found')
+    assignment = db.query(TopicLearningAssignment).filter_by(
+        id=attempt.assignment_id,
+        student_id=student.id,
+    ).first()
+    if assignment is None or not _topic_assignment_scope_is_valid(assignment, db):
+        raise HTTPException(status_code=404, detail='Attempt not found')
+    if attempt.status in {'SUBMITTED', 'AWAITING_REVIEW'}:
+        return {'id': attempt.id, 'status': attempt.status, 'total_marks': attempt.total_marks, 'percentage': attempt.percentage}
+    if attempt.status != 'IN_PROGRESS':
+        raise HTTPException(status_code=409, detail='This assessment attempt is not open for submission.')
+    assessment = db.query(LearningAssessment).filter_by(
+        id=attempt.assessment_id,
+        assignment_id=assignment.id,
+        status='PUBLISHED',
+    ).first()
+    if assessment is None:
+        raise HTTPException(status_code=409, detail='The assessment is no longer published.')
+    session = db.query(LearningStudySession).filter_by(
+        id=attempt.study_session_id,
+        assignment_id=assignment.id,
+        student_id=student.id,
+    ).first()
+    if session is None or session.completed_at is None or (datetime.utcnow() - session.started_at).total_seconds() < session.required_duration_minutes * 60:
+        raise HTTPException(status_code=409, detail='The required study session is not complete.')
+    try:
+        submission = AssessmentAttemptSubmit.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+    questions = db.query(AssessmentQuestion).filter(AssessmentQuestion.id.in_([int(key) for key in attempt.answer_key.keys()])).all()
+    expected_ids = set(attempt.answer_key)
+    if set(submission.answers) != expected_ids or len(questions) != 20:
+        raise HTTPException(status_code=422, detail='Submit exactly one answer for each of the 20 assessment questions.')
+    if any(
+        question.assessment_id != assessment.id
+        or question.subject_id != assignment.subject_id
+        or question.module_id != assignment.module_id
+        or question.topic_id != assignment.approved_topic_id
+        for question in questions
+    ):
+        raise HTTPException(status_code=409, detail='Assessment attempt questions do not match the assigned subject topic.')
+    questions_by_id = {question.id: question for question in questions}
+    total_marks = 0.0
+    responses = []
+    requires_review = False
+    for key, value in submission.answers.items():
+        question_id = int(key)
+        question = questions_by_id.get(question_id)
+        if question is None:
+            raise HTTPException(status_code=422, detail='The submission contains an unknown question.')
+        review_required = False
+        review_reason = None
+        rubric_evaluation: dict[str, Any] = {}
+        if question.question_type == 'MCQ':
+            selected = value.strip()
+            is_correct = selected == question.correct_answer
+            marks = float(question.marks) if is_correct else 0.0
+            feedback = 'Correct.' if is_correct else 'Incorrect. Review the approved source material and try again in a future attempt.'
+            source_reference = question.source_reference
+        else:
+            response_text = value.strip()
+            source_reference = question.source_reference
+            context = {
+                'question': question.question,
+                'student_answer': response_text,
+                'reference_answer': question.correct_answer,
+                'rubric': question.rubric,
+                'source_evidence': (question.source_provenance or {}).get('evidence', []),
+            }
+            try:
+                provider = build_provider(settings)
+                rubric_evaluation = validate_short_answer_evaluation(provider.evaluate_short_answer(context))
+                marks = min(float(question.marks), float(question.marks) * rubric_evaluation['marks_awarded'])
+                feedback = rubric_evaluation['feedback']
+                review_required = rubric_evaluation['needs_review']
+                review_reason = 'Evaluator confidence below policy threshold or answer flagged as ambiguous.' if review_required else None
+                is_correct = marks >= float(question.marks)
+            except (RuntimeError, ValueError) as exc:
+                marks = 0.0
+                feedback = 'Automated grading was unavailable; a teacher must review this response.'
+                review_required = True
+                review_reason = str(exc)[:1000]
+                rubric_evaluation = {'needs_review': True, 'provider_error': str(exc)[:1000]}
+                is_correct = None
+            requires_review = requires_review or review_required
+        total_marks += marks
+        response_record = AssessmentAttemptAnswer(
+            attempt_id=attempt.id,
+            question_id=question.id,
+            selected_choice=str(value) if question.question_type == 'MCQ' else None,
+            response_text=str(value) if question.question_type != 'MCQ' else None,
+            marks_awarded=marks,
+            original_marks_awarded=marks,
+            is_correct=is_correct,
+            review_required=review_required,
+            feedback=feedback,
+            review_reason=review_reason,
+            rubric_evaluation=rubric_evaluation,
+            source_reference=source_reference,
+        )
+        db.add(response_record)
+        responses.append({'question_id': question.id, 'marks_awarded': marks, 'feedback': feedback})
+    attempt.status = 'AWAITING_REVIEW' if requires_review else 'SUBMITTED'
+    attempt.total_marks = total_marks
+    maximum_marks = _attempt_maximum_marks(attempt)
+    attempt.percentage = round((total_marks / maximum_marks) * 100, 2) if maximum_marks else 0
+    attempt.submitted_at = datetime.utcnow()
+    attempt.evaluated_at = datetime.utcnow()
+    if not requires_review:
+        assignment = db.query(TopicLearningAssignment).filter_by(id=attempt.assignment_id).first()
+        if assignment:
+            assignment.status = 'MASTERED' if attempt.percentage >= 80 else 'REVISION_REQUIRED'
+    db.commit()
+    return {'id': attempt.id, 'status': attempt.status, 'total_marks': attempt.total_marks, 'percentage': attempt.percentage, 'review_pending': requires_review, 'responses': responses}
+
+
+@app.get(f'{settings.api_v1_prefix}/teacher/learning-monitoring')
+def teacher_learning_monitoring(user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
+    subject_ids = _teacher_assigned_subject_ids(db, user)
+    if not subject_ids:
+        return {'topic_count': 0, 'assignment_count': 0, 'resource_count': 0, 'status': 'active'}
+    topic_count = db.query(ApprovedTopic).filter(ApprovedTopic.subject_id.in_(subject_ids)).count()
+    assignments = db.query(TopicLearningAssignment).filter(TopicLearningAssignment.subject_id.in_(subject_ids)).count()
+    resources = db.query(SubjectModuleResource).filter(SubjectModuleResource.subject_id.in_(subject_ids)).count()
+    return {'topic_count': topic_count, 'assignment_count': assignments, 'resource_count': resources, 'status': 'active'}
 
 
 @app.get(f'{settings.api_v1_prefix}/academic-register')
@@ -602,6 +2352,7 @@ def student_subject_records(student: Student, db: Session, academic_period: str 
         'student_id': student.student_id,
         'academic_period': period,
         'academic_periods': academic_periods(db),
+        'records': subject_record_evidence(db, student.id, period),
         'subjects': {subject.code: {'name': subject.name, **serialize_record(records.get(subject.code))} for subject in subjects},
         **academic_totals(records),
         'risk_scope': 'global model; subject marks are not model features',
@@ -675,9 +2426,18 @@ def update_academic_record(
         db.add(record)
         db.flush()
     updates = payload.model_dump(exclude_unset=True)
+    if updates.get('fa1') is not None:
+        fa1_maximum = record.fa1_maximum_marks if record.fa1_maximum_marks is not None else 25
+        if updates['fa1'] > fa1_maximum:
+            raise HTTPException(
+                status_code=422,
+                detail=f'fa1 must not exceed the recorded maximum of {fa1_maximum}.',
+            )
     old_values = {field: getattr(record, field) for field in updates}
     for field, value in updates.items():
         setattr(record, field, value)
+    if 'fa1' in updates:
+        record.temporal_evidence_verified = False
     record.updated_by_user_id = user.id
     db.add(StudentSubjectAcademicRecordHistory(
         academic_record_id=record.id,
@@ -685,6 +2445,8 @@ def update_academic_record(
         change_kind='manual',
         fa1=record.fa1,
         fa1_observed_at=record.fa1_observed_at,
+        fa1_maximum_marks=record.fa1_maximum_marks,
+        fa1_maximum_verified=record.fa1_maximum_verified,
         fa2=record.fa2,
         fa2_observed_at=record.fa2_observed_at,
         assignment_mark=record.assignment_mark,
@@ -712,6 +2474,111 @@ def update_academic_record(
         **serialize_record(record),
         'register_row': register_row,
     }
+
+
+@app.post(f'{settings.api_v1_prefix}/academic-register/{{student_id}}/{{subject_code}}/fa1-maximum-verification')
+def verify_fa1_maximum_evidence(
+    student_id: int,
+    subject_code: str,
+    payload: Fa1MaximumEvidenceReview,
+    user: CurrentTeacher,
+    academic_period: str = Query(...),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    student = db.query(Student).filter(Student.id == student_id).first()
+    subject = db.query(Subject).filter(
+        Subject.code == subject_code.upper(),
+        Subject.code.in_(SUBJECTS),
+    ).first()
+    if student is None:
+        raise HTTPException(status_code=404, detail='Student not found')
+    if subject is None:
+        raise HTTPException(status_code=404, detail='Subject not found')
+    try:
+        period = normalize_academic_period(academic_period)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    _, teacher = _teacher_subject_access(db, teacher_user=user, subject_id=subject.id)
+    assigned_course = db.query(Course).filter_by(
+        id=student.course_id,
+        subject_id=subject.id,
+        teacher_id=teacher.id,
+    ).first()
+    if assigned_course is None:
+        raise HTTPException(status_code=403, detail='Teacher is not assigned to this student and subject')
+
+    record = db.query(StudentSubjectAcademicRecord).filter_by(
+        student_id=student.id,
+        subject_id=subject.id,
+        academic_period=period,
+    ).first()
+    if record is None:
+        raise HTTPException(status_code=404, detail='Subject academic record not found')
+    batch = (
+        db.query(AcademicDataImportBatch)
+        .filter(AcademicDataImportBatch.id == record.import_batch_id)
+        .first()
+        if record.import_batch_id is not None
+        else None
+    )
+    if record.fa1 is None:
+        raise HTTPException(status_code=409, detail='A recorded FA-1 mark is required before maximum evidence can be reviewed')
+    if record.fa1_observed_at is None or not record.temporal_evidence_verified:
+        raise HTTPException(status_code=409, detail='A dated, temporally verified FA-1 observation is required')
+    if (
+        record.fa1_maximum_marks is None
+        or not math.isfinite(record.fa1_maximum_marks)
+        or record.fa1_maximum_marks <= 0
+        or record.fa1 > record.fa1_maximum_marks
+    ):
+        raise HTTPException(status_code=409, detail='A valid recorded FA-1 maximum that covers the score is required')
+    if batch is None or not batch.source_filename.strip():
+        raise HTTPException(status_code=409, detail='Imported source provenance is required before maximum evidence can be reviewed')
+    if payload.source_reference.casefold() == batch.source_filename.strip().casefold():
+        raise HTTPException(status_code=409, detail='Maximum review must cite an independent source, not only the imported filename')
+
+    record.fa1_maximum_verified = True
+    record.updated_by_user_id = user.id
+    db.add(StudentSubjectAcademicRecordHistory(
+        academic_record_id=record.id,
+        import_batch_id=record.import_batch_id,
+        changed_by_user_id=user.id,
+        change_kind='fa1_maximum_verified',
+        fa1=record.fa1,
+        fa1_observed_at=record.fa1_observed_at,
+        fa1_maximum_marks=record.fa1_maximum_marks,
+        fa1_maximum_verified=True,
+        fa2=record.fa2,
+        fa2_observed_at=record.fa2_observed_at,
+        assignment_mark=record.assignment_mark,
+        assignment_observed_at=record.assignment_observed_at,
+        attendance_rate=record.attendance_rate,
+        attendance_observed_at=record.attendance_observed_at,
+    ))
+    db.add(AuditLog(
+        actor_user_id=user.id,
+        action='academic_subject_record.fa1_maximum_verified',
+        resource_type='student_subject_academic_record',
+        resource_id=str(record.id),
+        detail={
+            'student_id': student.student_id,
+            'subject_id': subject.id,
+            'subject_code': subject.code,
+            'academic_period': period,
+            'fa1': record.fa1,
+            'fa1_observed_at': record.fa1_observed_at.isoformat(),
+            'fa1_maximum_marks': record.fa1_maximum_marks,
+            'import_batch_id': batch.id,
+            'import_source_filename': batch.source_filename,
+            'source_reference': payload.source_reference,
+        },
+    ))
+    db.commit()
+    return next(
+        item for item in subject_record_evidence(db, student.id, period)
+        if item['record_id'] == record.id
+    )
 
 
 @app.get(f'{settings.api_v1_prefix}/me')
@@ -839,7 +2706,16 @@ def my_subjects(student: CurrentStudent, db: Session = Depends(get_db)) -> list[
     recorded_rates = [item.attendance_rate for item in attendance_rows if item.attendance_rate is not None]
     attendance_rate = sum(recorded_rates) / len(recorded_rates) if recorded_rates else sum(item.attended for item in attendance_rows) / len(attendance_rows) * 100 if attendance_rows else None
     teacher_name = course.teacher.user.full_name if course and course.teacher and course.teacher.user else None
-    return [{'course': course.name, 'course_code': course.code, 'section': course.section, 'subject': subject.name if subject else course.name, 'teacher': teacher_name, 'attendance': attendance_rate, 'assessments': results}]
+    return [{
+        'course': course.name,
+        'course_code': course.code,
+        'subject_id': subject.id if subject else None,
+        'section': course.section,
+        'subject': subject.name if subject else course.name,
+        'teacher': teacher_name,
+        'attendance': attendance_rate,
+        'assessments': results,
+    }]
 
 
 @app.get(f'{settings.api_v1_prefix}/support/resources')
@@ -974,6 +2850,1968 @@ def student_support_plan_history(student_id: int, user: CurrentUser, db: Session
     student = _student_access(student_id, user, db)
     items = db.query(SupportPlanVersion).filter(SupportPlanVersion.student_id == student.id).order_by(SupportPlanVersion.version.desc(), SupportPlanVersion.created_at.desc()).all()
     return {'student_id': student.id, 'items': [{'id': item.id, 'version': item.version, 'summary': item.summary, 'plan': item.plan_json.get('plan', []), 'created_at': item.created_at.isoformat()} for item in items]}
+
+
+def _recovery_student_access(student_id: int, user: User, db: Session) -> Student:
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if student is None:
+        raise HTTPException(status_code=404, detail='Student not found')
+    role = user.role.upper()
+    if role == 'STUDENT':
+        if student.user_id != user.id:
+            raise HTTPException(status_code=404, detail='Student not found')
+        return student
+    if role != 'TEACHER':
+        raise HTTPException(status_code=403, detail='Recovery roadmap access required')
+    teacher = db.query(Teacher).filter(Teacher.user_id == user.id).first()
+    if teacher is None:
+        raise HTTPException(status_code=403, detail='Teacher profile is not linked')
+    if student.course_id is None:
+        query = db.query(Course.id).filter(
+            Course.teacher_id == teacher.id,
+            Course.section == student.section,
+        ) if student.section else db.query(Course.id).filter(False)
+    else:
+        query = db.query(Course.id).filter(
+            Course.teacher_id == teacher.id,
+            Course.id == student.course_id,
+        )
+    if query.first() is None:
+        raise HTTPException(status_code=404, detail='Student not found')
+    return student
+
+
+def _teacher_assigned_subject_ids(db: Session, user: User) -> set[int]:
+    teacher = db.query(Teacher).filter(Teacher.user_id == user.id).first()
+    if teacher is None:
+        raise HTTPException(status_code=403, detail='Teacher profile is not linked')
+    return {
+        subject_id for (subject_id,) in db.query(Course.subject_id)
+        .filter(Course.teacher_id == teacher.id, Course.subject_id.is_not(None))
+        .distinct()
+        .all()
+    }
+
+
+def _recovery_plan_subject_ids(plan: SupportPlanVersion) -> set[int]:
+    if plan.subject_id is not None:
+        return {plan.subject_id}
+    if not plan.is_blueprint_group:
+        return set()
+    plan_json = plan.plan_json or {}
+    blueprint = plan_json.get('blueprint')
+    subject_ids = {
+        int(item['subject_id'])
+        for item in blueprint.get('subjects', [])
+        if item.get('subject_id') is not None
+    } if isinstance(blueprint, dict) else set()
+    subject_ids.update(
+        int(item['subject_id'])
+        for item in plan_json.get('tasks', [])
+        if item.get('subject_id') is not None
+    )
+    return subject_ids
+
+
+def _recovery_plan_access(plan_id: int, user: User, db: Session) -> SupportPlanVersion:
+    plan = db.query(SupportPlanVersion).filter(SupportPlanVersion.id == plan_id).first()
+    if plan is None:
+        raise HTTPException(status_code=404, detail='Recovery plan not found')
+    _recovery_student_access(plan.student_id, user, db)
+    if user.role.upper() == 'STUDENT':
+        if (
+            plan.status != PLAN_PUBLISHED
+            or plan.is_blueprint_group
+            or plan.subject_scope_review_required
+            or plan.subject_id is None
+        ):
+            raise HTTPException(status_code=404, detail='Recovery plan not found')
+    else:
+        subject_ids = _recovery_plan_subject_ids(plan)
+        allowed_subject_ids = _teacher_assigned_subject_ids(db, user)
+        if not subject_ids or not subject_ids.issubset(allowed_subject_ids):
+            raise HTTPException(status_code=404, detail='Recovery plan not found')
+    return plan
+
+
+def _recovery_task_access(task_id: int, user: User, db: Session, *, lock: bool = False) -> RecoveryTask:
+    task_query = db.query(RecoveryTask).filter(RecoveryTask.id == task_id)
+    if lock:
+        task_query = task_query.with_for_update()
+    task = task_query.first()
+    if task is None:
+        raise HTTPException(status_code=404, detail='Recovery task not found')
+    _recovery_student_access(task.student_id, user, db)
+    plan = db.query(SupportPlanVersion).filter(SupportPlanVersion.id == task.roadmap_version_id).first()
+    if plan is None or plan.status != PLAN_PUBLISHED:
+        raise HTTPException(status_code=404, detail='Recovery task not found')
+    if user.role.upper() == 'STUDENT' and (
+        task.subject_scope_review_required
+        or task.subject_id is None
+        or plan.subject_id != task.subject_id
+        or plan.subject_scope_review_required
+    ):
+        raise HTTPException(status_code=404, detail='Recovery task not found')
+    if user.role.upper() == 'TEACHER' and task.subject_id is not None:
+        _teacher_subject_access(db, teacher_user=user, subject_id=task.subject_id)
+    if task.status == TASK_DRAFT and user.role.upper() == 'STUDENT':
+        raise HTTPException(status_code=404, detail='Recovery task not found')
+    return task
+
+
+def _recovery_task_out(task: RecoveryTask) -> RecoveryTaskOut:
+    result = RecoveryTaskOut.model_validate(task).model_dump()
+    plan = task.roadmap
+    definition = next(
+        (
+            item for item in (plan.plan_json or {}).get('tasks', [])
+            if item.get('task_key') == task.task_key
+        ),
+        {},
+    )
+    evidence_refs = definition.get('evidence_refs', [])
+    evidence_records = plan.evidence_json.get('academic_records', [])
+    try:
+        activity = RecoveryActivity.model_validate(definition.get('activity'))
+    except (ValidationError, TypeError):
+        activity = RecoveryActivity.model_validate(legacy_recovery_activity(task))
+    result.update({
+        'evidence_refs': evidence_refs,
+        'evidence': [item for item in evidence_records if item.get('ref') in evidence_refs],
+        'field_provenance': definition.get('field_provenance', {}),
+        'activity': activity.model_dump(mode='json'),
+        'stage': definition.get('stage'),
+    })
+    return RecoveryTaskOut.model_validate(result)
+
+
+def _published_recovery_tasks(
+    db: Session,
+    student_id: int,
+    status: str | None,
+    user: User | None = None,
+) -> list[RecoveryTask]:
+    query = (
+        db.query(RecoveryTask)
+        .join(SupportPlanVersion, SupportPlanVersion.id == RecoveryTask.roadmap_version_id)
+        .filter(
+            RecoveryTask.student_id == student_id,
+            SupportPlanVersion.status == PLAN_PUBLISHED,
+            SupportPlanVersion.is_blueprint_group.is_(False),
+            SupportPlanVersion.subject_scope_review_required.is_(False),
+            SupportPlanVersion.subject_id == RecoveryTask.subject_id,
+            RecoveryTask.subject_id.is_not(None),
+            RecoveryTask.subject_scope_review_required.is_(False),
+            RecoveryTask.status != TASK_DRAFT,
+            RecoveryTask.status != TASK_SUPERSEDED,
+        )
+    )
+    if status:
+        query = query.filter(RecoveryTask.status == status)
+    if user is not None and user.role.upper() == 'TEACHER':
+        teacher = db.query(Teacher).filter(Teacher.user_id == user.id).first()
+        if teacher is None:
+            raise HTTPException(status_code=403, detail='Teacher profile is not linked')
+        query = (
+            query.join(Subject, Subject.id == RecoveryTask.subject_id)
+            .join(Course, Course.subject_id == Subject.id)
+            .filter(Course.teacher_id == teacher.id)
+        )
+    return query.order_by(RecoveryTask.scheduled_at.is_(None), RecoveryTask.scheduled_at, RecoveryTask.id).all()
+
+
+def _recovery_plan_out(plan: SupportPlanVersion) -> RecoveryPlanOut:
+    return RecoveryPlanOut(
+        id=plan.id,
+        student_id=plan.student_id,
+        subject_id=plan.subject_id,
+        subject_scope_review_required=plan.subject_scope_review_required,
+        blueprint_group_id=plan.blueprint_group_id,
+        is_blueprint_group=plan.is_blueprint_group,
+        source_blueprint_plan_id=plan.source_blueprint_plan_id,
+        teacher_id=plan.teacher_id,
+        version=plan.version,
+        status=plan.status,
+        summary=plan.summary,
+        plan=plan.plan_json,
+        evidence=plan.evidence_json,
+        generation_key=plan.generation_key,
+        approved_by_user_id=plan.approved_by_user_id,
+        approved_at=plan.approved_at,
+        published_at=plan.published_at,
+        created_at=plan.created_at,
+    )
+
+
+def _refresh_blueprint_assessment_status(db: Session, topic: dict[str, Any]) -> None:
+    assignment_id = topic.get('assignment_id')
+    if not assignment_id:
+        topic.setdefault('assessment', {})['status'] = 'BLOCKED_NO_SOURCE_BACKED_ASSIGNMENT'
+        return
+    assessments = db.query(LearningAssessment).filter_by(
+        assignment_id=assignment_id,
+    ).order_by(LearningAssessment.version.desc()).all()
+    published = next((item for item in assessments if item.status == 'PUBLISHED'), None)
+    current = published or (assessments[0] if assessments else None)
+    assessment_info = topic.setdefault('assessment', {})
+    assessment_info['status'] = current.status if current else 'NOT_GENERATED'
+    assessment_info['assessment_id'] = current.id if current else None
+    if current is not None:
+        questions = db.query(AssessmentQuestion).filter_by(assessment_id=current.id).all()
+        assessment_info['question_count'] = len(questions)
+        assessment_info['mcq_count'] = sum(item.question_type == 'MCQ' for item in questions)
+        assessment_info['short_answer_count'] = sum(item.question_type == 'SHORT_ANSWER' for item in questions)
+        assessment_info['validation_results'] = current.validation_results
+
+
+def _recovery_blueprint_publish_blockers(db: Session, plan: SupportPlanVersion) -> list[str]:
+    blueprint = (plan.plan_json or {}).get('blueprint')
+    if not isinstance(blueprint, dict):
+        return []
+    blueprint = json.loads(json.dumps(blueprint))
+    blockers: list[str] = []
+    if blueprint.get('generation_status') != 'GENERATED_NEEDS_TEACHER_REVIEW':
+        blockers.append('Valid AI blueprint recommendations are not available.')
+    if not blueprint.get('syllabus', {}).get('reviewed'):
+        blockers.append('Teacher review or acknowledgement of the syllabus context is required.')
+    topic_items = [
+        topic
+        for subject in blueprint.get('subjects', [])
+        for topic in subject.get('topics', [])
+    ]
+    if not topic_items:
+        blockers.append('The blueprint contains no extracted topics to review.')
+    for topic in topic_items:
+        _refresh_blueprint_assessment_status(db, topic)
+        decision = topic.get('decision')
+        if decision not in {'INCLUDE', 'EXCLUDE'}:
+            blockers.append(f'Topic "{topic.get("title", topic.get("topic_id"))}" needs an include or exclude decision.')
+            continue
+        if decision == 'EXCLUDE':
+            continue
+        if not topic.get('source_ready'):
+            blockers.append(f'Included topic "{topic.get("title")}" has no readable approved source material.')
+        if not topic.get('priority') or not topic.get('suggested_minutes'):
+            blockers.append(f'Included topic "{topic.get("title")}" has no validated recommendation.')
+        if blueprint.get('syllabus', {}).get('context') and not topic.get('syllabus_mapping'):
+            blockers.append(f'Included topic "{topic.get("title")}" needs a teacher-confirmed syllabus mapping.')
+        if topic.get('conflict_resolution_status') == 'NEEDS_TEACHER_REVIEW' and not topic.get('conflict_resolution'):
+            blockers.append(f'Included topic "{topic.get("title")}" has an unresolved source-order conflict.')
+        assessment = topic.get('assessment') or {}
+        if assessment.get('status') != 'PUBLISHED':
+            blockers.append(f'Included topic "{topic.get("title")}" needs a teacher-approved and published assessment.')
+        elif (
+            assessment.get('question_count') != 20
+            or assessment.get('mcq_count') != 15
+            or assessment.get('short_answer_count') != 5
+            or not (assessment.get('validation_results') or {}).get('valid')
+        ):
+            blockers.append(f'Included topic "{topic.get("title")}" does not have a validated 15-MCQ/5-short-answer assessment.')
+        if not topic.get('assignment_id'):
+            blockers.append(f'Included topic "{topic.get("title")}" has no learning assignment.')
+    for subject in blueprint.get('subjects', []):
+        if not any(
+            topic.get('decision') == 'INCLUDE'
+            for topic in subject.get('topics', [])
+        ):
+            blockers.append(f'{subject.get("subject_name", "Selected subject")} has no included topic in the blueprint.')
+        for module_number in (3, 4):
+            if not any(
+                topic.get('decision') == 'INCLUDE'
+                and topic.get('module_number') == module_number
+                for topic in subject.get('topics', [])
+            ):
+                blockers.append(
+                    f'{subject.get("subject_name", "Eligible subject")} has no included, '
+                    f'source-backed Module {module_number} topic for the global recovery stage.'
+                )
+    included_ids = {
+        topic['topic_id'] for topic in topic_items if topic.get('decision') == 'INCLUDE'
+    }
+    if not included_ids:
+        blockers.append('At least one supported topic must be included in the roadmap.')
+    schedule = blueprint.get('schedule', [])
+    included_subjects = {
+        subject['subject_id']
+        for subject in blueprint.get('subjects', [])
+        if any(topic.get('decision') == 'INCLUDE' for topic in subject.get('topics', []))
+    }
+    topic_subjects = {
+        topic['topic_id']: subject['subject_id']
+        for subject in blueprint.get('subjects', [])
+        for topic in subject.get('topics', [])
+    }
+    topic_stages = {
+        topic['topic_id']: topic.get('stage')
+        for subject in blueprint.get('subjects', [])
+        for topic in subject.get('topics', [])
+    }
+    stage_dates: dict[str, list[date]] = {}
+    scheduled_topic_ids = {
+        item.get('topic_id') for item in schedule
+        if item.get('activity') == 'TOPIC_STUDY'
+    }
+    for topic_id in included_ids - scheduled_topic_ids:
+        blockers.append(f'Included topic {topic_id} has no scheduled study time.')
+    daily_totals: dict[str, int] = {}
+    topic_minutes: dict[int, int] = {}
+    subject_activities: dict[int, set[str]] = {}
+    for item in schedule:
+        day = item.get('scheduled_date')
+        subject_id = item.get('subject_id')
+        activity = item.get('activity')
+        if subject_id not in included_subjects:
+            blockers.append('Every schedule entry must identify a subject with an included topic.')
+        else:
+            subject_activities.setdefault(subject_id, set()).add(activity)
+        if activity == 'TOPIC_STUDY' and (
+            item.get('topic_id') not in topic_subjects
+            or topic_subjects.get(item.get('topic_id')) != subject_id
+        ):
+            blockers.append('A topic study schedule entry must match the topic subject.')
+        expected_stage = (
+            topic_stages.get(item.get('topic_id'))
+            if activity == 'TOPIC_STUDY'
+            else 'REVISION_ASSESSMENT'
+        )
+        if item.get('stage') != expected_stage:
+            blockers.append('Every schedule entry must preserve its validated global recovery stage.')
+        if item.get('provenance') != 'TEACHER_EDITED':
+            blockers.append('A teacher must confirm every scheduled date before publication.')
+        if day:
+            daily_totals[day] = daily_totals.get(day, 0) + int(item.get('estimated_minutes', 0))
+            if item.get('stage'):
+                stage_dates.setdefault(item['stage'], []).append(date.fromisoformat(day))
+        if activity == 'TOPIC_STUDY' and item.get('topic_id') in included_ids:
+            topic_id = item['topic_id']
+            topic_minutes[topic_id] = topic_minutes.get(topic_id, 0) + int(item.get('estimated_minutes', 0))
+        if day and date.fromisoformat(day) < _institutional_today():
+            blockers.append(f'Schedule entry on {day} is in the past; move it to a future date.')
+        if item.get('topic_id') not in included_ids and item.get('topic_id') is not None:
+            blockers.append(f'Schedule includes excluded or unconfirmed topic {item["topic_id"]}.')
+    if any(total > 240 for total in topic_minutes.values()):
+        blockers.append('A topic exceeds the maximum supported 240-minute backend-enforced study session.')
+    if any(total > blueprint.get('available_minutes_per_day', 60) for total in daily_totals.values()):
+        blockers.append('One or more scheduled days exceed the available study minutes.')
+    if not schedule:
+        blockers.append('No dated subject-specific schedule is available for publication.')
+    if (
+        stage_dates.get('MODULE_3')
+        and stage_dates.get('MODULE_4')
+        and max(stage_dates['MODULE_3']) >= min(stage_dates['MODULE_4'])
+    ):
+        blockers.append('Stage 2 must be scheduled after every Module 3 topic in Stage 1.')
+    final_module_dates = stage_dates.get('MODULE_4') or stage_dates.get('MODULE_3') or []
+    if (
+        final_module_dates
+        and stage_dates.get('REVISION_ASSESSMENT')
+        and max(final_module_dates) >= min(stage_dates['REVISION_ASSESSMENT'])
+    ):
+        blockers.append('Revision and assessment practice must be scheduled after the Module 3 and Module 4 stages.')
+    if (date.fromisoformat(blueprint['exam_date']) - _institutional_today()).days >= 4:
+        for subject_id in included_subjects:
+            missing = {'REVISION', 'MOCK_PRACTICE', 'RETENTION_CHECK'} - subject_activities.get(subject_id, set())
+            if missing:
+                blockers.append(
+                    f'Subject {subject_id} is missing feasible pre-exam checkpoints: {", ".join(sorted(missing))}.'
+                )
+    plan.plan_json = {**plan.plan_json, 'blueprint': blueprint}
+    flag_modified(plan, 'plan_json')
+    return list(dict.fromkeys(blockers))
+
+
+def _recovery_audit(
+    db: Session,
+    user: User,
+    action: str,
+    resource_type: str,
+    resource_id: int,
+    *,
+    previous_state: str | None = None,
+    new_state: str | None = None,
+    reason: str | None = None,
+    extra_detail: dict[str, Any] | None = None,
+) -> None:
+    detail = {
+        'actor_role': user.role.upper(),
+        'previous_state': previous_state,
+        'new_state': new_state,
+        'reason': reason,
+    }
+    if extra_detail:
+        detail.update(extra_detail)
+    db.add(AuditLog(
+        actor_user_id=user.id,
+        action=action,
+        resource_type=resource_type,
+        resource_id=str(resource_id),
+        detail=detail,
+    ))
+
+
+@app.get(f'{settings.api_v1_prefix}/students/me/recovery-tasks', response_model=list[RecoveryTaskOut])
+def list_my_recovery_tasks(
+    student: CurrentStudent,
+    db: Session = Depends(get_db),
+    status: str | None = Query(default=None, pattern='^(AVAILABLE|IN_PROGRESS|SUBMITTED|NEEDS_REVISION|COMPLETED)$'),
+) -> list[RecoveryTaskOut]:
+    tasks = _published_recovery_tasks(db, student.id, status)
+    return [_recovery_task_out(task) for task in tasks]
+
+
+@app.get(f'{settings.api_v1_prefix}/students/me/recovery-timeline')
+def my_recovery_timeline(
+    student: CurrentStudent,
+    user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return recovery_timeline(student.id, user, db)
+
+
+@app.post(
+    f'{settings.api_v1_prefix}/students/me/recovery-tutor',
+    response_model=RecoveryTutorOut,
+)
+def recovery_tutor(
+    payload: RecoveryTutorRequest,
+    student: CurrentStudent,
+    user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> RecoveryTutorOut:
+    evidence = build_recovery_evidence(db, student)
+    all_records = evidence['academic_records']
+    academic_records = all_records[-40:]
+    missing_information = list(evidence['missing_information'])
+    if len(all_records) > len(academic_records):
+        missing_information.append('Only 40 academic records are included in this tutor response; earlier records may be omitted.')
+    missing_information.append(
+        'Course-document retrieval is disabled because the available shared index has no enforceable course access scope.'
+    )
+    status = 'no_evidence'
+    answer_source = 'deterministic_fallback'
+    answer = (
+        'The tutor is temporarily unavailable. You can still write down the concept or question you are working on, '
+        'note what you already understand, and ask your teacher to select an appropriate course resource. '
+        'No AI-generated answer or official academic change was made.'
+    )
+    suggestions: list[str] = []
+    evidence_refs: list[str] = []
+    cited_evidence: list[dict[str, Any]] = []
+    provider_name: str | None = None
+    answer_scope: str | None = None
+
+    if re.fullmatch(
+        r'(?:hi|hello|hey)(?:\s+there)?[!?.\s]*',
+        payload.question,
+        flags=re.IGNORECASE,
+    ):
+        status = 'answered'
+        answer_source = 'built_in'
+        answer_scope = 'GENERAL_EXPLANATION'
+        answer = 'Hi! I can explain a general learning concept or help you interpret an academic record your teacher has shared.'
+    else:
+        try:
+            provider = build_provider(settings)
+            provider_name = provider.provider_name
+            if provider_name not in {'ollama', 'ollama-local'} and not settings.allow_external_tutor_data:
+                raise RuntimeError(
+                    'External recovery tutoring is disabled. Set ALLOW_EXTERNAL_TUTOR_DATA=true only when institutional policy permits it.'
+                )
+            generate = getattr(provider, 'generate_recovery_tutor', None)
+            if not callable(generate):
+                raise RuntimeError('The configured language-model provider does not support recovery tutoring.')
+            generated = generate(RecoveryTutorContext(
+                question=payload.question,
+                academic_evidence=academic_records,
+                missing_information=missing_information,
+                conversation_history=[
+                    turn.model_dump(mode='json')
+                    for turn in payload.conversation_history
+                ],
+            ))
+            model_response = RecoveryTutorModelResponse.model_validate(json.loads(generated))
+            validate_recovery_tutor_response(
+                model_response,
+                evidence_records=academic_records,
+            )
+        except (RuntimeError, TimeoutError, OSError, ValueError, TypeError, ValidationError) as exc:
+            status = 'unavailable'
+            logger.warning('Recovery tutor provider or response validation failed (%s).', type(exc).__name__)
+            answer = (
+                'The tutor is temporarily unavailable, so this was not an AI-generated answer. '
+                'You can still note the concept you are working on and ask your teacher for a suitable course resource. '
+                'Your academic records and official grades have not been changed.'
+            )
+        else:
+            answer_source = 'provider'
+            if model_response.supported:
+                status = 'answered'
+                answer = model_response.answer
+                suggestions = model_response.practice_suggestions
+                evidence_refs = model_response.evidence_refs
+                cited_evidence = [record for record in academic_records if record.get('ref') in evidence_refs]
+                answer_scope = model_response.answer_scope
+            else:
+                status = 'no_evidence' if not academic_records else 'unsupported'
+                answer_source = 'deterministic_fallback'
+                answer = (
+                    'There is not enough verified academic evidence to answer this student-specific question. '
+                    'Ask your teacher to review the relevant records with you.'
+                    if not academic_records else
+                    'This question cannot be answered from the verified academic evidence currently available. '
+                    'Ask your teacher to review it with you.'
+                )
+
+    _recovery_audit(
+        db,
+        user,
+        'recovery_tutor.requested',
+        'recovery_tutor',
+        student.id,
+        new_state=status.upper(),
+        reason='Student requested evidence-grounded tutoring; question and generated content are not stored.',
+    )
+    db.commit()
+    return RecoveryTutorOut(
+        status=status,
+        answer_source=answer_source,
+        answer_scope=answer_scope,
+        answer=answer,
+        practice_suggestions=suggestions,
+        evidence_refs=evidence_refs,
+        evidence=cited_evidence,
+        missing_information=missing_information,
+        provider=provider_name,
+    )
+
+
+@app.post(f'{settings.api_v1_prefix}/students/{{student_id}}/recovery-plans', response_model=RecoveryPlanOut, status_code=201)
+def generate_recovery_plan(
+    student_id: int,
+    payload: RecoveryPlanGenerateRequest,
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+) -> RecoveryPlanOut:
+    student = _recovery_student_access(student_id, user, db)
+    teacher = db.query(Teacher).filter(Teacher.user_id == user.id).first()
+    if teacher is None:
+        raise HTTPException(status_code=403, detail='Teacher profile is not linked')
+    evidence = build_recovery_evidence(db, student)
+    generation_key = stable_generation_key(student.id, evidence, payload.generation_key)
+    plan, created = create_draft(
+        db,
+        student_id=student.id,
+        teacher_id=teacher.id,
+        evidence=evidence,
+        generation_key=generation_key,
+    )
+    if created:
+        _recovery_audit(
+            db, user, 'recovery_plan.generated', 'recovery_plan', plan.id,
+            new_state=PLAN_DRAFT,
+        )
+    db.commit()
+    db.refresh(plan)
+    return _recovery_plan_out(plan)
+
+
+@app.post(f'{settings.api_v1_prefix}/students/{{student_id}}/recovery-blueprints', response_model=RecoveryPlanOut, status_code=201)
+def generate_recovery_blueprint(
+    student_id: int,
+    payload: RecoveryBlueprintGenerateRequest,
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+) -> RecoveryPlanOut:
+    student = _recovery_student_access(student_id, user, db)
+    teacher = db.query(Teacher).filter(Teacher.user_id == user.id).first()
+    if teacher is None:
+        raise HTTPException(status_code=403, detail='Teacher profile is not linked')
+    today = _institutional_today()
+    horizon = (payload.exam_date - today).days
+    if horizon < 1 or horizon > 365:
+        raise HTTPException(status_code=422, detail='FA-2 exam date must be within the next 365 days.')
+
+    policy = current_subject_focus_policy(db)
+    subject_context: dict[int, dict[str, Any]] = {}
+    focus_response = build_teacher_subject_focus(
+        db,
+        user,
+        student_id=student.id,
+        first_internal_only=True,
+    )
+    subject_evidence: list[dict[str, Any]] = []
+    for subject_data in focus_response['subjects']:
+        subject_id = subject_data['id']
+        student_evidence = next(
+            (item for item in subject_data['students'] if item['id'] == student.id),
+            None,
+        )
+        if student_evidence is None:
+            continue
+        subject = db.get(Subject, subject_id)
+        if subject is None:
+            continue
+        evaluation = {
+            key: student_evidence[key]
+            for key in (
+                'status',
+                'support_required',
+                'support_triggers',
+                'reason',
+                'latest_assessment',
+                'latest_assessments',
+                'official_failure',
+                'official_failure_status',
+                'evidence_scope',
+                'history',
+            )
+        }
+        triggers = evaluation['support_triggers']
+        eligible = 'LOW_SCORE' in triggers
+        latest_evidence = evaluation['latest_assessments']
+        evidence_summary = {
+            'subject_id': subject.id,
+            'subject_code': subject.code,
+            'subject_name': subject.name,
+            'eligible': eligible,
+            'status': evaluation['status'],
+            'support_triggers': triggers,
+            'official_failure_status': evaluation['official_failure_status'],
+            'reason': evaluation['reason'],
+            'evidence': latest_evidence,
+        }
+        subject_evidence.append(evidence_summary)
+        if not eligible:
+            continue
+        academic_record = db.query(StudentSubjectAcademicRecord).filter_by(
+            student_id=student.id,
+            subject_id=subject.id,
+            academic_period=payload.academic_period,
+        ).first() if payload.academic_period else None
+        subject_context[subject.id] = {
+            'subject': subject,
+            'academic_record': academic_record,
+            'evaluation': evaluation,
+            'eligibility': {
+                **evidence_summary,
+                'latest_evidence': latest_evidence,
+            },
+        }
+
+    if not subject_context:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                'message': 'No subjects qualify from the currently recorded first-internal evidence. Only uniquely dated, verified FA-1 marks strictly below 12/25 are eligible; official FAIL remains a separate support signal. Missing, ambiguous, unverified, or non-current-policy evidence remains insufficient.',
+                'subjects': subject_evidence,
+            },
+        )
+
+    blueprint_subjects: list[dict[str, Any]] = []
+    topic_subjects: dict[int, int] = {}
+    topic_module_numbers: dict[int, int] = {}
+    stage_topic_subjects: dict[int, set[int]] = {3: set(), 4: set()}
+    recommendations_context: list[dict[str, Any]] = []
+    blockers: list[str] = []
+
+    for subject_id in sorted(subject_context):
+        context = subject_context[subject_id]
+        subject = context['subject']
+        academic_record = context['academic_record']
+        eligibility = context['eligibility']
+        focus_reason = (
+            f"Eligible triggers: {', '.join(eligibility['support_triggers'])}. "
+            f"{eligibility['reason']}"
+        )
+        modules = db.query(SubjectModule).filter_by(subject_id=subject.id).order_by(
+            SubjectModule.module_number, SubjectModule.id,
+        ).all()
+        module_ids = [module.id for module in modules]
+        resources = db.query(SubjectModuleResource).filter(
+            SubjectModuleResource.subject_id == subject.id,
+            SubjectModuleResource.module_id.in_(module_ids),
+        ).order_by(SubjectModuleResource.created_at, SubjectModuleResource.id).all() if modules else []
+        module_number_by_id = {module.id: module.module_number for module in modules}
+        stage_module_ids = [
+            module.id for module in modules if module.module_number in {3, 4}
+        ]
+        for module_number in (3, 4):
+            if not any(module.module_number == module_number for module in modules):
+                blockers.append(f'{subject.name}: Module {module_number} is not configured for the requested recovery stages.')
+        topic_rows = db.query(ApprovedTopic).filter(
+            ApprovedTopic.subject_id == subject.id,
+            ApprovedTopic.approval_status == 'APPROVED',
+            ApprovedTopic.module_id.in_(stage_module_ids),
+        ).order_by(ApprovedTopic.module_id, ApprovedTopic.created_at, ApprovedTopic.id).all() if stage_module_ids else []
+        topics: list[dict[str, Any]] = []
+        for topic in topic_rows:
+            resource = db.query(SubjectModuleResource).filter_by(
+                id=topic.source_resource_id,
+                subject_id=subject.id,
+                module_id=topic.module_id,
+            ).first() if topic.source_resource_id else None
+            module = db.query(SubjectModule).filter_by(id=topic.module_id, subject_id=subject.id).first()
+            source_ready = bool(
+                resource
+                and resource.processing_status == 'PROCESSED'
+                and resource.extracted_text
+                and resource.extracted_text.strip()
+            )
+            topic_item = {
+                'topic_id': topic.id,
+                'title': topic.title,
+                'summary': topic.summary,
+                'learning_objectives': topic.learning_objectives,
+                'concepts': topic.concepts,
+                'module_id': topic.module_id,
+                'module_number': module.module_number if module else None,
+                'stage': f'MODULE_{module.module_number}' if module and module.module_number in {3, 4} else None,
+                'module_title': module.title if module else None,
+                'source_resource_id': topic.source_resource_id,
+                'source_material': {
+                    'ref': f'resource:{resource.id}',
+                    'filename': resource.original_filename,
+                    'title': resource.title,
+                    'content_hash': resource.content_hash,
+                } if source_ready and resource else None,
+                'source_ready': source_ready,
+                'source_provenance': topic.source_provenance or {},
+                'syllabus_mapping': None,
+                'syllabus_mapping_status': 'NEEDS_TEACHER_MAPPING',
+                'priority_basis': 'AI_PEDAGOGICAL_SEQUENCE_ONLY_NO_OFFICIAL_EXAM_WEIGHT',
+                'dependencies': [],
+                'dependency_status': 'NOT_SPECIFIED_IN_APPROVED_SOURCE',
+                'conflict_resolution': None,
+                'decision': 'PENDING',
+                'priority': None,
+                'suggested_minutes': None,
+                'assessment': {
+                    'required_mcq_count': 15,
+                    'required_short_answer_count': 5,
+                    'status': 'NOT_GENERATED',
+                    'source_mapping_required': True,
+                },
+            }
+            if not source_ready:
+                blockers.append(f'{subject.name}: approved topic "{topic.title}" has no readable processed source file.')
+            else:
+                topic_subjects[topic.id] = subject.id
+                topic_module_numbers[topic.id] = module_number_by_id.get(topic.module_id, 0)
+                if topic_module_numbers[topic.id] in {3, 4}:
+                    stage_topic_subjects[topic_module_numbers[topic.id]].add(subject.id)
+                    recommendations_context.append({
+                        'topic_id': topic.id,
+                        'subject': subject.name,
+                        'module': module.title if module else None,
+                        'module_number': topic_module_numbers[topic.id],
+                        'title': topic.title,
+                        'summary': topic.summary,
+                        'learning_objectives': topic.learning_objectives,
+                        'concepts': topic.concepts,
+                        'source': topic_item['source_material'],
+                    })
+            if (topic.source_provenance or {}).get('order_uncertain'):
+                topic_item['conflict_resolution_status'] = 'NEEDS_TEACHER_REVIEW'
+            else:
+                topic_item['conflict_resolution_status'] = 'NO_RECORDED_ORDER_CONFLICT'
+
+            assignment = db.query(TopicLearningAssignment).filter_by(
+                student_id=student.id,
+                approved_topic_id=topic.id,
+            ).first()
+            if source_ready and assignment is None:
+                assignment = TopicLearningAssignment(
+                    student_id=student.id,
+                    subject_id=subject.id,
+                    module_id=topic.module_id,
+                    approved_topic_id=topic.id,
+                    teacher_id=teacher.id,
+                    title=topic.title,
+                    learning_objective=(
+                        topic.learning_objectives[0]
+                        if topic.learning_objectives else topic.summary
+                    )[:2000],
+                    lesson_content=topic.summary[:10000],
+                    expected_duration_minutes=30,
+                    status='DRAFT',
+                    mastery_criteria='Complete the teacher-approved topic assessment; mastery is evaluated only from recorded assessment evidence.',
+                    source_provenance={
+                        'origin': 'recovery_blueprint_draft',
+                        'topic_id': topic.id,
+                        'resource_id': topic.source_resource_id,
+                        'roadmap_student_id': student.id,
+                    },
+                )
+                db.add(assignment)
+                db.flush()
+            topic_item['assignment_id'] = assignment.id if assignment else None
+            if assignment is None:
+                topic_item['assessment']['status'] = 'BLOCKED_NO_SOURCE_BACKED_ASSIGNMENT'
+            else:
+                assessments = db.query(LearningAssessment).filter_by(
+                    assignment_id=assignment.id,
+                ).order_by(LearningAssessment.version.desc()).all()
+                published_assessment = next(
+                    (assessment for assessment in assessments if assessment.status == 'PUBLISHED'),
+                    None,
+                )
+                topic_item['assessment']['status'] = (
+                    'PUBLISHED' if published_assessment else
+                    assessments[0].status if assessments else 'NOT_GENERATED'
+                )
+                topic_item['assessment']['assessment_id'] = published_assessment.id if published_assessment else None
+            topics.append(topic_item)
+
+        if not topic_rows:
+            blockers.append(f'{subject.name}: no teacher-approved extracted topics are available yet.')
+
+        recorded_evidence = eligibility['latest_evidence']
+        blueprint_subjects.append({
+            'subject_id': subject.id,
+            'subject_name': subject.name,
+            'focus_reason': focus_reason,
+            'eligibility': eligibility,
+            'evidence_source': 'DATED_FIRST_INTERNAL_ASSESSMENT_MARKS',
+            'fa1_evidence': {
+                'academic_period': academic_record.academic_period if academic_record else None,
+                'period_linkage': 'ACADEMIC_RECORD_LINKED' if academic_record else 'NOT_RECORDED_FOR_THIS_PERIOD',
+                'records': recorded_evidence,
+            },
+            'modules': [{
+                'module_id': module.id,
+                'module_number': module.module_number,
+                'title': module.title,
+                'resources': [{
+                    'resource_id': resource.id,
+                    'filename': resource.original_filename,
+                    'processing_status': resource.processing_status,
+                    'topic_map_status': (resource.provenance or {}).get('topic_map_status', 'NOT_PROCESSED'),
+                } for resource in resources if resource.module_id == module.id],
+            } for module in modules],
+            'topics': topics,
+        })
+
+    missing_stage_subjects = {
+        module_number: sorted(set(subject_context) - stage_topic_subjects[module_number])
+        for module_number in (3, 4)
+    }
+    for module_number, subject_ids in missing_stage_subjects.items():
+        for subject_id in subject_ids:
+            blockers.append(
+                f'{subject_context[subject_id]["subject"].name}: no approved, source-backed Module '
+                f'{module_number} topics are available for the global recovery stage.'
+            )
+    stage_coverage_complete = not any(missing_stage_subjects.values())
+
+    ai_recommendations: list[dict[str, Any]] = []
+    generation_status = 'NOT_RUN_NO_APPROVED_SOURCE_BACKED_TOPICS'
+    if recommendations_context:
+        try:
+            provider = build_provider(settings)
+            raw = provider.generate_recovery_blueprint({
+                'academic_period': payload.academic_period or 'NOT_SPECIFIED',
+                'exam_date': payload.exam_date.isoformat(),
+                'syllabus_context': payload.syllabus_context,
+                'syllabus_source': payload.syllabus_source,
+                'approved_source_backed_topics': recommendations_context,
+            })
+            ai_recommendations = validate_recovery_blueprint_response(
+                raw,
+                {item['topic_id'] for item in recommendations_context},
+            )
+            by_topic = {item['topic_id']: item for item in ai_recommendations}
+            for subject_item in blueprint_subjects:
+                for topic_item in subject_item['topics']:
+                    if topic_item['topic_id'] in by_topic:
+                        topic_item.update(by_topic[topic_item['topic_id']])
+            generation_status = 'GENERATED_NEEDS_TEACHER_REVIEW'
+        except (RuntimeError, ValueError, ValidationError) as exc:
+            blockers.append(f'AI recommendations are unavailable or invalid: {exc}')
+            generation_status = 'FAILED_EXPLICITLY'
+
+    schedule: list[dict[str, Any]] = []
+    schedule_blockers: list[str] = []
+    if ai_recommendations and stage_coverage_complete:
+        schedule, schedule_blockers = build_recovery_blueprint_schedule(
+            ai_recommendations,
+            topic_subjects,
+            start_date=today,
+            exam_date=payload.exam_date,
+            minutes_per_day=payload.available_minutes_per_day or 60,
+            topic_module_numbers=topic_module_numbers,
+            eligible_subject_ids=set(subject_context),
+        )
+    blockers.extend(schedule_blockers)
+    if ai_recommendations and not stage_coverage_complete:
+        blockers.append(
+            'The global schedule was not generated because every eligible subject needs approved, '
+            'source-backed topics in both Module 3 and Module 4.'
+        )
+    plan_digest = hashlib.sha256(json.dumps({
+        'student_id': student.id,
+        'academic_period': payload.academic_period,
+        'exam_date': payload.exam_date.isoformat(),
+        'eligible_subject_ids': sorted(subject_context),
+        'subject_evidence': subject_evidence,
+        'syllabus_context': payload.syllabus_context,
+        'syllabus_source': payload.syllabus_source,
+        'acknowledge_no_syllabus': payload.acknowledge_no_syllabus,
+        'available_minutes_per_day': payload.available_minutes_per_day or 60,
+        'records': [item['fa1_evidence'] for item in blueprint_subjects],
+        'topics': recommendations_context,
+    }, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+    generation_key = f'blueprint-{plan_digest[:64]}'
+    existing = db.query(SupportPlanVersion).filter_by(
+        student_id=student.id,
+        generation_key=generation_key,
+    ).first()
+    if existing is not None:
+        db.rollback()
+        return _recovery_plan_out(existing)
+    previous = db.query(SupportPlanVersion).filter_by(student_id=student.id).order_by(
+        SupportPlanVersion.version.desc(),
+    ).first()
+    evidence = build_recovery_evidence(db, student)
+    blueprint = {
+        'schema_version': 1,
+        'status': 'DRAFT',
+        'generation_status': generation_status,
+        'academic_period': payload.academic_period,
+        'exam_date': payload.exam_date.isoformat(),
+        'generated_at': datetime.utcnow().isoformat(),
+        'syllabus': {
+            'context': payload.syllabus_context,
+            'source': payload.syllabus_source,
+            'status': 'PROVIDED_NEEDS_REVIEW' if payload.syllabus_context else 'NO_OFFICIAL_MAPPING_PROVIDED',
+            'reviewed': False,
+        },
+        'available_minutes_per_day': payload.available_minutes_per_day or 60,
+        'facts_provenance': 'VERIFIED_PERSISTED_RECORDS',
+        'ai_recommendations_provenance': getattr(locals().get('provider'), 'provider_name', 'unavailable'),
+        'subjects': blueprint_subjects,
+        'subject_evidence': subject_evidence,
+        'schedule': schedule,
+        'assessment_policy': {
+            'mcq_count_per_topic': 15,
+            'short_answer_count_per_topic': 5,
+            'answers_rubrics_and_source_mappings_required': True,
+        },
+        'blockers': list(dict.fromkeys(blockers)),
+        'teacher_review': {
+            'syllabus_reviewed': False,
+            'topic_decisions_complete': False,
+            'conflicts_resolved': False,
+            'assessments_published': False,
+        },
+    }
+    plan = SupportPlanVersion(
+        student_id=student.id,
+        subject_scope_review_required=False,
+        blueprint_group_id=str(uuid4()),
+        is_blueprint_group=True,
+        teacher_id=teacher.id,
+        version=(previous.version if previous else 0) + 1,
+        summary='Teacher-reviewed recovery blueprint draft; no student-facing activities are published.',
+        plan_json={'tasks': [], 'blueprint': blueprint},
+        status=PLAN_DRAFT,
+        evidence_json=evidence,
+        generation_key=generation_key,
+    )
+    db.add(plan)
+    db.flush()
+    _recovery_audit(
+        db, user, 'recovery_blueprint.generated', 'recovery_plan', plan.id,
+        new_state=PLAN_DRAFT,
+        reason=f'{generation_status}; {len(blockers)} blocker(s)',
+        extra_detail={
+            'student_id': student.id,
+            'subject_eligibility': [{
+                'subject_id': subject_id,
+                'status': subject_context[subject_id]['eligibility']['status'],
+                'support_triggers': subject_context[subject_id]['eligibility']['support_triggers'],
+                'official_failure_status': subject_context[subject_id]['eligibility']['official_failure_status'],
+                'latest_evidence': subject_context[subject_id]['eligibility']['latest_evidence'],
+            } for subject_id in sorted(subject_context)],
+            'insufficient_subject_evidence': [
+                item for item in subject_evidence if not item['eligible']
+            ],
+        },
+    )
+    db.commit()
+    db.refresh(plan)
+    return _recovery_plan_out(plan)
+
+
+@app.patch(f'{settings.api_v1_prefix}/recovery-plans/{{plan_id}}/blueprint', response_model=RecoveryPlanOut)
+def edit_recovery_blueprint(
+    plan_id: int,
+    payload: RecoveryBlueprintEditRequest,
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+) -> RecoveryPlanOut:
+    plan = _recovery_plan_access(plan_id, user, db)
+    if plan.status != PLAN_DRAFT:
+        raise HTTPException(status_code=409, detail='Only draft blueprints can be reviewed.')
+    blueprint = (plan.plan_json or {}).get('blueprint')
+    if not isinstance(blueprint, dict):
+        raise HTTPException(status_code=409, detail='This recovery plan has no reviewable blueprint.')
+    blueprint = json.loads(json.dumps(blueprint))
+    topic_items = {
+        topic['topic_id']: topic
+        for subject in blueprint.get('subjects', [])
+        for topic in subject.get('topics', [])
+    }
+    seen_decisions: set[int] = set()
+    for item in payload.topic_decisions:
+        if item.topic_id not in topic_items or item.topic_id in seen_decisions:
+            raise HTTPException(status_code=422, detail='Topic decisions must uniquely reference topics in this blueprint.')
+        seen_decisions.add(item.topic_id)
+        topic_items[item.topic_id]['decision'] = item.decision
+        topic_items[item.topic_id]['decision_provenance'] = 'TEACHER_CONFIRMED'
+    for item in payload.syllabus_mappings:
+        if item.topic_id not in topic_items:
+            raise HTTPException(status_code=422, detail='Syllabus mappings must reference topics in this blueprint.')
+        topic_items[item.topic_id]['syllabus_mapping'] = item.mapping
+        topic_items[item.topic_id]['syllabus_mapping_status'] = 'TEACHER_CONFIRMED'
+    for item in payload.conflict_resolutions:
+        if item.topic_id not in topic_items:
+            raise HTTPException(status_code=422, detail='Conflict resolutions must reference topics in this blueprint.')
+        topic_items[item.topic_id]['conflict_resolution'] = item.resolution
+        topic_items[item.topic_id]['conflict_resolution_status'] = 'TEACHER_RESOLVED'
+        topic_items[item.topic_id]['conflict_resolution_provenance'] = 'TEACHER_CONFIRMED'
+    if payload.syllabus_reviewed is not None:
+        blueprint['syllabus']['reviewed'] = payload.syllabus_reviewed
+        blueprint['syllabus']['reviewed_by_user_id'] = user.id if payload.syllabus_reviewed else None
+        blueprint['syllabus']['reviewed_at'] = datetime.utcnow().isoformat() if payload.syllabus_reviewed else None
+    if payload.schedule is not None:
+        topic_subjects = {
+            topic['topic_id']: subject['subject_id']
+            for subject in blueprint.get('subjects', [])
+            for topic in subject.get('topics', [])
+        }
+        exam_date = date.fromisoformat(blueprint['exam_date'])
+        normalized_schedule: list[dict[str, Any]] = []
+        daily_totals: dict[str, int] = {}
+        for item in payload.schedule:
+            scheduled = item.scheduled_date
+            if scheduled > exam_date:
+                raise HTTPException(status_code=422, detail='Schedule entries cannot occur after the FA-2 exam date.')
+            if item.activity == 'TOPIC_STUDY':
+                if item.topic_id not in topic_items or item.topic_id not in topic_subjects:
+                    raise HTTPException(status_code=422, detail='Topic study entries must reference a blueprint topic.')
+                if topic_items[item.topic_id]['decision'] == 'EXCLUDE':
+                    raise HTTPException(status_code=422, detail='Excluded topics cannot remain on the schedule.')
+                expected_subject_id = topic_subjects[item.topic_id]
+                if item.subject_id is not None and item.subject_id != expected_subject_id:
+                    raise HTTPException(status_code=422, detail='A topic schedule entry must remain in its source subject.')
+                schedule_subject_id = expected_subject_id
+            else:
+                blueprint_subject_ids = {
+                    subject['subject_id'] for subject in blueprint.get('subjects', [])
+                }
+                schedule_subject_id = item.subject_id
+                if schedule_subject_id is None and len(blueprint_subject_ids) == 1:
+                    schedule_subject_id = next(iter(blueprint_subject_ids))
+                if schedule_subject_id not in blueprint_subject_ids:
+                    raise HTTPException(
+                        status_code=422,
+                        detail='Subject-level checkpoints must identify a subject in this blueprint.',
+                    )
+            day = scheduled.isoformat()
+            daily_totals[day] = daily_totals.get(day, 0) + item.estimated_minutes
+            normalized_schedule.append({
+                **item.model_dump(mode='json'),
+                'subject_id': schedule_subject_id,
+                'stage': (
+                    topic_items[item.topic_id].get('stage')
+                    if item.activity == 'TOPIC_STUDY'
+                    else 'REVISION_ASSESSMENT'
+                ),
+                'provenance': 'TEACHER_EDITED',
+            })
+        if any(total > blueprint['available_minutes_per_day'] for total in daily_totals.values()):
+            raise HTTPException(status_code=422, detail='Daily scheduled workload cannot exceed the stated available minutes.')
+        blueprint['schedule'] = normalized_schedule
+    for topic in topic_items.values():
+        _refresh_blueprint_assessment_status(db, topic)
+    plan.plan_json = {**plan.plan_json, 'blueprint': blueprint}
+    blueprint['teacher_review'] = {
+        'syllabus_reviewed': bool(blueprint['syllabus'].get('reviewed')),
+        'topic_decisions_complete': all(topic.get('decision') in {'INCLUDE', 'EXCLUDE'} for topic in topic_items.values()),
+        'conflicts_resolved': all(
+            topic.get('conflict_resolution_status') != 'NEEDS_TEACHER_REVIEW'
+            or topic.get('conflict_resolution')
+            for topic in topic_items.values()
+        ),
+        'assessments_published': all(
+            topic.get('decision') != 'INCLUDE' or topic.get('assessment', {}).get('status') == 'PUBLISHED'
+            for topic in topic_items.values()
+        ),
+    }
+    plan.plan_json = {**plan.plan_json, 'blueprint': blueprint}
+    _recovery_audit(
+        db, user, 'recovery_blueprint.reviewed', 'recovery_plan', plan.id,
+        previous_state=PLAN_DRAFT, new_state=PLAN_DRAFT,
+        reason='Teacher updated blueprint topics, mappings, schedule, or conflict resolutions.',
+    )
+    db.commit()
+    db.refresh(plan)
+    return _recovery_plan_out(plan)
+
+
+@app.post(
+    f'{settings.api_v1_prefix}/recovery-plans/{{plan_id}}/blueprint/revisions',
+    response_model=RecoveryPlanOut,
+    status_code=201,
+)
+def create_recovery_blueprint_revision(
+    plan_id: int,
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+) -> RecoveryPlanOut:
+    source = _recovery_plan_access(plan_id, user, db)
+    if source.status != PLAN_PUBLISHED or not isinstance((source.plan_json or {}).get('blueprint'), dict):
+        raise HTTPException(status_code=409, detail='Only a published blueprint can start a reviewable revision.')
+    latest_version = db.query(func.max(SupportPlanVersion.version)).filter_by(
+        student_id=source.student_id,
+    ).scalar() or source.version
+    plan_data = json.loads(json.dumps(source.plan_json))
+    blueprint = plan_data['blueprint']
+    blueprint['status'] = 'DRAFT_REVISION'
+    blueprint['generated_at'] = datetime.utcnow().isoformat()
+    blueprint['source_version_id'] = source.id
+    blueprint['blockers'] = []
+    blueprint['teacher_review'] = {
+        'syllabus_reviewed': False,
+        'topic_decisions_complete': False,
+        'conflicts_resolved': False,
+        'assessments_published': False,
+    }
+    blueprint['syllabus']['reviewed'] = False
+    blueprint['syllabus'].pop('reviewed_by_user_id', None)
+    blueprint['syllabus'].pop('reviewed_at', None)
+    for subject in blueprint.get('subjects', []):
+        for topic in subject.get('topics', []):
+            topic['decision'] = 'PENDING'
+            topic.pop('decision_provenance', None)
+    revision = SupportPlanVersion(
+        student_id=source.student_id,
+        subject_scope_review_required=False,
+        blueprint_group_id=source.blueprint_group_id or str(source.id),
+        is_blueprint_group=True,
+        source_blueprint_plan_id=source.id,
+        teacher_id=source.teacher_id,
+        version=latest_version + 1,
+        summary=f'Revision of recovery blueprint v{source.version}; review future work before publication.',
+        plan_json={**plan_data, 'tasks': []},
+        status=PLAN_DRAFT,
+        evidence_json=json.loads(json.dumps(source.evidence_json or {})),
+        generation_key=f'blueprint-revision-{uuid4().hex}',
+    )
+    db.add(revision)
+    db.flush()
+    _recovery_audit(
+        db, user, 'recovery_blueprint.revision_created', 'recovery_plan', revision.id,
+        previous_state=source.status, new_state=PLAN_DRAFT,
+        reason=f'Revision based on published roadmap v{source.version}; existing work and assessment history remain unchanged.',
+    )
+    db.commit()
+    db.refresh(revision)
+    return _recovery_plan_out(revision)
+
+
+@app.get(f'{settings.api_v1_prefix}/students/{{student_id}}/recovery-plans', response_model=list[RecoveryPlanOut])
+def list_recovery_plans(student_id: int, user: CurrentUser, db: Session = Depends(get_db)) -> list[RecoveryPlanOut]:
+    student = _recovery_student_access(student_id, user, db)
+    query = db.query(SupportPlanVersion).filter(SupportPlanVersion.student_id == student.id)
+    if user.role.upper() == 'STUDENT':
+        query = query.filter(
+            SupportPlanVersion.status == PLAN_PUBLISHED,
+            SupportPlanVersion.is_blueprint_group.is_(False),
+            SupportPlanVersion.subject_scope_review_required.is_(False),
+            SupportPlanVersion.subject_id.is_not(None),
+        )
+    plans = query.order_by(SupportPlanVersion.version.desc(), SupportPlanVersion.created_at.desc()).all()
+    if user.role.upper() == 'TEACHER':
+        allowed_subject_ids = _teacher_assigned_subject_ids(db, user)
+        plans = [
+            plan for plan in plans
+            if (subject_ids := _recovery_plan_subject_ids(plan))
+            and subject_ids.issubset(allowed_subject_ids)
+        ]
+    return [_recovery_plan_out(plan) for plan in plans]
+
+
+@app.patch(f'{settings.api_v1_prefix}/recovery-plans/{{plan_id}}', response_model=RecoveryPlanOut)
+def edit_recovery_plan(
+    plan_id: int,
+    payload: RecoveryPlanEditRequest,
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+) -> RecoveryPlanOut:
+    plan = _recovery_plan_access(plan_id, user, db)
+    before = plan.status
+    if payload.tasks is not None:
+        if plan.subject_id is not None and any(
+            task.subject_id not in {None, plan.subject_id}
+            for task in payload.tasks
+        ):
+            raise HTTPException(status_code=422, detail='Edited tasks must remain within this roadmap subject.')
+        if plan.is_blueprint_group:
+            existing_subject_ids = {
+                int(item['subject_id'])
+                for item in (plan.plan_json or {}).get('tasks', [])
+                if item.get('subject_id') is not None
+            }
+            if any(task.subject_id is None for task in payload.tasks):
+                raise HTTPException(
+                    status_code=422,
+                    detail='Every task in a subject-group roadmap must retain its persisted subject ID.',
+                )
+            if any(task.subject_id not in existing_subject_ids for task in payload.tasks):
+                raise HTTPException(
+                    status_code=422,
+                    detail='Edited tasks must remain within the subjects already present in this roadmap.',
+                )
+        for subject_id in {task.subject_id for task in payload.tasks if task.subject_id is not None}:
+            _teacher_subject_access(db, teacher_user=user, subject_id=subject_id)
+    try:
+        edit_draft(plan, summary=payload.summary, tasks=payload.tasks)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    _recovery_audit(db, user, 'recovery_plan.edited', 'recovery_plan', plan.id, previous_state=before, new_state=plan.status)
+    db.commit()
+    db.refresh(plan)
+    return _recovery_plan_out(plan)
+
+
+@app.post(f'{settings.api_v1_prefix}/recovery-plans/{{plan_id}}/approve', response_model=RecoveryPlanOut)
+def approve_recovery_plan(
+    plan_id: int,
+    payload: RecoveryPlanDecisionRequest,
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+) -> RecoveryPlanOut:
+    plan = _recovery_plan_access(plan_id, user, db)
+    if plan.status == PLAN_DRAFT:
+        blueprint_blockers = _recovery_blueprint_publish_blockers(db, plan)
+        if blueprint_blockers:
+            plan.plan_json = {
+                **plan.plan_json,
+                'blueprint': {
+                    **plan.plan_json['blueprint'],
+                    'blockers': blueprint_blockers,
+                },
+            }
+            db.commit()
+            raise HTTPException(
+                status_code=409,
+                detail={'message': 'Blueprint review requirements are not complete.', 'blockers': blueprint_blockers},
+            )
+        previous_state = plan.status
+        plan.status = PLAN_APPROVED
+        plan.approved_by_user_id = user.id
+        plan.approved_at = datetime.utcnow()
+        _recovery_audit(
+            db, user, 'recovery_plan.approved', 'recovery_plan', plan.id,
+            previous_state=previous_state, new_state=plan.status, reason=payload.reason,
+        )
+    elif plan.status != PLAN_APPROVED:
+        raise HTTPException(status_code=409, detail='Only draft recovery plans can be approved.')
+    db.commit()
+    db.refresh(plan)
+    return _recovery_plan_out(plan)
+
+
+@app.post(f'{settings.api_v1_prefix}/recovery-plans/{{plan_id}}/reject', response_model=RecoveryPlanOut)
+def reject_recovery_plan(
+    plan_id: int,
+    payload: RecoveryPlanDecisionRequest,
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+) -> RecoveryPlanOut:
+    if not payload.reason or not payload.reason.strip():
+        raise HTTPException(status_code=422, detail='A rejection reason is required.')
+    plan = _recovery_plan_access(plan_id, user, db)
+    if plan.status not in {PLAN_DRAFT, PLAN_APPROVED}:
+        raise HTTPException(status_code=409, detail='Only draft or approved recovery plans can be rejected.')
+    previous_state = plan.status
+    plan.status = PLAN_REJECTED
+    _recovery_audit(
+        db, user, 'recovery_plan.rejected', 'recovery_plan', plan.id,
+        previous_state=previous_state, new_state=plan.status, reason=payload.reason.strip(),
+    )
+    db.commit()
+    db.refresh(plan)
+    return _recovery_plan_out(plan)
+
+
+@app.post(f'{settings.api_v1_prefix}/recovery-plans/{{plan_id}}/publish', response_model=RecoveryPlanOut)
+def publish_recovery_plan_endpoint(
+    plan_id: int,
+    payload: RecoveryPlanDecisionRequest,
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+) -> RecoveryPlanOut:
+    plan = _recovery_plan_access(plan_id, user, db)
+    blueprint_blockers = _recovery_blueprint_publish_blockers(db, plan)
+    if blueprint_blockers:
+        plan.plan_json = {
+            **plan.plan_json,
+            'blueprint': {
+                **plan.plan_json['blueprint'],
+                'blockers': blueprint_blockers,
+            },
+        }
+        db.commit()
+        raise HTTPException(
+            status_code=409,
+            detail={'message': 'Blueprint review requirements are not complete.', 'blockers': blueprint_blockers},
+        )
+    previous_state = plan.status
+    try:
+        tasks = publish_plan(db, plan, user.id, datetime.utcnow())
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    blueprint = (plan.plan_json or {}).get('blueprint')
+    if isinstance(blueprint, dict):
+        blueprint['status'] = 'PUBLISHED'
+        plan.plan_json = {**plan.plan_json, 'blueprint': blueprint}
+        flag_modified(plan, 'plan_json')
+    activated_assignment_count = 0
+    if isinstance(blueprint, dict):
+        for subject in blueprint.get('subjects', []):
+            for topic in subject.get('topics', []):
+                if topic.get('decision') == 'INCLUDE' and topic.get('assignment_id'):
+                    assignment = db.query(TopicLearningAssignment).filter_by(
+                        id=topic['assignment_id'],
+                        student_id=plan.student_id,
+                    ).first()
+                    if assignment is not None:
+                        activated_assignment_count += 1
+                        if assignment.status == 'DRAFT':
+                            assignment.status = 'ACTIVE'
+                        scheduled_items = [
+                            item for item in blueprint.get('schedule', [])
+                            if item.get('activity') == 'TOPIC_STUDY'
+                            and item.get('topic_id') == topic.get('topic_id')
+                        ]
+                        existing_session = db.query(LearningStudySession).filter_by(
+                            assignment_id=assignment.id,
+                            student_id=plan.student_id,
+                        ).first()
+                        has_attempt = db.query(AssessmentAttempt.id).filter_by(
+                            assignment_id=assignment.id,
+                            student_id=plan.student_id,
+                        ).first() is not None
+                        if (
+                            scheduled_items
+                            and assignment.status == 'ACTIVE'
+                            and existing_session is None
+                            and not has_attempt
+                        ):
+                            scheduled_items.sort(key=lambda item: item['scheduled_date'])
+                            assignment.scheduled_at = datetime.fromisoformat(
+                                f"{scheduled_items[0]['scheduled_date']}T00:00:00"
+                            )
+                            assignment.available_from = assignment.scheduled_at
+                            total_minutes = sum(int(item['estimated_minutes']) for item in scheduled_items)
+                            if 5 <= total_minutes <= 240:
+                                assignment.expected_duration_minutes = total_minutes
+    if previous_state != PLAN_PUBLISHED:
+        student = db.query(Student).filter(Student.id == plan.student_id).first()
+        if student and student.user_id:
+            db.add(Notification(
+                user_id=student.user_id,
+                kind='recovery',
+                title='Recovery roadmap published',
+                body=plan.summary or 'A teacher published a recovery roadmap for you.',
+                metadata_json={
+                    'recovery_plan_id': plan.id,
+                    'task_count': len(tasks),
+                    'learning_assignment_count': activated_assignment_count,
+                },
+            ))
+        _recovery_audit(
+            db, user, 'recovery_plan.published', 'recovery_plan', plan.id,
+            previous_state=previous_state, new_state=plan.status, reason=payload.reason,
+        )
+    db.commit()
+    db.refresh(plan)
+    return _recovery_plan_out(plan)
+
+
+@app.get(f'{settings.api_v1_prefix}/students/{{student_id}}/recovery-tasks', response_model=list[RecoveryTaskOut])
+def list_recovery_tasks(
+    student_id: int,
+    user: CurrentUser,
+    db: Session = Depends(get_db),
+    status: str | None = Query(default=None, pattern='^(AVAILABLE|IN_PROGRESS|SUBMITTED|NEEDS_REVISION|COMPLETED)$'),
+) -> list[RecoveryTaskOut]:
+    student = _recovery_student_access(student_id, user, db)
+    tasks = _published_recovery_tasks(db, student.id, status, user)
+    return [_recovery_task_out(task) for task in tasks]
+
+
+@app.patch(f'{settings.api_v1_prefix}/recovery-tasks/{{task_id}}', response_model=RecoveryTaskOut)
+def update_recovery_task_progress(
+    task_id: int,
+    payload: RecoveryTaskProgressRequest,
+    student_user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> RecoveryTaskOut:
+    if student_user.role.upper() != 'STUDENT':
+        raise HTTPException(status_code=403, detail='Only the assigned student can update task progress.')
+    task = _recovery_task_access(task_id, student_user, db)
+    event_type = 'STARTED' if payload.action == 'start' else 'PROGRESS_UPDATED'
+    detail = {'action': payload.action, 'progress_percent': payload.progress_percent}
+    existing = db.query(RecoveryTaskEvent).filter_by(idempotency_key=payload.idempotency_key).first()
+    if existing is not None:
+        try:
+            add_task_event(
+                db, task=task, actor_user_id=student_user.id, event_type=event_type,
+                detail=detail, idempotency_key=payload.idempotency_key,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return _recovery_task_out(task)
+    if payload.action == 'start':
+        if task.status != TASK_AVAILABLE:
+            raise HTTPException(status_code=409, detail='Only available tasks can be started.')
+        task.status = TASK_IN_PROGRESS
+    else:
+        if task.status != TASK_IN_PROGRESS:
+            raise HTTPException(status_code=409, detail='Progress can only be updated on an in-progress task.')
+        task.progress_percent = payload.progress_percent or 0
+    add_task_event(
+        db, task=task, actor_user_id=student_user.id, event_type=event_type,
+        detail=detail, idempotency_key=payload.idempotency_key,
+    )
+    _recovery_audit(db, student_user, f'recovery_task.{event_type.lower()}', 'recovery_task', task.id, new_state=task.status)
+    db.commit()
+    db.refresh(task)
+    return _recovery_task_out(task)
+
+
+@app.put(f'{settings.api_v1_prefix}/recovery-tasks/{{task_id}}/draft', response_model=RecoveryTaskOut)
+def save_recovery_task_draft(
+    task_id: int,
+    payload: RecoveryTaskDraftSaveRequest,
+    student_user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> RecoveryTaskOut:
+    if student_user.role.upper() != 'STUDENT':
+        raise HTTPException(status_code=403, detail='Only the assigned student can save recovery work.')
+    if db.get_bind().dialect.name == 'sqlite':
+        db.connection().exec_driver_sql('BEGIN IMMEDIATE')
+    task = _recovery_task_access(task_id, student_user, db, lock=True)
+    if task.status not in {TASK_IN_PROGRESS, TASK_NEEDS_REVISION}:
+        raise HTTPException(status_code=409, detail='Draft work can only be saved on an in-progress or revision-requested task.')
+    detail = {'response': payload.response}
+    existing = db.query(RecoveryTaskEvent).filter_by(idempotency_key=payload.idempotency_key).first()
+    if existing is not None:
+        try:
+            add_task_event(
+                db, task=task, actor_user_id=student_user.id, event_type='DRAFT_SAVED',
+                detail=detail, idempotency_key=payload.idempotency_key,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return _recovery_task_out(task)
+    task.student_response = payload.response
+    add_task_event(
+        db, task=task, actor_user_id=student_user.id, event_type='DRAFT_SAVED',
+        detail=detail, idempotency_key=payload.idempotency_key,
+    )
+    _recovery_audit(db, student_user, 'recovery_task.draft_saved', 'recovery_task', task.id, new_state=task.status)
+    db.commit()
+    db.refresh(task)
+    return _recovery_task_out(task)
+
+
+@app.post(f'{settings.api_v1_prefix}/recovery-tasks/{{task_id}}/submit', response_model=RecoveryTaskOut)
+def submit_recovery_task(
+    task_id: int,
+    payload: RecoveryTaskSubmitRequest,
+    student_user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> RecoveryTaskOut:
+    if student_user.role.upper() != 'STUDENT':
+        raise HTTPException(status_code=403, detail='Only the assigned student can submit recovery work.')
+    task = _recovery_task_access(task_id, student_user, db)
+    detail = {'response': payload.response}
+    existing = db.query(RecoveryTaskEvent).filter_by(idempotency_key=payload.idempotency_key).first()
+    if existing is not None:
+        try:
+            add_task_event(
+                db, task=task, actor_user_id=student_user.id, event_type='SUBMITTED',
+                detail=detail, idempotency_key=payload.idempotency_key,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return _recovery_task_out(task)
+    if task.status not in {TASK_IN_PROGRESS, TASK_NEEDS_REVISION}:
+        raise HTTPException(status_code=409, detail='Only in-progress or revision-requested tasks can be submitted.')
+    previous_state = task.status
+    task.status = TASK_SUBMITTED
+    task.student_response = payload.response
+    task.submitted_at = datetime.utcnow()
+    if previous_state == TASK_NEEDS_REVISION:
+        task.revision_count += 1
+    add_task_event(
+        db, task=task, actor_user_id=student_user.id, event_type='SUBMITTED',
+        detail=detail, idempotency_key=payload.idempotency_key,
+    )
+    _recovery_audit(db, student_user, 'recovery_task.submitted', 'recovery_task', task.id, previous_state=previous_state, new_state=task.status)
+    db.commit()
+    db.refresh(task)
+    return _recovery_task_out(task)
+
+
+@app.patch(f'{settings.api_v1_prefix}/recovery-tasks/{{task_id}}/assess', response_model=RecoveryTaskOut)
+def assess_recovery_task(
+    task_id: int,
+    payload: RecoveryTaskAssessmentRequest,
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+) -> RecoveryTaskOut:
+    if db.get_bind().dialect.name == 'sqlite':
+        db.connection().exec_driver_sql('BEGIN IMMEDIATE')
+    task = _recovery_task_access(task_id, user, db, lock=True)
+    event_type = 'ASSESSED'
+    detail = {'decision': payload.decision, 'feedback': payload.feedback, 'score': payload.score}
+    existing = db.query(RecoveryTaskEvent).filter_by(idempotency_key=payload.idempotency_key).first()
+    if existing is not None:
+        try:
+            add_task_event(
+                db, task=task, actor_user_id=user.id, event_type=event_type,
+                detail=detail, idempotency_key=payload.idempotency_key,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return _recovery_task_out(task)
+    previous_state = task.status
+    next_state = TASK_COMPLETED if payload.decision == 'complete' else TASK_NEEDS_REVISION
+    claimed = (
+        db.query(RecoveryTask)
+        .filter(RecoveryTask.id == task.id, RecoveryTask.status == TASK_SUBMITTED)
+        .update({RecoveryTask.status: next_state}, synchronize_session=False)
+    )
+    if claimed != 1:
+        raced_event = db.query(RecoveryTaskEvent).filter_by(idempotency_key=payload.idempotency_key).first()
+        if raced_event is None:
+            raise HTTPException(status_code=409, detail='Only submitted recovery work can be assessed.')
+        try:
+            add_task_event(
+                db,
+                task=task,
+                actor_user_id=user.id,
+                event_type=event_type,
+                detail=detail,
+                idempotency_key=payload.idempotency_key,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        db.refresh(task)
+        return _recovery_task_out(task)
+    db.refresh(task)
+    task.teacher_feedback = payload.feedback
+    task.assessed_score = payload.score
+    if next_state == TASK_COMPLETED:
+        task.progress_percent = 100
+        task.completed_at = datetime.utcnow()
+    else:
+        task.completed_at = None
+    assessment_event, _ = add_task_event(
+        db, task=task, actor_user_id=user.id, event_type=event_type,
+        detail=detail, idempotency_key=payload.idempotency_key,
+    )
+    adaptation, adaptation_created = record_adaptation_decision(
+        db,
+        task=task,
+        trigger_event=assessment_event,
+    )
+    if adaptation_created:
+        _recovery_audit(
+            db,
+            user,
+            'recovery_adaptation.generated',
+            'recovery_adaptation',
+            adaptation.id,
+            new_state=adaptation.status,
+            reason=adaptation.rationale,
+        )
+    student = db.query(Student).filter(Student.id == task.student_id).first()
+    if student and student.user_id:
+        db.add(Notification(
+            user_id=student.user_id,
+            kind='recovery',
+            title='Recovery task feedback is ready',
+            body=payload.feedback,
+            metadata_json={'recovery_task_id': task.id, 'status': task.status},
+        ))
+    _recovery_audit(db, user, 'recovery_task.assessed', 'recovery_task', task.id, previous_state=previous_state, new_state=task.status)
+    db.commit()
+    db.refresh(task)
+    return _recovery_task_out(task)
+
+
+@app.put(f'{settings.api_v1_prefix}/recovery-tasks/{{task_id}}/activity', response_model=RecoveryTaskOut)
+def propose_recovery_task_activity(
+    task_id: int,
+    payload: RecoveryTaskActivityEditRequest,
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+) -> RecoveryTaskOut:
+    if db.get_bind().dialect.name == 'sqlite':
+        db.connection().exec_driver_sql('BEGIN IMMEDIATE')
+    task = _recovery_task_access(task_id, user, db, lock=True)
+    proposal = payload.model_dump(mode='json', exclude={'idempotency_key'})
+    existing = db.query(RecoveryTaskEvent).filter_by(idempotency_key=payload.idempotency_key).first()
+    if existing is not None:
+        if (
+            existing.task_id != task.id
+            or existing.actor_user_id != user.id
+            or existing.event_type != 'ACTIVITY_PROPOSED'
+            or existing.detail.get('proposal') != proposal
+        ):
+            raise HTTPException(status_code=409, detail='The idempotency key was already used for a different event.')
+        return _recovery_task_out(task)
+    if task.status not in {TASK_AVAILABLE, TASK_DRAFT}:
+        raise HTTPException(status_code=409, detail='An activity can only be replaced before a student starts the task.')
+    previous_status = task.status
+    task.status = TASK_DRAFT
+    add_task_event(
+        db, task=task, actor_user_id=user.id, event_type='ACTIVITY_PROPOSED',
+        detail={'proposal': proposal, 'previous_status': previous_status},
+        idempotency_key=payload.idempotency_key,
+    )
+    _recovery_audit(
+        db, user, 'recovery_task.activity_proposed', 'recovery_task', task.id,
+        previous_state=previous_status, new_state=TASK_DRAFT,
+        reason='Replacement activity is withheld from the student pending teacher approval.',
+    )
+    db.commit()
+    db.refresh(task)
+    return _recovery_task_out(task)
+
+
+@app.post(f'{settings.api_v1_prefix}/recovery-tasks/{{task_id}}/approve-activity', response_model=RecoveryTaskOut)
+def approve_recovery_task_activity(
+    task_id: int,
+    payload: RecoveryTaskActivityApprovalRequest,
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+) -> RecoveryTaskOut:
+    if db.get_bind().dialect.name == 'sqlite':
+        db.connection().exec_driver_sql('BEGIN IMMEDIATE')
+    task = _recovery_task_access(task_id, user, db, lock=True)
+    proposals = (
+        db.query(RecoveryTaskEvent)
+        .filter_by(task_id=task.id, event_type='ACTIVITY_PROPOSED')
+        .order_by(RecoveryTaskEvent.created_at.desc(), RecoveryTaskEvent.id.desc())
+        .all()
+    )
+    if not proposals:
+        raise HTTPException(status_code=409, detail='There is no replacement activity awaiting approval.')
+    proposal_event = proposals[0]
+    detail = {'proposal_event_id': proposal_event.id}
+    existing = db.query(RecoveryTaskEvent).filter_by(idempotency_key=payload.idempotency_key).first()
+    if existing is not None:
+        try:
+            add_task_event(
+                db, task=task, actor_user_id=user.id, event_type='ACTIVITY_APPROVED',
+                detail=detail, idempotency_key=payload.idempotency_key,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return _recovery_task_out(task)
+    if task.status != TASK_DRAFT:
+        raise HTTPException(status_code=409, detail='Only a withheld replacement activity can be approved.')
+    proposal = proposal_event.detail.get('proposal')
+    if not isinstance(proposal, dict):
+        raise HTTPException(status_code=409, detail='The replacement activity proposal is malformed.')
+    plan = task.roadmap
+    definitions = [
+        dict(item)
+        for item in (plan.plan_json or {}).get('tasks', [])
+        if isinstance(item, dict)
+    ]
+    definition = next((item for item in definitions if item.get('task_key') == task.task_key), None)
+    if definition is None:
+        raise HTTPException(status_code=409, detail='The recovery task definition could not be found.')
+    approved_activity = RecoveryActivity.model_validate(proposal.get('activity'))
+    definition.update({
+        'title': proposal['title'],
+        'learning_objective': proposal['learning_objective'],
+        'instructions': proposal['instructions'],
+        'completion_criteria': proposal['completion_criteria'],
+        'resources': proposal['resources'],
+        'activity': approved_activity.model_dump(mode='json'),
+        'field_provenance': {
+            **definition.get('field_provenance', {}),
+            'content': 'TEACHER_AUTHORED_APPROVED',
+            'activity': 'TEACHER_AUTHORED_APPROVED',
+            'resources': 'TEACHER_PROVIDED' if proposal['resources'] else 'NO_VERIFIED_RESOURCES',
+        },
+    })
+    plan.plan_json = {'tasks': definitions}
+    task.title = proposal['title']
+    task.learning_objective = proposal['learning_objective']
+    task.instructions = proposal['instructions']
+    task.completion_criteria = proposal['completion_criteria']
+    task.resources = proposal['resources']
+    task.status = TASK_AVAILABLE
+    task.progress_percent = 0
+    add_task_event(
+        db, task=task, actor_user_id=user.id, event_type='ACTIVITY_APPROVED',
+        detail=detail, idempotency_key=payload.idempotency_key,
+    )
+    _recovery_audit(
+        db, user, 'recovery_task.activity_approved', 'recovery_task', task.id,
+        previous_state=TASK_DRAFT, new_state=TASK_AVAILABLE,
+        reason='Teacher approved the replacement activity before student access.',
+    )
+    db.commit()
+    db.refresh(task)
+    return _recovery_task_out(task)
+
+
+@app.get(f'{settings.api_v1_prefix}/students/{{student_id}}/recovery-timeline')
+def recovery_timeline(student_id: int, user: CurrentUser, db: Session = Depends(get_db)) -> dict[str, Any]:
+    student = _recovery_student_access(student_id, user, db)
+    plans_query = db.query(SupportPlanVersion).filter(SupportPlanVersion.student_id == student.id)
+    if user.role.upper() == 'STUDENT':
+        plans_query = plans_query.filter(
+            SupportPlanVersion.status == PLAN_PUBLISHED,
+            SupportPlanVersion.is_blueprint_group.is_(False),
+            SupportPlanVersion.subject_scope_review_required.is_(False),
+            SupportPlanVersion.subject_id.is_not(None),
+        )
+    plans = plans_query.order_by(SupportPlanVersion.created_at.desc()).all()
+    if user.role.upper() == 'TEACHER':
+        allowed_subject_ids = _teacher_assigned_subject_ids(db, user)
+        plans = [
+            plan for plan in plans
+            if (subject_ids := _recovery_plan_subject_ids(plan))
+            and subject_ids.issubset(allowed_subject_ids)
+        ]
+    plan_ids = [plan.id for plan in plans]
+    items = [
+        {
+            'kind': 'recovery_plan',
+            'plan_id': plan.id,
+            'occurred_at': (plan.published_at or plan.created_at).isoformat(),
+            'title': f'Recovery roadmap v{plan.version}',
+            'summary': plan.summary,
+            'status': plan.status,
+        }
+        for plan in plans
+    ]
+    if plan_ids:
+        task_ids = [
+            row[0] for row in db.query(RecoveryTask.id)
+            .filter(RecoveryTask.roadmap_version_id.in_(plan_ids))
+            .all()
+        ]
+        if task_ids:
+            event_query = (
+                db.query(RecoveryTaskEvent)
+                .join(RecoveryTask, RecoveryTask.id == RecoveryTaskEvent.task_id)
+                .filter(
+                    RecoveryTaskEvent.task_id.in_(task_ids),
+                    RecoveryTaskEvent.subject_id == RecoveryTask.subject_id,
+                    RecoveryTask.subject_id.is_not(None),
+                    RecoveryTask.subject_scope_review_required.is_(False),
+                )
+            )
+            if user.role.upper() == 'TEACHER':
+                event_query = event_query.filter(RecoveryTaskEvent.subject_id.in_(allowed_subject_ids))
+            events = event_query.order_by(RecoveryTaskEvent.created_at.desc()).all()
+            items.extend({
+                'kind': 'recovery_task_event',
+                'task_id': event.task_id,
+                'event_id': event.id,
+                'occurred_at': event.created_at.isoformat(),
+                'title': event.event_type.replace('_', ' ').title(),
+                'summary': event.detail,
+                'status': event.event_type,
+            } for event in events)
+    items.sort(key=lambda item: item['occurred_at'], reverse=True)
+    return {'student_id': student.id, 'items': items}
+
+
+@app.get(f'{settings.api_v1_prefix}/teacher/recovery-monitoring')
+def recovery_monitoring(
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+    student_id: int | None = Query(default=None, gt=0),
+    status: str | None = Query(default=None, pattern='^(AVAILABLE|DRAFT|IN_PROGRESS|SUBMITTED|NEEDS_REVISION|COMPLETED)$'),
+) -> dict[str, Any]:
+    teacher = db.query(Teacher).filter(Teacher.user_id == user.id).first()
+    if teacher is None:
+        raise HTTPException(status_code=403, detail='Teacher profile is not linked')
+    if student_id is not None:
+        _recovery_student_access(student_id, user, db)
+    courses = db.query(Course).filter(Course.teacher_id == teacher.id).all()
+    course_ids = [course.id for course in courses]
+    empty_counts = {
+        name: 0 for name in (
+            TASK_AVAILABLE, TASK_DRAFT, TASK_IN_PROGRESS, TASK_SUBMITTED, TASK_NEEDS_REVISION,
+            TASK_COMPLETED, 'overdue',
+        )
+    }
+    if not course_ids:
+        return {'counts': empty_counts, 'tasks': [], 'students': []}
+    assigned_query = db.query(Student).filter(Student.course_id.in_(course_ids))
+    assigned_students = assigned_query.order_by(Student.full_name).all()
+    assigned_student_ids = [student.id for student in assigned_students]
+    if student_id is not None:
+        if student_id not in assigned_student_ids:
+            raise HTTPException(status_code=404, detail='Student not found')
+        assigned_student_ids = [student_id]
+        assigned_students = [student for student in assigned_students if student.id == student_id]
+    if not assigned_student_ids:
+        return {'counts': empty_counts, 'tasks': [], 'students': []}
+    query = (
+        db.query(RecoveryTask)
+        .join(SupportPlanVersion, SupportPlanVersion.id == RecoveryTask.roadmap_version_id)
+        .join(Subject, Subject.id == RecoveryTask.subject_id)
+        .join(Course, Course.subject_id == Subject.id)
+        .filter(
+            RecoveryTask.student_id.in_(assigned_student_ids),
+            SupportPlanVersion.status == PLAN_PUBLISHED,
+            SupportPlanVersion.is_blueprint_group.is_(False),
+            SupportPlanVersion.subject_scope_review_required.is_(False),
+            SupportPlanVersion.subject_id == RecoveryTask.subject_id,
+            RecoveryTask.subject_scope_review_required.is_(False),
+            RecoveryTask.status != TASK_SUPERSEDED,
+            Course.teacher_id == teacher.id,
+        )
+    )
+    if status:
+        query = query.filter(RecoveryTask.status == status)
+    tasks = query.order_by(RecoveryTask.deadline, RecoveryTask.id).all()
+    pending_activity_by_task: dict[int, dict[str, Any]] = {}
+    draft_task_ids = [task.id for task in tasks if task.status == TASK_DRAFT]
+    if draft_task_ids:
+        proposals = (
+            db.query(RecoveryTaskEvent)
+            .filter(
+                RecoveryTaskEvent.task_id.in_(draft_task_ids),
+                RecoveryTaskEvent.event_type == 'ACTIVITY_PROPOSED',
+            )
+            .order_by(RecoveryTaskEvent.created_at.desc(), RecoveryTaskEvent.id.desc())
+            .all()
+        )
+        for event in proposals:
+            proposal = event.detail.get('proposal')
+            if event.task_id not in pending_activity_by_task and isinstance(proposal, dict):
+                pending_activity_by_task[event.task_id] = proposal
+    all_tasks = (
+        db.query(RecoveryTask)
+        .join(SupportPlanVersion, SupportPlanVersion.id == RecoveryTask.roadmap_version_id)
+        .join(Subject, Subject.id == RecoveryTask.subject_id)
+        .join(Course, Course.subject_id == Subject.id)
+        .filter(
+            RecoveryTask.student_id.in_(assigned_student_ids),
+            SupportPlanVersion.status == PLAN_PUBLISHED,
+            SupportPlanVersion.is_blueprint_group.is_(False),
+            SupportPlanVersion.subject_scope_review_required.is_(False),
+            SupportPlanVersion.subject_id == RecoveryTask.subject_id,
+            RecoveryTask.subject_scope_review_required.is_(False),
+            Course.teacher_id == teacher.id,
+        )
+        .all()
+    )
+    counts = {name: sum(task.status == name for task in all_tasks) for name in (
+        TASK_AVAILABLE, TASK_DRAFT, TASK_IN_PROGRESS, TASK_SUBMITTED, TASK_NEEDS_REVISION, TASK_COMPLETED,
+    )}
+    counts['overdue'] = sum(
+        task.deadline is not None and task.deadline < datetime.utcnow() and task.status != TASK_COMPLETED
+        for task in all_tasks
+    )
+    return {
+        'counts': counts,
+        'tasks': [
+            {
+                **_recovery_task_out(task).model_dump(mode='json'),
+                'student_name': task.student.full_name,
+                'student_code': task.student.student_id,
+                'pending_activity': pending_activity_by_task.get(task.id),
+            }
+            for task in tasks
+        ],
+        'students': [
+            {
+                'id': student.id,
+                'student_id': student.student_id,
+                'full_name': student.full_name,
+                'section': student.section,
+            }
+            for student in assigned_students
+        ],
+    }
+
+
+@app.get(
+    f'{settings.api_v1_prefix}/teacher/recovery-adaptations',
+    response_model=list[RecoveryAdaptationDecisionOut],
+)
+def list_teacher_recovery_adaptations(
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+    student_id: int | None = Query(default=None, gt=0),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> list[RecoveryAdaptationDecisionOut]:
+    if student_id is not None:
+        student = _recovery_student_access(student_id, user, db)
+        assigned_student_ids = [student.id]
+    else:
+        teacher = db.query(Teacher).filter(Teacher.user_id == user.id).first()
+        if teacher is None:
+            raise HTTPException(status_code=403, detail='Teacher profile is not linked')
+        courses = db.query(Course).filter(Course.teacher_id == teacher.id).all()
+        course_ids = [course.id for course in courses]
+        sections = [course.section for course in courses if course.section]
+        if not course_ids:
+            return []
+        assigned_students = db.query(Student.id).filter(
+            or_(
+                Student.course_id.in_(course_ids),
+                and_(Student.course_id.is_(None), Student.section.in_(sections)) if sections else False,
+            )
+        ).all()
+        assigned_student_ids = [row[0] for row in assigned_students]
+
+    if not assigned_student_ids:
+        return []
+    decisions = (
+        db.query(RecoveryAdaptationDecision)
+        .filter(RecoveryAdaptationDecision.student_id.in_(assigned_student_ids))
+        .order_by(RecoveryAdaptationDecision.created_at.desc(), RecoveryAdaptationDecision.id.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return [
+        RecoveryAdaptationDecisionOut(
+            id=decision.id,
+            student_id=decision.student_id,
+            roadmap_version_id=decision.roadmap_version_id,
+            task_id=decision.task_id,
+            trigger_event_id=decision.trigger_event_id,
+            decision_type=decision.decision_type,
+            status=decision.status,
+            recommended_action=decision.recommended_action,
+            rationale=decision.rationale,
+            evidence=decision.evidence_json,
+            created_at=decision.created_at,
+        )
+        for decision in decisions
+    ]
 
 
 @app.get(f'{settings.api_v1_prefix}/students/{{student_id}}/support-timeline')
@@ -1260,6 +5098,114 @@ def student_explanation(student_id: int, user: CurrentTeacher, db: Session = Dep
     }
 
 
+def _build_risk_summary(prediction: dict[str, Any], explanation: dict[str, Any]) -> dict[str, Any]:
+    target_class = str(prediction.get('risk_level', '')).upper()
+    if target_class not in {'HIGH', 'MEDIUM', 'LOW'} or str(explanation.get('target_class', '')).upper() != target_class:
+        return {'status': 'unavailable', 'provider': None, 'error': 'The predicted class and SHAP target do not match.'}
+
+    class_probabilities = prediction.get('class_probabilities')
+    risk_probability = prediction.get('risk_probability')
+    class_probability = class_probabilities.get(target_class) if isinstance(class_probabilities, dict) else None
+    if (
+        prediction.get('risk_probability_semantics') != 'P(risk_level)'
+        or not isinstance(class_probabilities, dict)
+        or not isinstance(class_probability, (int, float))
+        or isinstance(class_probability, bool)
+        or not isinstance(risk_probability, (int, float))
+        or isinstance(risk_probability, bool)
+        or not math.isfinite(float(risk_probability))
+        or not 0 <= float(risk_probability) <= 1
+        or not math.isfinite(float(class_probability))
+        or not math.isclose(float(class_probability), float(risk_probability), rel_tol=1e-5, abs_tol=1e-5)
+    ):
+        return {'status': 'unavailable', 'provider': None, 'error': 'The predicted class probability is incomplete or inconsistent.'}
+
+    waterfall = explanation.get('waterfall')
+    if not isinstance(waterfall, list):
+        return {'status': 'unavailable', 'provider': None, 'error': 'The SHAP feature evidence is unavailable.'}
+    evidence_by_feature: dict[str, RiskSummaryEvidence] = {}
+    for item in waterfall:
+        if not isinstance(item, dict):
+            continue
+        feature = item.get('feature')
+        value = item.get('value')
+        contribution = item.get('contribution')
+        if (
+            feature not in FEATURES
+            or feature in evidence_by_feature
+            or isinstance(value, bool)
+            or isinstance(contribution, bool)
+            or not isinstance(value, (int, float))
+            or not isinstance(contribution, (int, float))
+            or not math.isfinite(float(value))
+            or not math.isfinite(float(contribution))
+        ):
+            continue
+        evidence_by_feature[feature] = RiskSummaryEvidence(
+            feature=feature,
+            value=float(value),
+            contribution=float(contribution),
+        )
+
+    if set(evidence_by_feature) != set(FEATURES):
+        return {'status': 'unavailable', 'provider': None, 'error': 'The SHAP response does not contain the complete model feature evidence.'}
+
+    feature_values = explanation.get('feature_values')
+    contributions = explanation.get('contributions')
+    base_value = explanation.get('base_value')
+    if not isinstance(feature_values, dict) or not isinstance(contributions, dict) or not isinstance(base_value, (int, float)) or isinstance(base_value, bool) or not math.isfinite(float(base_value)):
+        return {'status': 'unavailable', 'provider': None, 'error': 'The SHAP feature values or base value are unavailable.'}
+    if any(
+        not isinstance(feature_values.get(name), (int, float))
+        or isinstance(feature_values.get(name), bool)
+        or not isinstance(contributions.get(name), (int, float))
+        or isinstance(contributions.get(name), bool)
+        or not math.isclose(float(feature_values[name]), evidence_by_feature[name].value, rel_tol=1e-5, abs_tol=1e-5)
+        or not math.isclose(float(contributions[name]), evidence_by_feature[name].contribution, rel_tol=1e-5, abs_tol=1e-5)
+        for name in FEATURES
+    ):
+        return {'status': 'unavailable', 'provider': None, 'error': 'The SHAP waterfall does not match its feature values and contributions.'}
+    if not math.isclose(
+        float(base_value) + sum(item.contribution for item in evidence_by_feature.values()),
+        float(risk_probability),
+        rel_tol=1e-5,
+        abs_tol=1e-5,
+    ):
+        return {'status': 'unavailable', 'provider': None, 'error': 'The SHAP contributions do not reconcile with the predicted class probability.'}
+
+    ranked_evidence = sorted(evidence_by_feature.values(), key=lambda item: abs(item.contribution), reverse=True)
+    summary_evidence = [item for item in ranked_evidence if item.contribution != 0][:5]
+    if not summary_evidence:
+        return {'status': 'unavailable', 'provider': None, 'error': 'The model returned no non-zero SHAP contributions to summarize.'}
+
+    context = RiskSummaryContext(
+        target_class=target_class,
+        risk_probability=float(risk_probability),
+        evidence=summary_evidence,
+    )
+    provider = build_provider(settings)
+    try:
+        response = provider.generate_risk_summary(context)
+    except RuntimeError as exc:
+        return {'status': 'unavailable', 'provider': provider.provider_name, 'error': str(exc)}
+
+    validation_errors = validate_risk_summary_selection(response, context)
+    if validation_errors:
+        return {
+            'status': 'unavailable',
+            'provider': provider.provider_name,
+            'error': 'The AI provider returned an invalid evidence selection: ' + ' '.join(validation_errors),
+        }
+
+    selected_names = json.loads(response)['signals']
+    evidence_by_name = {item.feature: item for item in context.evidence}
+    return {
+        'status': 'ready',
+        'provider': provider.provider_name,
+        'selected_signals': [evidence_by_name[name].model_dump() for name in selected_names],
+    }
+
+
 @app.get(f'{settings.api_v1_prefix}/students/{{student_id}}/shap')
 def student_shap(student_id: int, user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
     student = db.query(Student).filter(Student.id == student_id).first()
@@ -1281,7 +5227,12 @@ def student_shap(student_id: int, user: CurrentTeacher, db: Session = Depends(ge
     student.risk_probability = prediction['risk_probability']
     db.add(RiskSnapshot(student_id=student.id, risk_level=prediction['risk_level'], probability=prediction['risk_probability'], recorded_at=prediction['prediction_timestamp'].replace(tzinfo=None)))
     db.commit()
-    return {'prediction': prediction, 'explanation': explanation, 'question': 'Why is this student at risk?'}
+    return {
+        'prediction': prediction,
+        'explanation': explanation,
+        'risk_summary': _build_risk_summary(prediction, explanation),
+        'question': 'Why is this student at risk?',
+    }
 
 
 @app.post(f'{settings.api_v1_prefix}/risk/predict')
@@ -1453,8 +5404,12 @@ def phase3_policy(user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[s
     policy = db.query(Phase3PolicyApproval).order_by(Phase3PolicyApproval.id.desc()).first()
     return {
         **phase3_policy_payload(policy),
-        'supported_aggregation_strategies': ['equal_subject_mean'],
+        'supported_aggregation_strategies': ['equal_subject_mean', FEATURE_SNAPSHOT_AGGREGATION_STRATEGY],
         'supported_feature_contract': ['fa1_mean', 'fa2_mean', 'assignment_mean', 'attendance_mean'],
+        'supported_feature_contracts': {
+            'equal_subject_mean': ['fa1_mean', 'fa2_mean', 'assignment_mean', 'attendance_mean'],
+            FEATURE_SNAPSHOT_AGGREGATION_STRATEGY: list(FEATURES),
+        },
         'note': 'Methodology approval is separate from data readiness and never creates candidate data or candidate models.',
     }
 
@@ -1467,8 +5422,6 @@ def approve_phase3_policy(
 ) -> dict[str, Any]:
     if not payload.explicit_approval:
         raise HTTPException(status_code=422, detail='Explicit faculty approval is required for the Phase 3 policy.')
-    if len(payload.feature_contract) != len(set(payload.feature_contract)):
-        raise HTTPException(status_code=422, detail='The approved feature contract cannot contain duplicate features.')
     previous = db.query(Phase3PolicyApproval).order_by(Phase3PolicyApproval.id.desc()).first()
     previous_state = {
         'aggregation_strategy': previous.aggregation_strategy,
@@ -1542,7 +5495,7 @@ def phase3_dataset_export(
     export_rows = dataset['candidate_rows'] if aggregation_strategy and feature_contract else dataset['rows']
     for row in export_rows:
         values = dict(row)
-        for name in ('exclusion_reasons', 'source_record_ids', 'source_subjects', 'source_batch_ids', 'source_filenames', 'source_checksums'):
+        for name in ('exclusion_reasons', 'source_record_ids', 'source_subjects', 'source_batch_ids', 'source_filenames', 'source_checksums', 'feature_observed_at'):
             if name in values:
                 values[name] = json.dumps(values[name], separators=(',', ':'))
         writer.writerow(values)
@@ -1626,6 +5579,90 @@ def phase3_compare(user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[
         ModelRegistryEntry.status == 'candidate',
         ModelRegistryEntry.artifact_identifier.is_not(None),
     ).order_by(ModelRegistryEntry.created_at.desc()).first()
+    common_test_set: dict[str, Any] | None = None
+    common_test_error: str | None = None
+    if entry and entry.aggregation_strategy == FEATURE_SNAPSHOT_AGGREGATION_STRATEGY:
+        try:
+            dataset = build_phase3_dataset(
+                db,
+                aggregation_strategy=entry.aggregation_strategy,
+                feature_contract=entry.feature_schema,
+            )
+            if not dataset['readiness']['training_ready']:
+                raise ValueError('; '.join(dataset['readiness']['blockers']))
+            if entry.dataset_fingerprint != dataset['dataset_fingerprint']:
+                raise ValueError('Candidate dataset fingerprint no longer matches current source data.')
+            test_periods = set(entry.test_periods or [])
+            test_rows = [
+                row for row in dataset['candidate_rows']
+                if row['academic_period'] in test_periods
+            ]
+            if not test_rows:
+                raise ValueError('No current, temporally eligible observations match the candidate test periods.')
+            candidate_path, _ = verify_candidate_artifact(entry, CANDIDATE_ARTIFACT_DIRECTORY)
+            import pandas as pd
+
+            common_test_set = evaluate_common_test_set(
+                pd.DataFrame(test_rows),
+                candidate_artifact_path=candidate_path,
+                production_artifact_path=DEFAULT_ARTIFACT,
+            )
+        except (DeploymentArtifactError, KeyError, OSError, TypeError, ValueError) as exc:
+            common_test_error = f'Common-test-set evaluation is unavailable: {exc}'
+        if common_test_set is not None:
+            return {
+                'status': 'available',
+                'comparison': {
+                    'compatible': True,
+                    'blockers': [],
+                    'feature_contract': {
+                        'compatible': entry.feature_schema == production['feature_contract'] == FEATURES,
+                        'production': production['feature_contract'],
+                        'candidate': entry.feature_schema,
+                    },
+                    'dataset_identity': {
+                        'compatible': True,
+                        'production_identity': 'production model evaluated on the candidate independent test rows',
+                        'candidate_identity': entry.dataset_id,
+                        'production_hash': production.get('training_dataset_hash'),
+                        'candidate_hash': entry.dataset_fingerprint,
+                        'hashes_match': False,
+                        'same_temporal_test_rows_verified': True,
+                        'common_test_row_identity_sha256': common_test_set['row_identity_sha256'],
+                    },
+                    'common_test_set': common_test_set,
+                    'winner': None,
+                    'interpretation': (
+                        'Both models were evaluated on the same temporally held-out imported feature snapshots '
+                        'and recorded independent outcomes. Metrics are descriptive; no model is automatically selected. '
+                        'Import provenance does not independently authenticate the source records.'
+                    ),
+                },
+                'production': {
+                    'model_version': production['model_version'],
+                    'demo_data': production['training_provenance']['demo_data'],
+                    'feature_contract': production['feature_contract'],
+                    'feature_contract_version': production['feature_contract_version'],
+                    'dataset_identity': production['training_provenance'].get('source'),
+                    'dataset_hash': production.get('training_dataset_hash'),
+                    'training_timestamp': production.get('training_timestamp'),
+                    'provenance': production['training_provenance'],
+                    'metrics': common_test_set['production'],
+                    'metric_context': 'Computed on the exact independent test rows shared with this candidate; the production artifact training provenance remains unchanged.',
+                },
+                'candidate': candidate_registry_payload(entry),
+                'candidate_test_evaluation': common_test_set['candidate'],
+                'candidate_test_provenance': {
+                    'dataset_id': entry.dataset_id,
+                    'dataset_version': entry.dataset_version,
+                    'dataset_hash': entry.dataset_fingerprint,
+                    'test_periods': entry.test_periods,
+                    'feature_contract': entry.feature_schema,
+                    'feature_contract_version': entry.feature_contract_version,
+                    'artifact_hash': entry.artifact_hash,
+                    'common_test_row_identity_sha256': common_test_set['row_identity_sha256'],
+                },
+            }
     production_contract = production['feature_contract']
     candidate_contract = entry.feature_schema if entry else None
     production_hash = production.get('training_dataset_hash')
@@ -1636,6 +5673,8 @@ def phase3_compare(user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[
     if entry is None:
         blockers.append('No candidate model with a registered artifact is available.')
     else:
+        if common_test_error:
+            blockers.append(common_test_error)
         if candidate_contract != production_contract:
             blockers.append('Candidate and production feature contracts are not identical.')
         if not candidate_hash or not entry.dataset_id or not entry.test_periods:
@@ -1763,6 +5802,11 @@ def phase3_train_candidate(payload: Phase3TrainingRequest, user: CurrentTeacher,
             dataset_fingerprint=dataset['dataset_fingerprint'],
             target_definition=dataset['target_definition'],
             aggregation_strategy=payload.aggregation_strategy,
+            feature_contract_version=(
+                FEATURE_CONTRACT_VERSION
+                if dataset['feature_contract_version'] == FEATURE_CONTRACT_VERSION
+                else 'phase3-candidate-explicit-v1'
+            ),
         )
     except ValueError as exc:
         reason = str(exc)
@@ -2033,6 +6077,8 @@ def promote_model_registry_entry(entry_id: int, payload: ModelPromotionRequest, 
     blockers.extend(candidate_validation_blockers(entry, dataset))
     if active_error:
         blockers.append(active_error)
+    if entry.created_by_user_id is None:
+        blockers.append('Candidate creator identity is unavailable; independent approval cannot be verified.')
     if not payload.explicit_approval:
         blockers.append('Explicit authorized deployment approval was not provided.')
     if len(payload.approval_note.strip()) < 10:
@@ -2041,8 +6087,9 @@ def promote_model_registry_entry(entry_id: int, payload: ModelPromotionRequest, 
         blockers.append('Only a non-rejected candidate may be deployed.')
     if entry.validation_status != 'passed':
         blockers.append('Candidate validation has not passed.')
-    if entry.approval_status != 'approved' or entry.approved_by_user_id is None or entry.approved_at is None:
-        blockers.append('Candidate approval is not recorded.')
+    approval_error = independent_candidate_approval_error(db, entry)
+    if approval_error:
+        blockers.append(approval_error)
     try:
         verified_path, _ = verify_candidate_artifact(entry, CANDIDATE_ARTIFACT_DIRECTORY)
     except DeploymentArtifactError as exc:
@@ -2103,6 +6150,10 @@ def approve_model_registry_entry(entry_id: int, payload: ModelApprovalRequest, u
         dataset = build_phase3_dataset(db)
     previous_state = {'validation_status': entry.validation_status, 'approval_status': entry.approval_status, 'status': entry.status}
     blockers = candidate_validation_blockers(entry, dataset)
+    if entry.created_by_user_id is None:
+        blockers.append('Candidate creator identity is unavailable; independent approval cannot be verified.')
+    elif entry.created_by_user_id == user.id:
+        blockers.append('The candidate creator cannot approve their own candidate.')
     if entry.validation_status != 'passed':
         blockers.append('Candidate validation has not passed.')
     if not payload.explicit_approval:
@@ -2216,8 +6267,12 @@ def rollback_model_registry_entry(entry_id: int, payload: ModelRollbackRequest, 
     elif not blockers:
         if target_entry is None or target_entry.status != 'candidate' or target_entry.deployment_status == 'REJECTED':
             blockers.append('Rollback target registry candidate is unavailable or rejected.')
-        elif target_entry.validation_status != 'passed' or target_entry.approval_status != 'approved':
-            blockers.append('Rollback target no longer has passed validation and recorded approval.')
+        elif target_entry.validation_status != 'passed':
+            blockers.append('Rollback target no longer has passed validation.')
+        if not blockers and target_entry is not None:
+            approval_error = independent_candidate_approval_error(db, target_entry)
+            if approval_error:
+                blockers.append(f'Rollback target {approval_error[0].lower()}{approval_error[1:]}')
         target_hash = (deployed_event.previous_state or {}).get('artifact_hash') if deployed_event else None
         if not blockers and (not target_hash or target_entry is None or target_entry.artifact_hash != target_hash):
             blockers.append('Rollback target artifact hash does not match its prior deployment record.')
@@ -2925,7 +6980,15 @@ def export_report(user: CurrentTeacher, db: Session = Depends(get_db), report_ty
         records = subject_records_by_student(db, [student.id for student in students], period)
         headers = ['Academic Period', 'USN', 'Student Name', 'Department', 'Section']
         for code in SUBJECTS:
-            headers.extend([f'{code} FA1 /25', f'{code} FA2 /25', f'{code} Assignment /25', f'{code} Internal /50', f'{code} Attendance %'])
+            headers.extend([
+                f'{code} FA1 raw',
+                f'{code} FA1 maximum marks',
+                f'{code} FA1 maximum verified',
+                f'{code} FA2 /25',
+                f'{code} Assignment /25',
+                f'{code} Internal /50',
+                f'{code} Attendance %',
+            ])
         headers.extend(['Total Internal /250', 'Average Internal /50'])
         writer.writerow(headers)
         for student in students:
@@ -2934,7 +6997,15 @@ def export_report(user: CurrentTeacher, db: Session = Depends(get_db), report_ty
             for code in SUBJECTS:
                 record = row_records.get(code)
                 academic = serialize_record(record)
-                values.extend([academic['fa1'] if academic['fa1'] is not None else '', academic['fa2'] if academic['fa2'] is not None else '', academic['assignment_mark'] if academic['assignment_mark'] is not None else '', academic['internal_mark'] if academic['internal_mark'] is not None else '', academic['attendance_rate'] if academic['attendance_rate'] is not None else ''])
+                values.extend([
+                    academic['fa1'] if academic['fa1'] is not None else '',
+                    academic['fa1_maximum_marks'] if academic['fa1_maximum_marks'] is not None else '',
+                    academic['fa1_maximum_verified'],
+                    academic['fa2'] if academic['fa2'] is not None else '',
+                    academic['assignment_mark'] if academic['assignment_mark'] is not None else '',
+                    academic['internal_mark'] if academic['internal_mark'] is not None else '',
+                    academic['attendance_rate'] if academic['attendance_rate'] is not None else '',
+                ])
             totals = academic_totals(row_records)
             values.extend([totals['total_internal'] if totals['total_internal'] is not None else '', totals['average_internal'] if totals['average_internal'] is not None else ''])
             writer.writerow(values)

@@ -8,13 +8,13 @@ import { API_BASE, api, readToken } from '@/lib/api';
 
 type SubjectCode = 'EVS' | 'CN' | 'TOC' | 'RM' | 'SE';
 type Field = 'fa1' | 'fa2' | 'assignment_mark' | 'attendance_rate';
-type SubjectRecord = { fa1: number | null; fa2: number | null; fa_average: number | null; assignment_mark: number | null; internal_mark: number | null; attendance_rate: number | null };
+type SubjectRecord = { fa1: number | null; fa1_maximum_marks: number | null; fa1_maximum_verified: boolean; fa1_normalized: number | null; fa2: number | null; fa_average: number | null; assignment_mark: number | null; internal_mark: number | null; attendance_rate: number | null };
 type RegisterRow = { id: number; student_id: string; full_name: string; department?: string | null; section?: string | null; subjects: Record<SubjectCode, SubjectRecord>; total_internal: number | null; average_internal: number | null; risk_level: string; risk_probability: number };
 type Subject = { code: SubjectCode; name: string };
 type RegisterResponse = { subjects: Subject[]; items: RegisterRow[]; total: number; risk_scope: string; academic_period: string | null; academic_periods: string[] };
 type Readiness = { training_ready: boolean; students_in_database: number; subject_records: number; fa1_present: number; fa2_present: number; complete_fa1_fa2_observations: number; complete_period_aligned_observations_with_valid_target: number; distinct_academic_periods: string[]; duplicate_import_rows: number; conflicting_import_rows_rejected: number; other_rejected_import_rows: number; blockers: string[] };
 
-const fieldLabels: Record<Field, string> = { fa1: 'FA1', fa2: 'FA2', assignment_mark: 'Assignment', attendance_rate: 'Attendance %' };
+const fieldLabels: Record<Field, string> = { fa1: 'FA1 raw', fa2: 'FA2', assignment_mark: 'Assignment', attendance_rate: 'Attendance %' };
 const subjectCodes: SubjectCode[] = ['EVS', 'CN', 'TOC', 'RM', 'SE'];
 const pageSize = 25;
 
@@ -61,7 +61,11 @@ export default function InternalMarksPage() {
     if (!academicPeriod) { setError('Choose an academic period before editing marks.'); return; }
     const raw = drafts[key].trim();
     const value = raw === '' ? null : Number(raw);
-    const maximum = field === 'attendance_rate' ? 100 : 25;
+    const maximum = field === 'attendance_rate'
+      ? 100
+      : field === 'fa1'
+        ? row.subjects[code].fa1_maximum_marks ?? 25
+        : 25;
     if (value !== null && (!Number.isFinite(value) || value < 0 || value > maximum)) {
       setError(`${fieldLabels[field]} must be between 0 and ${maximum}.`);
       return;
@@ -124,7 +128,7 @@ export default function InternalMarksPage() {
             {scope === 'ALL' && <><th rowSpan={2} className="min-w-28 border-b border-r border-white/10 px-3 py-3 text-center">Total /250</th><th rowSpan={2} className="min-w-28 border-b border-r border-white/10 px-3 py-3 text-center">Average /50</th><th rowSpan={2} className="min-w-32 border-b border-r border-white/10 px-3 py-3">Global risk</th></>}
             <th rowSpan={2} className="min-w-24 border-b border-white/10 px-3 py-3">Student 360</th>
           </tr>
-          <tr>{shownSubjects.flatMap((code) => (scope === 'ALL' ? ['FA1 /25', 'FA2 /25', 'FA Avg /25', 'Assignment /25', 'Internal /50', 'Attendance %'] : ['FA1 /25', 'FA2 /25', 'FA Avg /25', 'Assignment /25', 'Internal /50', 'Attendance %', 'Risk', 'Trend']).map((label, index) => <th key={`${code}-${label}`} className="sticky top-10 z-30 min-w-24 border-b border-r border-white/10 bg-[#121e2d] px-2 py-2 text-center font-medium text-slate-400">{label}</th>))}</tr>
+          <tr>{shownSubjects.flatMap((code) => (scope === 'ALL' ? ['FA1 raw (source max below)', 'FA2 /25', 'FA Avg /25', 'Assignment /25', 'Internal /50', 'Attendance %'] : ['FA1 raw (source max below)', 'FA2 /25', 'FA Avg /25', 'Assignment /25', 'Internal /50', 'Attendance %', 'Risk', 'Trend']).map((label) => <th key={`${code}-${label}`} className="sticky top-10 z-30 min-w-24 border-b border-r border-white/10 bg-[#121e2d] px-2 py-2 text-center font-medium text-slate-400">{label}</th>))}</tr>
         </thead>
         <tbody>
           {pageRows.map((row) => <tr key={row.id} className="group hover:bg-white/[.025]">
@@ -137,7 +141,7 @@ export default function InternalMarksPage() {
               const cells = fields.flatMap((field) => {
                 const key = `${row.id}:${code}:${field}`;
                 const value = drafts[key] ?? (record[field] == null ? '' : String(record[field]));
-                return [<td key={key} className="border-b border-r border-white/8 p-1"><input aria-label={`${row.student_id} ${code} ${fieldLabels[field]}`} type="number" min="0" max={field === 'attendance_rate' ? 100 : 25} step="0.1" value={value} disabled={saving === key} onChange={(event) => setDraft(row.id, code, field, event.target.value)} onBlur={() => void saveCell(row, code, field)} onKeyDown={(event) => { if (event.key === 'Enter') { event.currentTarget.blur(); } }} className="w-20 border border-cyan-200/10 bg-[#101b2a] px-2 py-1.5 text-right tabular-nums text-slate-100 outline-none focus:border-cyan-200/60" /></td>];
+                return [<td key={key} className="border-b border-r border-white/8 p-1"><div className="flex items-center gap-1"><input aria-label={`${row.student_id} ${code} ${fieldLabels[field]}`} type="number" min="0" max={field === 'attendance_rate' ? 100 : field === 'fa1' ? record.fa1_maximum_marks ?? 25 : 25} step="0.1" value={value} disabled={saving === key} onChange={(event) => setDraft(row.id, code, field, event.target.value)} onBlur={() => void saveCell(row, code, field)} onKeyDown={(event) => { if (event.key === 'Enter') { event.currentTarget.blur(); } }} className="w-20 border border-cyan-200/10 bg-[#101b2a] px-2 py-1.5 text-right tabular-nums text-slate-100 outline-none focus:border-cyan-200/60" />{field === 'fa1' && <span className="whitespace-nowrap text-[9px] text-slate-500">/{record.fa1_maximum_marks ?? '—'}{record.fa1_maximum_verified ? ' · verified' : ''}</span>}</div></td>];
               });
               cells.splice(2, 0, <td key={`${row.id}:${code}:fa-average`} className="border-b border-r border-white/8 bg-white/[.02] px-2 py-2 text-center tabular-nums text-slate-300">{record.fa_average == null ? '—' : record.fa_average.toFixed(1)}</td>);
               cells.splice(4, 0, <td key={`${row.id}:${code}:internal`} className="border-b border-r border-white/8 bg-cyan-200/[.035] px-2 py-2 text-center font-semibold tabular-nums text-cyan-100">{record.internal_mark == null ? '—' : record.internal_mark.toFixed(1)}</td>);

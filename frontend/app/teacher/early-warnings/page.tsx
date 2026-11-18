@@ -3,7 +3,7 @@
 import { ArrowRight, BellRing, Filter } from 'lucide-react';
 import Link from 'next/link';
 import { useEffect, useMemo, useState } from 'react';
-import { Empty, ErrorNotice, PageHeading, RiskBadge } from '@/components/ui';
+import { Empty, ErrorNotice, Metric, PageHeading, RiskBadge } from '@/components/ui';
 import { api } from '@/lib/api';
 
 type Warning = { student_id: number; name: string; department?: string | null; course?: string | null; detected_at: string; risk_level: string; severity: string; signal: string; change: string; reason: string };
@@ -24,7 +24,13 @@ export default function EarlyWarningsPage() {
     const afterDate = dateRange === 'all' || Date.now() - new Date(item.detected_at).getTime() <= Number(dateRange) * 86400000;
     return (!severity || item.severity === severity) && (!signal || item.signal === signal) && (!department || item.department === department) && (!course || item.course === course) && afterDate;
   }), [items, severity, signal, department, course, dateRange]);
+  const highPriority = items.filter((item) => item.severity === 'HIGH').length;
   return <div className="fade-up"><PageHeading eyebrow="Signals · faculty review" title="Early warning center" description="Recent academic signals that may benefit from a timely, human check-in." action={<span className="inline-flex items-center gap-2 rounded-full border border-rose-200/15 bg-rose-200/5 px-3 py-1.5 text-[10px] text-rose-100"><BellRing size={12} />{filtered.length} signals</span>} />
+    <section aria-label="Early warning summary" className="mb-4 grid gap-3 sm:grid-cols-3">
+      <Metric label="Detected signals" value={items.length} detail="Records returned by the warning service" color="amber" />
+      <Metric label="High priority" value={highPriority} detail="Requires timely faculty review" color="rose" />
+      <Metric label="Matching filters" value={filtered.length} detail="Signals shown in the current view" color="mint" />
+    </section>
     <div className="surface mb-4 flex flex-wrap items-center gap-2 rounded-xl p-3"><Filter size={14} className="ml-1 text-slate-500" /><select aria-label="Filter severity" value={severity} onChange={(event) => setSeverity(event.target.value)} className="h-9 rounded-md border border-white/10 bg-[#0b1320] px-3 text-xs text-slate-300"><option value="">All severities</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option></select><select aria-label="Filter signal" value={signal} onChange={(event) => setSignal(event.target.value)} className="h-9 rounded-md border border-white/10 bg-[#0b1320] px-3 text-xs text-slate-300"><option value="">All signal types</option>{signals.map((item) => <option key={item}>{item}</option>)}</select>
       <select aria-label="Filter department" value={department} onChange={(event) => setDepartment(event.target.value)} className="h-9 rounded-md border border-white/10 bg-[#0b1320] px-3 text-xs text-slate-300"><option value="">All departments</option>{departments.map((item) => <option key={item}>{item}</option>)}</select>
       <select aria-label="Filter course" value={course} onChange={(event) => setCourse(event.target.value)} className="h-9 rounded-md border border-white/10 bg-[#0b1320] px-3 text-xs text-slate-300"><option value="">All courses</option>{courses.map((item) => <option key={item}>{item}</option>)}</select>

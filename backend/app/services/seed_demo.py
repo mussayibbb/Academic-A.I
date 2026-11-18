@@ -86,7 +86,7 @@ def seed_demo_data(db: Session) -> None:
     db.flush()
     db.add_all([AssignmentStudent(assignment_id=assignment.id, student_id=student.id) for assignment in assignments for student in students])
 
-    assessment = Assessment(course_id=course.id, title='Foundations assessment', due_at=now - timedelta(days=12), maximum_marks=100)
+    assessment = Assessment(course_id=course.id, title='Foundations assessment', due_at=now - timedelta(days=12), maximum_marks=100, maximum_marks_verified=False)
     db.add(assessment)
     db.flush()
     for student in students:

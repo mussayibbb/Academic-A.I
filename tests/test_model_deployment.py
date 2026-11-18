@@ -10,6 +10,13 @@ from sklearn.preprocessing import LabelEncoder
 from ai.risk.features import FEATURES
 from ai.risk.predict import DEFAULT_ARTIFACT, load_artifact
 from backend.app.models import AuditLog, ModelDeploymentEvent, ModelDeploymentState, ModelRegistryEntry, RiskPrediction, User
+from backend.app.services.auth import create_access_token, hash_password
+from backend.app.services.model_deployment import (
+    DeploymentArtifactError,
+    active_artifact_path,
+    independent_candidate_approval_error,
+    sha256_file,
+)
 
 
 class FixturePipeline:
@@ -78,9 +85,7 @@ def create_candidate(client, monkeypatch, artifact_directory: Path, *, features=
             target_definition=metadata['target_definition'],
             aggregation_strategy=metadata['aggregation_strategy'],
             validation_status='passed',
-            approval_status='approved',
-            approved_by_user_id=teacher.id,
-            approved_at=datetime(2026, 1, 2),
+            approval_status='pending',
         )
         db.add(entry)
         db.commit()
@@ -97,6 +102,105 @@ def create_candidate(client, monkeypatch, artifact_directory: Path, *, features=
 
 def auth(token):
     return {'Authorization': f'Bearer {token}'}
+
+
+def independent_reviewer_headers(client):
+    with client.app.state.test_session_factory() as db:
+        db.add(User(
+            email='reviewer@example.com',
+            full_name='Independent Reviewer',
+            role='TEACHER',
+            password_hash=hash_password('reviewer-pass'),
+        ))
+        db.commit()
+    return auth(create_access_token('reviewer@example.com', 'TEACHER'))
+
+
+def approve_candidate(client, entry_id, reviewer_headers):
+    response = client.post(f'/api/v1/models/registry/{entry_id}/approve', json={
+        'explicit_approval': True,
+        'approval_note': 'Fixture-only approval by an independent teacher.',
+    }, headers=reviewer_headers)
+    assert response.status_code == 200, response.text
+
+
+def test_active_candidate_requires_independent_approval_evidence(client, monkeypatch, tmp_path):
+    artifact_directory = tmp_path / 'candidate-artifacts'
+    candidate_id, version, artifact_hash = create_candidate(client, monkeypatch, artifact_directory)
+    with client.app.state.test_session_factory() as db:
+        candidate = db.query(ModelRegistryEntry).filter_by(id=candidate_id).one()
+        candidate.deployment_status = 'LOCAL_ACTIVE'
+        candidate.approval_status = 'approved'
+        candidate.approved_by_user_id = candidate.created_by_user_id
+        candidate.approved_at = datetime(2026, 1, 2)
+        db.add(ModelDeploymentState(
+            id=1,
+            active_model_version=version,
+            active_artifact_hash=artifact_hash,
+        ))
+        db.commit()
+
+        with pytest.raises(DeploymentArtifactError, match='other than its creator'):
+            active_artifact_path(
+                db,
+                candidate_directory=artifact_directory,
+                production_path=DEFAULT_ARTIFACT,
+                production_version=load_artifact()['metadata']['model_version'],
+                production_hash=sha256_file(DEFAULT_ARTIFACT),
+            )
+
+
+def test_approval_validator_requires_matching_audit_event(client, monkeypatch, tmp_path):
+    candidate_id, _, _ = create_candidate(
+        client, monkeypatch, tmp_path / 'candidate-artifacts', version='audit-approved-candidate-v1',
+    )
+    reviewer_headers = independent_reviewer_headers(client)
+    approve_candidate(client, candidate_id, reviewer_headers)
+
+    with client.app.state.test_session_factory() as db:
+        candidate = db.query(ModelRegistryEntry).filter_by(id=candidate_id).one()
+        assert independent_candidate_approval_error(db, candidate) is None
+
+
+def test_approval_validator_fails_closed_when_audit_event_is_missing(client, monkeypatch, tmp_path):
+    candidate_id, _, _ = create_candidate(
+        client, monkeypatch, tmp_path / 'candidate-artifacts', version='audit-missing-candidate-v1',
+    )
+    reviewer_headers = independent_reviewer_headers(client)
+    approve_candidate(client, candidate_id, reviewer_headers)
+
+    with client.app.state.test_session_factory() as db:
+        candidate = db.query(ModelRegistryEntry).filter_by(id=candidate_id).one()
+        event = db.query(AuditLog).filter_by(
+            action='model.candidate.approval.granted',
+            resource_type='phase3_model_governance',
+            resource_id=str(candidate_id),
+        ).one()
+        db.delete(event)
+        db.commit()
+        assert independent_candidate_approval_error(db, candidate) == 'Candidate approval audit evidence is not recorded.'
+
+
+def test_approval_validator_fails_closed_when_audit_actor_differs_from_approver(client, monkeypatch, tmp_path):
+    candidate_id, _, _ = create_candidate(
+        client, monkeypatch, tmp_path / 'candidate-artifacts', version='audit-mismatch-candidate-v1',
+    )
+    reviewer_headers = independent_reviewer_headers(client)
+    approve_candidate(client, candidate_id, reviewer_headers)
+
+    with client.app.state.test_session_factory() as db:
+        candidate = db.query(ModelRegistryEntry).filter_by(id=candidate_id).one()
+        other_reviewer = User(
+            email='different-reviewer@example.com',
+            full_name='Different Reviewer',
+            role='TEACHER',
+            password_hash=hash_password('different-reviewer-pass'),
+        )
+        db.add(other_reviewer)
+        db.flush()
+        candidate.approved_by_user_id = other_reviewer.id
+        db.commit()
+        assert independent_candidate_approval_error(db, candidate) == 'Candidate approval audit evidence does not match persisted approval.'
 
 
 def test_local_deploy_switches_inference_and_rollback_restores_verified_fallback(client, teacher_token, student_token, monkeypatch, tmp_path):
@@ -125,6 +229,8 @@ def test_local_deploy_switches_inference_and_rollback_restores_verified_fallback
     assert comparison['candidate_test_evaluation']['confusion_matrix']
     assert comparison['candidate_test_provenance']['dataset_hash'] == 'c' * 64
     entry_id, candidate_version, candidate_hash = create_candidate(client, monkeypatch, tmp_path / 'candidate-artifacts')
+    reviewer_headers = independent_reviewer_headers(client)
+    approve_candidate(client, entry_id, reviewer_headers)
 
     deployed = client.post(f'/api/v1/models/registry/{entry_id}/promote', json={
         'explicit_approval': True,
@@ -266,6 +372,8 @@ def test_rollback_must_name_the_active_local_registry_entry(client, teacher_toke
     artifact_directory = tmp_path / 'candidate-artifacts'
     active_id, active_version, _ = create_candidate(client, monkeypatch, artifact_directory)
     other_id, other_version, _ = create_candidate(client, monkeypatch, artifact_directory, version='other-local-fixture-v1')
+    reviewer_headers = independent_reviewer_headers(client)
+    approve_candidate(client, active_id, reviewer_headers)
     deployed = client.post(f'/api/v1/models/registry/{active_id}/promote', json={
         'explicit_approval': True,
         'approval_note': 'Deploy the candidate used for this rollback test.',
@@ -282,6 +390,156 @@ def test_rollback_must_name_the_active_local_registry_entry(client, teacher_toke
     assert history['active']['model_version'] == active_version
     assert history['history'][0]['candidate_version'] == other_version
     assert history['history'][0]['status'] == 'blocked'
+
+
+@pytest.mark.parametrize(
+    ('approval_issue', 'expected_blocker'),
+    [
+        ('missing_approver', 'approval is not recorded'),
+        ('missing_timestamp', 'approval is not recorded'),
+        ('creator_as_approver', 'other than its creator'),
+    ],
+)
+def test_rollback_rejects_candidate_without_valid_independent_approval(
+    client,
+    teacher_token,
+    monkeypatch,
+    tmp_path,
+    approval_issue,
+    expected_blocker,
+):
+    headers = auth(teacher_token)
+    artifact_directory = tmp_path / 'candidate-artifacts'
+    target_id, target_version, target_hash = create_candidate(
+        client, monkeypatch, artifact_directory, version='rollback-target-v1',
+    )
+    active_id, active_version, active_hash = create_candidate(
+        client, monkeypatch, artifact_directory, version='rollback-active-v1',
+    )
+    reviewer_headers = independent_reviewer_headers(client)
+    approve_candidate(client, target_id, reviewer_headers)
+    approve_candidate(client, active_id, reviewer_headers)
+
+    with client.app.state.test_session_factory() as db:
+        target = db.query(ModelRegistryEntry).filter_by(id=target_id).one()
+        active = db.query(ModelRegistryEntry).filter_by(id=active_id).one()
+        if approval_issue == 'missing_approver':
+            target.approved_by_user_id = None
+        elif approval_issue == 'missing_timestamp':
+            target.approved_at = None
+        else:
+            target.approved_by_user_id = target.created_by_user_id
+        target.deployment_status = 'SHADOW'
+        active.deployment_status = 'LOCAL_ACTIVE'
+        db.add(ModelDeploymentState(
+            id=1,
+            active_model_version=active_version,
+            active_artifact_hash=active_hash,
+        ))
+        db.add(ModelDeploymentEvent(
+            event='PROMOTE',
+            previous_version=target_version,
+            new_version=active_version,
+            candidate_version=active_version,
+            artifact_hash=active_hash,
+            actor_user_id=active.created_by_user_id,
+            actor_role='TEACHER',
+            reason='Fixture deployment for rollback approval validation.',
+            status='succeeded',
+            dataset_hash=active.dataset_fingerprint,
+            feature_contract=active.feature_schema,
+            previous_state={
+                'model_version': target_version,
+                'artifact_hash': target_hash,
+                'deployment_status': 'LOCAL_ACTIVE',
+                'artifact_identifier': target.artifact_identifier,
+            },
+            new_state={
+                'model_version': active_version,
+                'artifact_hash': active_hash,
+                'deployment_status': 'LOCAL_ACTIVE',
+                'artifact_identifier': active.artifact_identifier,
+            },
+        ))
+        db.commit()
+
+    response = client.post(f'/api/v1/models/registry/{active_id}/rollback', json={
+        'explicit_approval': True,
+        'rollback_note': 'Reject a candidate with invalid prior approval evidence.',
+    }, headers=headers)
+
+    assert response.status_code == 409
+    assert any(expected_blocker in blocker for blocker in response.json()['detail']['blockers'])
+    with client.app.state.test_session_factory() as db:
+        state = db.query(ModelDeploymentState).one()
+        assert state.active_model_version == active_version
+        assert db.query(ModelDeploymentEvent).filter_by(event='ROLLBACK').one().status == 'blocked'
+
+
+def test_rollback_restores_candidate_with_independent_persisted_approval(
+    client, teacher_token, monkeypatch, tmp_path,
+):
+    headers = auth(teacher_token)
+    artifact_directory = tmp_path / 'candidate-artifacts'
+    target_id, target_version, target_hash = create_candidate(
+        client, monkeypatch, artifact_directory, version='approved-rollback-target-v1',
+    )
+    active_id, active_version, active_hash = create_candidate(
+        client, monkeypatch, artifact_directory, version='approved-rollback-active-v1',
+    )
+    reviewer_headers = independent_reviewer_headers(client)
+    approve_candidate(client, target_id, reviewer_headers)
+    approve_candidate(client, active_id, reviewer_headers)
+
+    with client.app.state.test_session_factory() as db:
+        target = db.query(ModelRegistryEntry).filter_by(id=target_id).one()
+        active = db.query(ModelRegistryEntry).filter_by(id=active_id).one()
+        target.deployment_status = 'SHADOW'
+        active.deployment_status = 'LOCAL_ACTIVE'
+        db.add(ModelDeploymentState(
+            id=1,
+            active_model_version=active_version,
+            active_artifact_hash=active_hash,
+        ))
+        db.add(ModelDeploymentEvent(
+            event='PROMOTE',
+            previous_version=target_version,
+            new_version=active_version,
+            candidate_version=active_version,
+            artifact_hash=active_hash,
+            actor_user_id=active.created_by_user_id,
+            actor_role='TEACHER',
+            reason='Fixture deployment for valid rollback.',
+            status='succeeded',
+            dataset_hash=active.dataset_fingerprint,
+            feature_contract=active.feature_schema,
+            previous_state={
+                'model_version': target_version,
+                'artifact_hash': target_hash,
+                'deployment_status': 'LOCAL_ACTIVE',
+                'artifact_identifier': target.artifact_identifier,
+            },
+            new_state={
+                'model_version': active_version,
+                'artifact_hash': active_hash,
+                'deployment_status': 'LOCAL_ACTIVE',
+                'artifact_identifier': active.artifact_identifier,
+            },
+        ))
+        db.commit()
+
+    response = client.post(f'/api/v1/models/registry/{active_id}/rollback', json={
+        'explicit_approval': True,
+        'rollback_note': 'Restore the independently approved candidate.',
+    }, headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json()['active_model_version'] == target_version
+    with client.app.state.test_session_factory() as db:
+        state = db.query(ModelDeploymentState).one()
+        restored = db.query(ModelRegistryEntry).filter_by(id=target_id).one()
+        assert state.active_model_version == target_version
+        assert restored.deployment_status == 'LOCAL_ACTIVE'
 
 
 def test_prediction_transitions_include_student_probability_and_model_provenance(client, teacher_token, student_token):

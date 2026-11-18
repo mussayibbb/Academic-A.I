@@ -1,4 +1,4 @@
-export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
+export const API_BASE = '';
 
 export function readToken(): string | null {
   return typeof window === 'undefined' ? null : window.localStorage.getItem('token');
@@ -13,8 +13,16 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
   const response = await fetch(`${API_BASE}${path}`, { ...init, headers, cache: 'no-store' });
   if (!response.ok) {
-    const detail = await response.json().catch(() => null) as { detail?: string } | null;
-    throw new Error(detail?.detail ?? `Request failed (${response.status})`);
+    const body = await response.json().catch(() => null) as {
+      detail?: string | { message?: string; blockers?: string[]; issues?: string[] };
+    } | null;
+    const detail = body?.detail;
+    const message = typeof detail === 'string'
+      ? detail
+      : detail?.message
+        ? [detail.message, ...(detail.blockers ?? detail.issues ?? [])].join(' ')
+        : `Request failed (${response.status})`;
+    throw new Error(message);
   }
   return response.json() as Promise<T>;
 }

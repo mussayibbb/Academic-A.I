@@ -5,6 +5,7 @@ import pytest
 
 from ai.risk.predict import DEFAULT_ARTIFACT
 from backend.app.models import AuditLog, AcademicRiskOutcome, ModelRegistryEntry, Student, StudentSubjectAcademicRecord, Subject, User
+from backend.app.services.auth import create_access_token, hash_password
 
 
 def auth(token):
@@ -85,6 +86,15 @@ def test_phase3_training_and_promotion_are_blocked_without_real_readiness(client
     )
     assert promotion.status_code == 409
     assert promotion.json()['detail']['result'] == 'blocked'
+    assert any('creator identity is unavailable' in item for item in promotion.json()['detail']['blockers'])
+    assert any('Candidate approval is not recorded' in item for item in promotion.json()['detail']['blockers'])
+    approval_without_creator = client.post(
+        f'/api/v1/models/registry/{candidate_id}/approve',
+        json={'explicit_approval': True, 'approval_note': 'Missing creator identity must fail closed.'},
+        headers=teacher,
+    )
+    assert approval_without_creator.status_code == 409
+    assert any('creator identity is unavailable' in item for item in approval_without_creator.json()['detail']['blockers'])
     rollback = client.post(f'/api/v1/models/registry/{candidate_id}/rollback', json={'explicit_approval': True, 'rollback_note': 'Fixture rollback request without a previous deployment.'}, headers=teacher)
     assert rollback.status_code == 409
     assert rollback.json()['detail']['result'] == 'blocked'
@@ -145,13 +155,20 @@ def test_phase3_has_no_candidate_evaluation_comparison_or_shap_by_default(client
     assert 'no validated candidate model exists' in shap.json()['detail'].lower()
 
 
-def test_sufficient_isolated_fixture_data_trains_candidate_registers_validates_and_explains(client, teacher_token, tmp_path, monkeypatch):
+def test_sufficient_isolated_fixture_data_trains_candidate_registers_validates_and_explains(client, teacher_token, student_token, tmp_path, monkeypatch):
     monkeypatch.setattr('backend.app.main.CANDIDATE_ARTIFACT_DIRECTORY', tmp_path / 'candidate-artifacts')
     monkeypatch.setattr('ai.risk.phase3.APPROVED_AGGREGATION_STRATEGY', 'equal_subject_mean')
     monkeypatch.setattr('ai.risk.phase3.APPROVED_CANDIDATE_FEATURE_CONTRACT', ('fa1_mean', 'fa2_mean'))
     production_hash = hashlib.sha256(DEFAULT_ARTIFACT.read_bytes()).hexdigest()
     with client.app.state.test_session_factory() as db:
         teacher = db.query(User).filter_by(email='teacher@example.com').one()
+        db.add(User(
+            email='reviewer@example.com',
+            full_name='Independent Reviewer',
+            role='TEACHER',
+            password_hash=hash_password('reviewer-pass'),
+        ))
+        db.flush()
         subject = Subject(code='EVS', name='Environmental Studies')
         db.add(subject)
         db.flush()
@@ -181,6 +198,7 @@ def test_sufficient_isolated_fixture_data_trains_candidate_registers_validates_a
                     assignment_observed_at=observation_at,
                     attendance_rate=55 + class_index * 15,
                     attendance_observed_at=observation_at,
+                    temporal_evidence_verified=True,
                     updated_by_user_id=teacher.id,
                 ))
                 db.add(AcademicRiskOutcome(
@@ -188,6 +206,7 @@ def test_sufficient_isolated_fixture_data_trains_candidate_registers_validates_a
                     academic_period=period,
                     risk_level=label,
                     observed_at=outcome_at,
+                    temporal_evidence_verified=True,
                     outcome_source='independent fixture-only label',
                     recorded_by_user_id=teacher.id,
                 ))
@@ -231,10 +250,32 @@ def test_sufficient_isolated_fixture_data_trains_candidate_registers_validates_a
 
     validation = client.post(f'/api/v1/models/registry/{candidate_id}/validate', headers=headers)
     assert validation.status_code == 200, validation.text
+    reviewer_headers = {
+        'Authorization': f'Bearer {create_access_token("reviewer@example.com", "TEACHER")}',
+    }
+    student_headers = auth(student_token)
+    self_approval = client.post(f'/api/v1/models/registry/{candidate_id}/approve', json={
+        'explicit_approval': True,
+        'approval_note': 'Candidate creator must not self-approve.',
+    }, headers=headers)
+    assert self_approval.status_code == 409
+    assert any('cannot approve their own' in item for item in self_approval.json()['detail']['blockers'])
+    assert client.post(f'/api/v1/models/registry/{candidate_id}/promote', json={
+        'explicit_approval': True,
+        'approval_note': 'Promotion without independent approval must fail closed.',
+    }, headers=headers).status_code == 409
+    assert client.post(f'/api/v1/models/registry/{candidate_id}/approve', json={
+        'explicit_approval': True,
+        'approval_note': 'Unauthorized student approval attempt.',
+    }, headers=student_headers).status_code == 403
+    assert client.post(f'/api/v1/models/registry/{candidate_id}/promote', json={
+        'explicit_approval': True,
+        'approval_note': 'Unauthorized student deployment attempt.',
+    }, headers=student_headers).status_code == 403
     approval = client.post(f'/api/v1/models/registry/{candidate_id}/approve', json={
         'explicit_approval': True,
-        'approval_note': 'Fixture-only approval for pipeline behavior verification.',
-    }, headers=headers)
+        'approval_note': 'Fixture-only independent approval for pipeline behavior verification.',
+    }, headers=reviewer_headers)
     assert approval.status_code == 200, approval.text
     assert approval.json()['production_changed'] is False
     shap = client.get(f'/api/v1/ml/phase3/shap?student_id={sample_student_id}', headers=headers)
@@ -248,4 +289,5 @@ def test_sufficient_isolated_fixture_data_trains_candidate_registers_validates_a
     }, headers=headers)
     assert promotion.status_code == 409
     assert promotion.json()['detail']['result'] == 'blocked'
+    assert not any('other than its creator' in item for item in promotion.json()['detail']['blockers'])
     assert hashlib.sha256(DEFAULT_ARTIFACT.read_bytes()).hexdigest() == production_hash

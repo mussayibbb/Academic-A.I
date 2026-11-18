@@ -1,7 +1,7 @@
 'use client';
 
 import { motion } from 'framer-motion';
-import { ArrowDownRight, ArrowUpRight, ChevronLeft, Clock3, RefreshCw, Sparkles } from 'lucide-react';
+import { ArrowDownRight, ArrowRight, ArrowUpRight, ChevronLeft, Clock3, RefreshCw, Sparkles } from 'lucide-react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { useEffect, useState } from 'react';
@@ -15,7 +15,11 @@ type Submission = { id: number; assignment_id: number; status: string; grade?: n
 type SubjectRecord = { name: string; fa1: number | null; fa1_observed_at: string | null; fa2: number | null; fa2_observed_at: string | null; fa_average: number | null; assignment_mark: number | null; assignment_observed_at: string | null; internal_mark: number | null; attendance_rate: number | null; attendance_observed_at: string | null };
 type SubjectAssignment = { id: number; title: string; subject_code: string; status: string; due_date: string | null; max_marks: number; submission_status: string; uploaded: boolean; file_name: string | null; grade: number | null; feedback: string | null; submitted_at: string | null };
 type Detail = { student: Student; momentum: Observation[]; submissions: Submission[]; risk_history: { risk_level: string; recorded_at: string }[]; academic_records: { subjects: Record<string, SubjectRecord>; risk_scope: string; academic_period: string | null; academic_periods: string[] } };
-type Explanation = { prediction: { risk_level: string; risk_probability: number; risk_probability_semantics: string; model_version: string }; explanation: { target: string; target_class: string; base_value: number; contributions: Record<string, number>; feature_values: Record<string, number>; waterfall: { feature: string; value: number; contribution: number }[]; summary: string[] } };
+type SubjectFocusRow = { id: number; status: 'LOW' | 'NOT_LOW' | 'INSUFFICIENT_EVIDENCE'; reason: string; official_failure: boolean | null; support_triggers: ('LOW_SCORE' | 'OFFICIAL_FAIL')[] };
+type TeacherSubjectFocus = { subjects: { id: number; code: string; name: string; students: SubjectFocusRow[] }[] };
+type SummarySignal = { feature: string; value: number; contribution: number };
+type RiskSummary = { status: 'ready'; provider: string; selected_signals: SummarySignal[] } | { status: 'unavailable'; provider: string | null; error: string };
+type Explanation = { prediction: { risk_level: string; risk_probability: number; risk_probability_semantics: string; model_version: string }; explanation: { target: string; target_class: string; base_value: number; contributions: Record<string, number>; feature_values: Record<string, number>; waterfall: { feature: string; value: number; contribution: number }[]; summary: string[] }; risk_summary: RiskSummary };
 type TabName = 'Overview' | 'EVS' | 'CN' | 'TOC' | 'RM' | 'SE' | 'Academic performance' | 'Assignments' | 'Learning activity' | 'Risk analysis' | 'SHAP';
 const subjectTabs: TabName[] = ['EVS', 'CN', 'TOC', 'RM', 'SE'];
 const tabs: TabName[] = ['Overview', ...subjectTabs, 'Academic performance', 'Assignments', 'Learning activity', 'Risk analysis', 'SHAP'];
@@ -27,6 +31,8 @@ export default function Student360Page() {
   const [explanation, setExplanation] = useState<Explanation | null>(null);
   const [loadingExplanation, setLoadingExplanation] = useState(false);
   const [subjectAssignments, setSubjectAssignments] = useState<SubjectAssignment[]>([]);
+  const [subjectFocus, setSubjectFocus] = useState<TeacherSubjectFocus | null>(null);
+  const [subjectFocusError, setSubjectFocusError] = useState('');
   const [error, setError] = useState('');
 
   const changeAcademicPeriod = async (academicPeriod: string) => {
@@ -41,6 +47,16 @@ export default function Student360Page() {
   useEffect(() => {
     api<Detail>(`/api/v1/students/${encodeURIComponent(params.studentId)}`).then(setDetail).catch((requestError: Error) => setError(requestError.message));
   }, [params.studentId]);
+
+  const currentStudentId = detail?.student.id;
+  useEffect(() => {
+    if (currentStudentId == null) return;
+    let active = true;
+    api<TeacherSubjectFocus>(`/api/v1/teacher/subject-focus?student_id=${currentStudentId}&first_internal_only=true`)
+      .then((result) => { if (active) setSubjectFocus(result); })
+      .catch((requestError: Error) => { if (active) setSubjectFocusError(requestError.message); });
+    return () => { active = false; };
+  }, [currentStudentId]);
 
   const openTab = async (next: TabName) => {
     setTab(next);
@@ -69,6 +85,8 @@ export default function Student360Page() {
   const { student } = detail;
   const metricGroups = detail.momentum.reduce<Record<string, Observation[]>>((groups, item) => { (groups[item.metric] ??= []).push(item); return groups; }, {});
   const subjectRecord = subjectTabs.includes(tab) ? detail.academic_records.subjects[tab] : undefined;
+  const waterfall = explanation?.explanation.waterfall ?? [];
+  const maxContribution = waterfall.reduce((maximum, item) => Math.max(maximum, Math.abs(item.contribution)), 0);
 
   return <div className="fade-up space-y-6">
     <Link href="/teacher/students" className="inline-flex items-center gap-1 text-xs text-slate-500 hover:text-cyan-200"><ChevronLeft size={15} /> Student directory</Link>
@@ -78,6 +96,36 @@ export default function Student360Page() {
       <div className="absolute right-0 top-0 h-40 w-1/3 border-l border-white/[.035] bg-gradient-to-bl from-cyan-300/[.07] to-transparent" />
       <div className="relative flex flex-wrap items-start justify-between gap-5"><div><p className="eyebrow">Student 360 · {student.department ?? 'Academic profile'}</p><h1 className="mt-2 text-3xl font-semibold text-white sm:text-4xl">{student.full_name}</h1><div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-400"><span className="font-mono">{student.student_id}</span><span>{student.program ?? 'Program not set'}</span><span>Year {student.year ?? '—'}</span><span>Section {student.section ?? '—'}</span></div></div><div className="flex items-center gap-3"><RiskBadge level={student.risk_level} /><div className="text-right"><div className="text-2xl font-semibold text-white">{formatRiskProbability(student.risk_level, student.risk_probability)}</div><div className="text-[10px] uppercase tracking-[.1em] text-slate-500">Predicted class probability</div></div></div></div>
       <div className="relative mt-6 grid gap-3 sm:grid-cols-3"><Metric label="Attendance" value={`${student.attendance.toFixed(0)}%`} detail="Recorded academic observations" color={student.attendance < 75 ? 'rose' : 'cyan'} /><Metric label="Assessment" value={`${student.assessment.toFixed(0)}%`} detail="Current assessment average" color="amber" /><Metric label="Assignments" value={student.assignments_completed} detail="Completed engagements" color="mint" /></div>
+    </section>
+
+    <section aria-label="Subject recovery support" className="surface rounded-xl p-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div><p className="eyebrow">Verified subject evidence</p><h2 className="mt-1 text-sm font-semibold text-white">Subject recovery workspaces</h2><p className="mt-1 text-[10px] text-slate-500">Only first-internal low scores and explicit official FAIL results trigger automatic support.</p></div>
+        <div className="flex flex-wrap gap-2">
+          <Link href={`/teacher/recovery/students/${student.id}`} className="inline-flex min-h-9 items-center gap-1 rounded-lg bg-rose-600 px-3 text-[10px] font-semibold text-white hover:bg-rose-500">Recovery profile <ArrowRight size={12} /></Link>
+          <Link href={`/teacher/recovery/roadmaps?student_id=${student.id}`} className="inline-flex min-h-9 items-center gap-1 rounded-lg border border-white/10 px-3 text-[10px] text-slate-200 hover:border-rose-200/20">Review roadmaps <ArrowRight size={12} /></Link>
+        </div>
+      </div>
+      {subjectFocusError && <p role="alert" className="mt-3 rounded-lg border border-rose-200/15 bg-rose-200/[.035] p-3 text-xs text-rose-100">Subject support evidence could not be loaded: {subjectFocusError}</p>}
+      {!subjectFocus && !subjectFocusError && <p role="status" className="mt-3 text-xs text-slate-500">Loading subject-specific support evidence…</p>}
+      {subjectFocus && (() => {
+        const rows = subjectFocus.subjects.flatMap((subject) => {
+          const row = subject.students.find((candidate) => candidate.id === student.id);
+          return row ? [{ subject, row }] : [];
+        });
+        const actionable = rows.filter(({ row }) => row.support_triggers.length > 0);
+        const insufficient = rows.filter(({ row }) => row.status === 'INSUFFICIENT_EVIDENCE');
+        return <>
+          {actionable.length > 0
+            ? <div className="mt-4 grid gap-3 md:grid-cols-2">{actionable.map(({ subject, row }) => <article key={subject.id} className="rounded-lg border border-rose-200/15 bg-rose-200/[.025] p-4">
+              <div className="flex items-start justify-between gap-3"><div><p className="eyebrow">{subject.code}</p><h3 className="mt-1 text-xs font-semibold text-white">{subject.name}</h3></div><span className="rounded-full border border-rose-200/20 px-2 py-1 text-[9px] text-rose-100">{row.support_triggers.includes('OFFICIAL_FAIL') ? 'Official FAIL' : 'Below threshold'}</span></div>
+              <p className="mt-2 text-[10px] leading-5 text-slate-400">{row.reason}</p>
+              <Link href={`/teacher/recovery/subjects/${subject.id}/students/${student.id}`} className="mt-3 inline-flex min-h-9 items-center gap-1.5 rounded-lg bg-rose-600 px-3 text-[10px] font-semibold text-white hover:bg-rose-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300">Open {subject.name} workspace <ArrowRight size={12} /></Link>
+            </article>)}</div>
+            : <p className="mt-3 text-xs text-slate-400">No subject has a verified low first-internal score or explicit official FAIL result.</p>}
+          {insufficient.length > 0 && <p className="mt-3 text-[10px] leading-5 text-amber-100">{insufficient.length} subject{insufficient.length === 1 ? ' has' : 's have'} insufficient verified evidence; automatic eligibility is not inferred.</p>}
+        </>;
+      })()}
     </section>
 
     <div className="border-b border-white/10"><div role="tablist" aria-label="Student details" className="flex gap-1 overflow-x-auto">{tabs.map((item) => <button key={item} role="tab" aria-selected={tab === item} onClick={() => void openTab(item)} className={`whitespace-nowrap border-b-2 px-3 py-3 text-xs transition ${tab === item ? 'border-cyan-200 text-cyan-100' : 'border-transparent text-slate-500 hover:text-slate-200'}`}>{item}</button>)}</div></div>
@@ -96,9 +144,36 @@ export default function Student360Page() {
 
     {tab === 'Risk analysis' && <section className="surface rounded-xl p-5"><div className="flex items-center gap-2"><Sparkles size={16} className="text-amber-100" /><h2 className="text-sm font-semibold">Risk history</h2></div><p className="mt-1 text-xs text-slate-500">Historical saved class labels; older entries may predate the current argmax policy.</p><div className="mt-5 flex flex-wrap gap-3">{detail.risk_history.map((item, index) => <div key={`${item.recorded_at}-${index}`} className="surface-soft min-w-44 rounded-lg p-4"><div className="flex items-center justify-between"><RiskBadge level={item.risk_level} /><span className="text-[10px] text-slate-500">Historical</span></div><div className="mt-3 text-[10px] text-slate-500">{new Date(item.recorded_at).toLocaleString()}</div></div>)}{!detail.risk_history.length && <div className="text-xs text-slate-500">No risk history has been saved yet.</div>}</div></section>}
 
-    {tab === 'SHAP' && <section className="surface rounded-xl p-5 sm:p-6"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="eyebrow">Model explanation</p><h2 className="mt-1 text-lg font-semibold">Why is this student at risk?</h2><p className="mt-1 text-xs text-slate-500">Contributions are calculated from this student’s features and the current trained model.</p></div><span className="rounded-full border border-indigo-200/15 bg-indigo-200/[.05] px-3 py-1.5 text-[10px] text-indigo-100">{explanation?.prediction.model_version ?? 'SHAP'}</span></div>
-      {loadingExplanation && <div className="mt-5 flex items-center gap-2 text-xs text-slate-400"><RefreshCw size={14} className="animate-spin" />Calculating model explanation…</div>}
-      {explanation && <><div className="mt-5 rounded-lg border border-white/7 bg-black/10 px-4 py-3"><div className="text-xs text-slate-400">SHAP target {explanation.explanation.target_class}<strong className="ml-2 text-white">{formatRiskProbability(explanation.prediction.risk_level, explanation.prediction.risk_probability)}</strong></div><div className="mt-3 space-y-3">{explanation.explanation.waterfall.map((item) => { const magnitude = Math.min(Math.abs(item.contribution) * 100 * 3, 100); return <div key={item.feature} className="grid grid-cols-[130px_1fr_56px] items-center gap-3"><div className="truncate text-[11px] capitalize text-slate-400">{item.feature.replaceAll('_', ' ')}</div><div className="relative h-2 rounded-full bg-white/5"><div className={`absolute top-0 h-full rounded-full ${item.contribution >= 0 ? 'bg-rose-300' : 'bg-emerald-300'}`} style={{ width: `${magnitude}%`, left: item.contribution >= 0 ? '50%' : `${50 - magnitude}%` }} /><span className="absolute left-1/2 top-[-3px] h-3.5 w-px bg-slate-500" /></div><div className={`text-right font-mono text-[10px] ${item.contribution >= 0 ? 'text-rose-200' : 'text-emerald-200'}`}>{item.contribution >= 0 ? '+' : ''}{item.contribution.toFixed(3)}</div></div>})}</div></div><div className="mt-4"><h3 className="text-xs font-semibold text-slate-200">Largest contributing signals</h3><ul className="mt-2 space-y-2">{explanation.explanation.summary.map((item) => <li key={item} className="flex gap-2 text-xs leading-5 text-slate-400"><span className="mt-1.5 size-1 shrink-0 rounded-full bg-cyan-200" />{item}</li>)}</ul></div><p className="mt-5 flex items-center gap-2 border-t border-white/8 pt-4 text-[10px] text-slate-600"><Clock3 size={12} /> Explanations support faculty review and are not a diagnosis.</p></>}
+    {tab === 'SHAP' && <section className="surface rounded-xl p-5 sm:p-6"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="eyebrow">Model explanation</p><h2 className="mt-1 text-lg font-semibold">What informs this classification?</h2><p className="mt-1 text-xs text-slate-500">SHAP contributions explain this student’s inputs to the predicted class probability, not causes.</p></div><span className="rounded-full border border-rose-300/15 bg-rose-300/[.05] px-3 py-1.5 text-[10px] text-rose-100">{explanation?.prediction.model_version ?? 'SHAP'}</span></div>
+      {loadingExplanation && <div className="mt-5 flex items-center gap-2 text-xs text-slate-400"><RefreshCw size={14} className="animate-spin" />Calculating model explanation and reviewing verified evidence…</div>}
+      {explanation && <>
+        <div className="mt-5 rounded-lg border border-white/7 bg-black/10 px-4 py-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400"><span>SHAP target <strong className="ml-1 text-white">P({explanation.explanation.target_class})</strong></span><strong className="text-white">{formatRiskProbability(explanation.prediction.risk_level, explanation.prediction.risk_probability)}</strong></div>
+          <div className="mt-4 space-y-3">
+            {waterfall.map((item) => {
+              const magnitude = maxContribution > 0 ? Math.abs(item.contribution) / maxContribution * 50 : 0;
+              const featureLabel = item.feature.replaceAll('_', ' ');
+              const contributionLabel = item.contribution > 0 ? `+${item.contribution.toFixed(3)}` : item.contribution.toFixed(3);
+              return <div key={item.feature} className="grid min-w-0 grid-cols-[minmax(0,1.1fr)_minmax(56px,1.5fr)_48px] items-center gap-2 sm:grid-cols-[minmax(0,1.2fr)_minmax(90px,2fr)_64px] sm:gap-3">
+                <div className="min-w-0"><div className="break-words text-[11px] capitalize text-slate-300">{featureLabel}</div><div className="mt-0.5 text-[9px] text-slate-500">Input {new Intl.NumberFormat(undefined, { maximumSignificantDigits: 5 }).format(item.value)}</div></div>
+                <div className="relative h-2 min-w-0 rounded-full bg-white/[.06]" aria-hidden="true"><div className={`absolute top-0 h-full rounded-full transition-[left,width] duration-500 motion-reduce:transition-none ${item.contribution > 0 ? 'bg-rose-400' : item.contribution < 0 ? 'bg-slate-300' : 'bg-slate-500'}`} style={{ width: `${magnitude}%`, left: `${item.contribution < 0 ? 50 - magnitude : 50}%` }} /><span className="absolute left-1/2 top-[-3px] h-3.5 w-px bg-slate-500" /></div>
+                <div className={`text-right font-mono text-[10px] ${item.contribution > 0 ? 'text-rose-200' : 'text-slate-300'}`} aria-label={`${contributionLabel} contribution to P(${explanation.explanation.target_class})`}>{contributionLabel}</div>
+              </div>;
+            })}
+          </div>
+          <div className="mt-4 flex flex-wrap gap-x-5 gap-y-2 border-t border-white/[.06] pt-3 text-[10px] text-slate-400"><span className="inline-flex items-center gap-2"><span className="size-2 rounded-full bg-rose-400" />Increases P({explanation.explanation.target_class})</span><span className="inline-flex items-center gap-2"><span className="size-2 rounded-full bg-slate-300" />Decreases P({explanation.explanation.target_class})</span><span>Bar scale is relative to the largest contribution shown.</span></div>
+        </div>
+        <div className="mt-4"><h3 className="text-xs font-semibold text-slate-200">Largest model-attributed signals</h3><ul className="mt-2 space-y-2">{explanation.explanation.summary.map((item) => <li key={item} className="flex gap-2 text-xs leading-5 text-slate-400"><span className="mt-1.5 size-1 shrink-0 rounded-full bg-rose-300" />{item}</li>)}</ul></div>
+        <div className="mt-5 rounded-lg border border-rose-300/15 bg-rose-300/[.035] p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2"><div className="flex items-center gap-2"><Sparkles size={15} className="text-rose-200" /><h3 className="text-sm font-semibold text-white">AI Risk Summary</h3></div><span className="text-[10px] text-slate-400">{explanation.risk_summary.provider ?? 'AI provider'}{explanation.risk_summary.status === 'ready' ? ' · evidence-selected' : ' · unavailable'}</span></div>
+          {explanation.risk_summary.status === 'ready' ? <>
+            <p className="mt-3 text-xs leading-5 text-slate-300">The model predicts <strong className="text-white">{explanation.prediction.risk_level}</strong> with {formatRiskProbability(explanation.prediction.risk_level, explanation.prediction.risk_probability)}. The configured AI selected these verified signals for review:</p>
+            <ul className="mt-3 grid gap-2 sm:grid-cols-2">{explanation.risk_summary.selected_signals.map((signal) => <li key={signal.feature} className="rounded-md border border-white/[.06] bg-black/[.12] p-3"><div className="text-xs capitalize text-white">{signal.feature.replaceAll('_', ' ')}</div><div className="mt-1 font-mono text-[10px] text-slate-400">Input {new Intl.NumberFormat(undefined, { maximumSignificantDigits: 5 }).format(signal.value)} <span className={signal.contribution > 0 ? 'text-rose-200' : 'text-slate-300'}>· {signal.contribution > 0 ? '+' : ''}{signal.contribution.toFixed(3)} to P({explanation.explanation.target_class})</span></div></li>)}</ul>
+            <p className="mt-3 text-[10px] leading-4 text-slate-500">SHAP signals describe model attribution, not causation. Zero-valued temporal inputs may reflect unavailable observations; they do not establish stability.</p>
+          </> : <p role="status" className="mt-3 text-xs leading-5 text-slate-300">The SHAP chart is available, but an AI risk summary could not be produced: {explanation.risk_summary.error}</p>}
+        </div>
+        <p className="mt-5 flex items-center gap-2 border-t border-white/8 pt-4 text-[10px] text-slate-500"><Clock3 size={12} /> Explanations support faculty review and are not a diagnosis.</p>
+      </>}
       {!explanation && !loadingExplanation && <button onClick={() => void openTab('SHAP')} className="mt-5 inline-flex items-center gap-2 rounded-lg border border-cyan-200/20 px-3 py-2 text-xs text-cyan-100 hover:bg-cyan-200/5"><Sparkles size={14} /> Calculate explanation</button>}
     </section>}
   </div>;

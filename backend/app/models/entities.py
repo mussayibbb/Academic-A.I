@@ -1,7 +1,7 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, event
+from sqlalchemy import JSON, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, event, select
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.database import Base
@@ -77,6 +77,194 @@ class Subject(Timestamps, Base):
     code: Mapped[str] = mapped_column(String(40), unique=True)
     department: Mapped[str | None] = mapped_column(String(160))
     courses: Mapped[list['Course']] = relationship(back_populates='subject')
+    modules: Mapped[list['SubjectModule']] = relationship(back_populates='subject', cascade='all, delete-orphan')
+    topic_assignments: Mapped[list['TopicLearningAssignment']] = relationship(back_populates='subject', cascade='all, delete-orphan')
+
+
+class SubjectModule(Timestamps, Base):
+    __tablename__ = 'subject_modules'
+    __table_args__ = (UniqueConstraint('subject_id', 'module_number', name='uq_subject_module_number'),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subject_id: Mapped[int] = mapped_column(ForeignKey('subjects.id', ondelete='CASCADE'), index=True)
+    module_number: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    title: Mapped[str] = mapped_column(String(200), default='Module')
+    description: Mapped[str | None] = mapped_column(Text, default=None)
+    status: Mapped[str] = mapped_column(String(30), default='ACTIVE', index=True)
+    subject: Mapped[Subject] = relationship(back_populates='modules')
+    resources: Mapped[list['SubjectModuleResource']] = relationship(back_populates='module', cascade='all, delete-orphan')
+    approved_topics: Mapped[list['ApprovedTopic']] = relationship(back_populates='module', cascade='all, delete-orphan')
+    assignments: Mapped[list['TopicLearningAssignment']] = relationship(back_populates='module', cascade='all, delete-orphan')
+
+
+class SubjectModuleResource(Timestamps, Base):
+    __tablename__ = 'subject_module_resources'
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    module_id: Mapped[int] = mapped_column(ForeignKey('subject_modules.id', ondelete='CASCADE'), index=True)
+    subject_id: Mapped[int] = mapped_column(ForeignKey('subjects.id', ondelete='CASCADE'), index=True)
+    teacher_id: Mapped[int] = mapped_column(ForeignKey('teachers.id', ondelete='SET NULL'), index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    original_filename: Mapped[str] = mapped_column(String(255))
+    storage_path: Mapped[str] = mapped_column(String(512))
+    file_type: Mapped[str] = mapped_column(String(30), index=True)
+    file_size: Mapped[int] = mapped_column(Integer, default=0)
+    content_hash: Mapped[str] = mapped_column(String(128), index=True)
+    processing_status: Mapped[str] = mapped_column(String(30), default='PENDING', index=True)
+    error_message: Mapped[str | None] = mapped_column(Text, default=None)
+    extracted_text: Mapped[str | None] = mapped_column(Text, default=None)
+    extracted_topics: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    provenance: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    module: Mapped[SubjectModule] = relationship(back_populates='resources')
+    teacher: Mapped['Teacher | None'] = relationship()
+    topics: Mapped[list['ApprovedTopic']] = relationship(back_populates='source_resource', cascade='all, delete-orphan')
+
+
+class ApprovedTopic(Timestamps, Base):
+    __tablename__ = 'approved_topics'
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subject_id: Mapped[int] = mapped_column(ForeignKey('subjects.id', ondelete='CASCADE'), index=True)
+    module_id: Mapped[int] = mapped_column(ForeignKey('subject_modules.id', ondelete='CASCADE'), index=True)
+    source_resource_id: Mapped[int | None] = mapped_column(ForeignKey('subject_module_resources.id', ondelete='SET NULL'), index=True)
+    teacher_id: Mapped[int | None] = mapped_column(ForeignKey('teachers.id', ondelete='SET NULL'), index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    summary: Mapped[str] = mapped_column(Text)
+    learning_objectives: Mapped[list[str]] = mapped_column(JSON, default=list)
+    concepts: Mapped[list[str]] = mapped_column(JSON, default=list)
+    approval_status: Mapped[str] = mapped_column(String(30), default='DRAFT', index=True)
+    approved_by_user_id: Mapped[int | None] = mapped_column(ForeignKey('users.id', ondelete='SET NULL'), index=True)
+    source_provenance: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    module: Mapped[SubjectModule] = relationship(back_populates='approved_topics')
+    source_resource: Mapped['SubjectModuleResource | None'] = relationship(back_populates='topics')
+    assignments: Mapped[list['TopicLearningAssignment']] = relationship(back_populates='approved_topic', cascade='all, delete-orphan')
+
+
+class TopicLearningAssignment(Timestamps, Base):
+    __tablename__ = 'topic_learning_assignments'
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey('students.id', ondelete='CASCADE'), index=True)
+    subject_id: Mapped[int] = mapped_column(ForeignKey('subjects.id', ondelete='CASCADE'), index=True)
+    module_id: Mapped[int] = mapped_column(ForeignKey('subject_modules.id', ondelete='CASCADE'), index=True)
+    approved_topic_id: Mapped[int] = mapped_column(ForeignKey('approved_topics.id', ondelete='CASCADE'), index=True)
+    teacher_id: Mapped[int | None] = mapped_column(ForeignKey('teachers.id', ondelete='SET NULL'), index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    learning_objective: Mapped[str] = mapped_column(Text)
+    lesson_content: Mapped[str] = mapped_column(Text)
+    expected_duration_minutes: Mapped[int] = mapped_column(Integer, default=30)
+    scheduled_at: Mapped[datetime | None] = mapped_column(DateTime)
+    available_from: Mapped[datetime | None] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(String(30), default='ACTIVE', index=True)
+    mastery_criteria: Mapped[str | None] = mapped_column(Text, default=None)
+    source_provenance: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    subject: Mapped[Subject] = relationship(back_populates='topic_assignments')
+    module: Mapped[SubjectModule] = relationship(back_populates='assignments')
+    approved_topic: Mapped[ApprovedTopic] = relationship(back_populates='assignments')
+    student: Mapped[Student] = relationship()
+    teacher: Mapped['Teacher | None'] = relationship()
+
+
+def _prevent_subject_reassignment(mapper, connection, target) -> None:
+    table = target.__table__
+    persisted_subject_id = connection.execute(
+        select(table.c.subject_id).where(table.c.id == target.id)
+    ).scalar_one()
+    if persisted_subject_id is not None and target.subject_id != persisted_subject_id:
+        raise ValueError('A persisted subject association is immutable.')
+
+
+class AssessmentQuestion(Timestamps, Base):
+    __tablename__ = 'assessment_questions'
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    assessment_id: Mapped[int | None] = mapped_column(ForeignKey('learning_assessments.id', ondelete='CASCADE'), index=True)
+    subject_id: Mapped[int] = mapped_column(ForeignKey('subjects.id', ondelete='CASCADE'), index=True)
+    module_id: Mapped[int] = mapped_column(ForeignKey('subject_modules.id', ondelete='CASCADE'), index=True)
+    topic_id: Mapped[int] = mapped_column(ForeignKey('approved_topics.id', ondelete='CASCADE'), index=True)
+    question_type: Mapped[str] = mapped_column(String(20), default='MCQ', index=True)
+    question: Mapped[str] = mapped_column(Text)
+    options: Mapped[list[str]] = mapped_column(JSON, default=list)
+    correct_answer: Mapped[str | None] = mapped_column(Text, default=None)
+    explanation: Mapped[str | None] = mapped_column(Text, default=None)
+    learning_objective: Mapped[str | None] = mapped_column(Text, default=None)
+    source_reference: Mapped[str | None] = mapped_column(String(255), default=None)
+    rubric: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    marks: Mapped[float] = mapped_column(Float, default=1.0)
+    source_provenance: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class LearningAssessment(Timestamps, Base):
+    __tablename__ = 'learning_assessments'
+    __table_args__ = (UniqueConstraint('assignment_id', 'version', name='uq_learning_assessment_assignment_version'),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    assignment_id: Mapped[int] = mapped_column(ForeignKey('topic_learning_assignments.id', ondelete='CASCADE'), index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(30), default='REVIEW_REQUIRED', index=True)
+    question_count: Mapped[int] = mapped_column(Integer, default=0)
+    source_evidence: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    validation_results: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error_message: Mapped[str | None] = mapped_column(Text, default=None)
+    teacher_id: Mapped[int | None] = mapped_column(ForeignKey('teachers.id', ondelete='SET NULL'), index=True)
+    approved_by_user_id: Mapped[int | None] = mapped_column(ForeignKey('users.id', ondelete='SET NULL'), index=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime)
+    review_reason: Mapped[str | None] = mapped_column(Text)
+
+
+class LearningStudySession(Timestamps, Base):
+    __tablename__ = 'learning_study_sessions'
+    __table_args__ = (UniqueConstraint('assignment_id', 'student_id', name='uq_learning_session_assignment_student'),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    assignment_id: Mapped[int] = mapped_column(ForeignKey('topic_learning_assignments.id', ondelete='CASCADE'), index=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey('students.id', ondelete='CASCADE'), index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    required_duration_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class AssessmentAttempt(Timestamps, Base):
+    __tablename__ = 'assessment_attempts'
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    assignment_id: Mapped[int] = mapped_column(ForeignKey('topic_learning_assignments.id', ondelete='CASCADE'), index=True)
+    assessment_id: Mapped[int | None] = mapped_column(ForeignKey('learning_assessments.id', ondelete='SET NULL'), index=True)
+    study_session_id: Mapped[int | None] = mapped_column(ForeignKey('learning_study_sessions.id', ondelete='SET NULL'), index=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey('students.id', ondelete='CASCADE'), index=True)
+    question_set_version: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(30), default='IN_PROGRESS', index=True)
+    total_marks: Mapped[float | None] = mapped_column(Float, default=None)
+    percentage: Mapped[float | None] = mapped_column(Float, default=None)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime)
+    evaluated_at: Mapped[datetime | None] = mapped_column(DateTime)
+    question_set: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    answer_key: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    provider_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    responses: Mapped[list['AssessmentAttemptAnswer']] = relationship(back_populates='attempt', cascade='all, delete-orphan')
+
+
+class AssessmentAttemptAnswer(Timestamps, Base):
+    __tablename__ = 'assessment_attempt_answers'
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    attempt_id: Mapped[int] = mapped_column(ForeignKey('assessment_attempts.id', ondelete='CASCADE'), index=True)
+    question_id: Mapped[int] = mapped_column(ForeignKey('assessment_questions.id', ondelete='CASCADE'), index=True)
+    selected_choice: Mapped[str | None] = mapped_column(Text, default=None)
+    response_text: Mapped[str | None] = mapped_column(Text, default=None)
+    marks_awarded: Mapped[float] = mapped_column(Float, default=0.0)
+    original_marks_awarded: Mapped[float | None] = mapped_column(Float)
+    is_correct: Mapped[bool | None] = mapped_column(Boolean, default=None)
+    review_required: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    feedback: Mapped[str | None] = mapped_column(Text, default=None)
+    review_reason: Mapped[str | None] = mapped_column(Text)
+    rubric_evaluation: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    reviewed_by_user_id: Mapped[int | None] = mapped_column(ForeignKey('users.id', ondelete='SET NULL'), index=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    source_reference: Mapped[str | None] = mapped_column(String(255), default=None)
+    attempt: Mapped[AssessmentAttempt] = relationship(back_populates='responses')
+    question: Mapped[AssessmentQuestion] = relationship()
 
 
 class StudentSubjectAcademicRecord(Timestamps, Base):
@@ -89,12 +277,15 @@ class StudentSubjectAcademicRecord(Timestamps, Base):
     academic_period: Mapped[str] = mapped_column(String(30), index=True)
     fa1: Mapped[float | None] = mapped_column(Float)
     fa1_observed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    fa1_maximum_marks: Mapped[float | None] = mapped_column(Float)
+    fa1_maximum_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     fa2: Mapped[float | None] = mapped_column(Float)
     fa2_observed_at: Mapped[datetime | None] = mapped_column(DateTime)
     assignment_mark: Mapped[float | None] = mapped_column(Float)
     assignment_observed_at: Mapped[datetime | None] = mapped_column(DateTime)
     attendance_rate: Mapped[float | None] = mapped_column(Float)
     attendance_observed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    temporal_evidence_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     import_batch_id: Mapped[int | None] = mapped_column(ForeignKey('academic_data_import_batches.id', ondelete='SET NULL'), index=True)
     updated_by_user_id: Mapped[int | None] = mapped_column(ForeignKey('users.id', ondelete='SET NULL'), index=True)
     student: Mapped[Student] = relationship()
@@ -112,6 +303,8 @@ class StudentSubjectAcademicRecordHistory(Timestamps, Base):
     change_kind: Mapped[str] = mapped_column(String(20))
     fa1: Mapped[float | None] = mapped_column(Float)
     fa1_observed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    fa1_maximum_marks: Mapped[float | None] = mapped_column(Float)
+    fa1_maximum_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     fa2: Mapped[float | None] = mapped_column(Float)
     fa2_observed_at: Mapped[datetime | None] = mapped_column(DateTime)
     assignment_mark: Mapped[float | None] = mapped_column(Float)
@@ -132,6 +325,7 @@ class AcademicRiskOutcome(Timestamps, Base):
     academic_period: Mapped[str] = mapped_column(String(30), index=True)
     risk_level: Mapped[str] = mapped_column(String(20))
     observed_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    temporal_evidence_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     outcome_source: Mapped[str] = mapped_column(String(255))
     import_batch_id: Mapped[int | None] = mapped_column(ForeignKey('academic_data_import_batches.id', ondelete='SET NULL'), index=True)
     recorded_by_user_id: Mapped[int | None] = mapped_column(ForeignKey('users.id', ondelete='SET NULL'), index=True)
@@ -180,6 +374,7 @@ class Assessment(Timestamps, Base):
     title: Mapped[str] = mapped_column(String(200))
     due_at: Mapped[datetime | None] = mapped_column(DateTime)
     maximum_marks: Mapped[float] = mapped_column(Float, default=100.0)
+    maximum_marks_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     course: Mapped[Course] = relationship(back_populates='assessments')
     marks: Mapped[list['Mark']] = relationship(back_populates='assessment', cascade='all, delete-orphan')
 
@@ -193,9 +388,34 @@ class Mark(Timestamps, Base):
     student_id: Mapped[int] = mapped_column(ForeignKey('students.id', ondelete='CASCADE'), index=True)
     assessment_id: Mapped[int] = mapped_column(ForeignKey('assessments.id', ondelete='CASCADE'), index=True)
     score: Mapped[float] = mapped_column(Float)
+    official_result: Mapped[str | None] = mapped_column(String(20))
     recorded_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     student: Mapped[Student] = relationship(back_populates='marks')
     assessment: Mapped[Assessment] = relationship(back_populates='marks')
+
+
+class SubjectFocusPolicy(Base):
+    __tablename__ = 'subject_focus_policies'
+    __table_args__ = (UniqueConstraint('version', name='uq_subject_focus_policy_version'),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    threshold_score: Mapped[float] = mapped_column(Float, nullable=False)
+    threshold_maximum: Mapped[float] = mapped_column(Float, nullable=False)
+    actor_user_id: Mapped[int | None] = mapped_column(ForeignKey('users.id', ondelete='SET NULL'))
+    change_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    actor: Mapped[User | None] = relationship()
+
+
+@event.listens_for(SubjectFocusPolicy, 'before_update')
+def prevent_subject_focus_policy_update(mapper, connection, target) -> None:
+    raise ValueError('Subject focus policy versions are immutable.')
+
+
+@event.listens_for(SubjectFocusPolicy, 'before_delete')
+def prevent_subject_focus_policy_delete(mapper, connection, target) -> None:
+    raise ValueError('Subject focus policy versions are immutable.')
 
 
 class LearningActivity(Timestamps, Base):
@@ -515,6 +735,30 @@ class AcademicDataImportRow(Timestamps, Base):
     errors: Mapped[list[str]] = mapped_column(JSON, default=list)
 
 
+class StudentPeriodFeatureSnapshot(Base):
+    __tablename__ = 'student_period_feature_snapshots'
+    __table_args__ = (
+        UniqueConstraint('student_id', 'academic_period', name='uq_student_feature_snapshot_student_period'),
+        UniqueConstraint('import_batch_id', 'source_row_number', name='uq_student_feature_snapshot_batch_row'),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey('students.id', ondelete='RESTRICT'), index=True)
+    academic_period: Mapped[str] = mapped_column(String(30), index=True)
+    feature_values: Mapped[dict[str, float]] = mapped_column(JSON, nullable=False)
+    feature_observed_at: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False)
+    import_batch_id: Mapped[int] = mapped_column(ForeignKey('academic_data_import_batches.id', ondelete='RESTRICT'), index=True)
+    source_row_number: Mapped[int] = mapped_column(Integer)
+    source_row_checksum: Mapped[str] = mapped_column(String(64))
+    source_filename: Mapped[str] = mapped_column(String(255))
+    source_checksum: Mapped[str] = mapped_column(String(64))
+    recorded_by_user_id: Mapped[int] = mapped_column(ForeignKey('users.id', ondelete='RESTRICT'), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    student: Mapped[Student] = relationship()
+    import_batch: Mapped['AcademicDataImportBatch'] = relationship()
+    recorded_by: Mapped[User] = relationship()
+
+
 class Intervention(Timestamps, Base):
     __tablename__ = 'interventions'
 
@@ -579,15 +823,163 @@ class SupportFollowUp(Timestamps, Base):
 
 class SupportPlanVersion(Timestamps, Base):
     __tablename__ = 'support_plan_versions'
+    __table_args__ = (UniqueConstraint('student_id', 'generation_key', name='uq_support_plan_generation_key'),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     student_id: Mapped[int] = mapped_column(ForeignKey('students.id', ondelete='CASCADE'), index=True)
+    subject_id: Mapped[int | None] = mapped_column(ForeignKey('subjects.id', ondelete='RESTRICT'), index=True)
+    subject_scope_review_required: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    blueprint_group_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    is_blueprint_group: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    source_blueprint_plan_id: Mapped[int | None] = mapped_column(ForeignKey('support_plan_versions.id', ondelete='SET NULL'), index=True)
     teacher_id: Mapped[int | None] = mapped_column(ForeignKey('teachers.id', ondelete='SET NULL'), index=True)
     version: Mapped[int] = mapped_column(Integer, default=1, index=True)
     summary: Mapped[str | None] = mapped_column(Text, default=None)
     plan_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(20), default='DRAFT', index=True)
+    evidence_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    generation_key: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    approved_by_user_id: Mapped[int | None] = mapped_column(ForeignKey('users.id', ondelete='SET NULL'), index=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime)
     student: Mapped[Student] = relationship()
+    subject: Mapped[Subject | None] = relationship()
     teacher: Mapped['Teacher | None'] = relationship()
+    source_blueprint: Mapped['SupportPlanVersion | None'] = relationship(remote_side='SupportPlanVersion.id')
+    tasks: Mapped[list['RecoveryTask']] = relationship(
+        back_populates='roadmap',
+        cascade='all, delete-orphan',
+        foreign_keys='RecoveryTask.roadmap_version_id',
+    )
+
+
+event.listen(TopicLearningAssignment, 'before_update', _prevent_subject_reassignment)
+
+
+@event.listens_for(StudentPeriodFeatureSnapshot, 'before_update')
+def prevent_student_period_feature_snapshot_update(mapper, connection, target) -> None:
+    raise ValueError('Student-period feature snapshots are immutable.')
+
+
+@event.listens_for(StudentPeriodFeatureSnapshot, 'before_delete')
+def prevent_student_period_feature_snapshot_delete(mapper, connection, target) -> None:
+    raise ValueError('Student-period feature snapshots are immutable.')
+
+
+class RecoveryTask(Timestamps, Base):
+    __tablename__ = 'recovery_tasks'
+    __table_args__ = (
+        UniqueConstraint('roadmap_version_id', 'task_key', name='uq_recovery_task_roadmap_key'),
+        UniqueConstraint(
+            'source_blueprint_plan_id',
+            'source_schedule_entry_key',
+            name='uq_recovery_task_blueprint_schedule_entry',
+        ),
+        Index('ix_recovery_task_student_status_schedule', 'student_id', 'status', 'scheduled_at'),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    roadmap_version_id: Mapped[int] = mapped_column(ForeignKey('support_plan_versions.id', ondelete='CASCADE'), index=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey('students.id', ondelete='CASCADE'), index=True)
+    subject_id: Mapped[int | None] = mapped_column(ForeignKey('subjects.id', ondelete='RESTRICT'), index=True)
+    subject_scope_review_required: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    scheduled_date: Mapped[date | None] = mapped_column(Date, index=True)
+    source_blueprint_plan_id: Mapped[int | None] = mapped_column(ForeignKey('support_plan_versions.id', ondelete='SET NULL'), index=True)
+    source_schedule_entry_key: Mapped[str | None] = mapped_column(String(100))
+    task_key: Mapped[str] = mapped_column(String(100))
+    subject: Mapped[str | None] = mapped_column(String(160))
+    topic: Mapped[str | None] = mapped_column(String(160))
+    learning_objective: Mapped[str] = mapped_column(Text)
+    title: Mapped[str] = mapped_column(String(200))
+    instructions: Mapped[str] = mapped_column(Text)
+    activity_type: Mapped[str] = mapped_column(String(40))
+    priority: Mapped[str] = mapped_column(String(20), default='MEDIUM')
+    source: Mapped[str] = mapped_column(String(30), default='AI_PRACTICE')
+    scheduled_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    deadline: Mapped[datetime | None] = mapped_column(DateTime)
+    estimated_minutes: Mapped[int] = mapped_column(Integer)
+    resources: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    completion_criteria: Mapped[str] = mapped_column(Text)
+    mastery_criteria: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default='DRAFT', index=True)
+    progress_percent: Mapped[int] = mapped_column(Integer, default=0)
+    student_response: Mapped[str | None] = mapped_column(Text)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime)
+    assessed_score: Mapped[float | None] = mapped_column(Float)
+    teacher_feedback: Mapped[str | None] = mapped_column(Text)
+    revision_count: Mapped[int] = mapped_column(Integer, default=0)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    roadmap: Mapped[SupportPlanVersion] = relationship(
+        back_populates='tasks',
+        foreign_keys=[roadmap_version_id],
+    )
+    student: Mapped[Student] = relationship()
+    subject_record: Mapped[Subject | None] = relationship()
+    source_blueprint: Mapped['SupportPlanVersion | None'] = relationship(foreign_keys=[source_blueprint_plan_id])
+    events: Mapped[list['RecoveryTaskEvent']] = relationship(back_populates='task', cascade='all, delete-orphan')
+
+
+class RecoveryTaskEvent(Base):
+    __tablename__ = 'recovery_task_events'
+    __table_args__ = (
+        UniqueConstraint('idempotency_key', name='uq_recovery_task_event_idempotency'),
+        Index('ix_recovery_task_event_task_created', 'task_id', 'created_at'),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey('recovery_tasks.id', ondelete='CASCADE'), index=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey('students.id', ondelete='CASCADE'), index=True)
+    subject_id: Mapped[int | None] = mapped_column(ForeignKey('subjects.id', ondelete='RESTRICT'), index=True)
+    actor_user_id: Mapped[int | None] = mapped_column(ForeignKey('users.id', ondelete='SET NULL'), index=True)
+    event_type: Mapped[str] = mapped_column(String(40), index=True)
+    detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    idempotency_key: Mapped[str] = mapped_column(String(100), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    task: Mapped[RecoveryTask] = relationship(back_populates='events')
+
+
+event.listen(SupportPlanVersion, 'before_update', _prevent_subject_reassignment)
+event.listen(RecoveryTask, 'before_update', _prevent_subject_reassignment)
+
+
+@event.listens_for(RecoveryTaskEvent, 'before_update')
+def prevent_recovery_task_event_update(mapper, connection, target) -> None:
+    raise ValueError('Recovery task events are immutable.')
+
+
+@event.listens_for(RecoveryTaskEvent, 'before_delete')
+def prevent_recovery_task_event_delete(mapper, connection, target) -> None:
+    raise ValueError('Recovery task events are immutable.')
+
+
+class RecoveryAdaptationDecision(Base):
+    __tablename__ = 'recovery_adaptation_decisions'
+    __table_args__ = (
+        UniqueConstraint('trigger_event_id', name='uq_recovery_adaptation_trigger_event'),
+        Index('ix_recovery_adaptation_student_created', 'student_id', 'created_at'),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey('students.id', ondelete='CASCADE'))
+    roadmap_version_id: Mapped[int] = mapped_column(ForeignKey('support_plan_versions.id', ondelete='CASCADE'), index=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey('recovery_tasks.id', ondelete='CASCADE'), index=True)
+    trigger_event_id: Mapped[int] = mapped_column(ForeignKey('recovery_task_events.id', ondelete='CASCADE'))
+    decision_type: Mapped[str] = mapped_column(String(50), index=True)
+    status: Mapped[str] = mapped_column(String(40), index=True)
+    recommended_action: Mapped[str] = mapped_column(Text)
+    rationale: Mapped[str] = mapped_column(Text)
+    evidence_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+@event.listens_for(RecoveryAdaptationDecision, 'before_update')
+def prevent_recovery_adaptation_decision_update(mapper, connection, target) -> None:
+    raise ValueError('Recovery adaptation decisions are immutable.')
+
+
+@event.listens_for(RecoveryAdaptationDecision, 'before_delete')
+def prevent_recovery_adaptation_decision_delete(mapper, connection, target) -> None:
+    raise ValueError('Recovery adaptation decisions are immutable.')
 
 
 class InterventionReview(Timestamps, Base):

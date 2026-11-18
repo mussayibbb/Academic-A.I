@@ -24,6 +24,7 @@ from sklearn.metrics import (
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder
 
+from ai.risk.features import FEATURE_CONTRACT_VERSION, FEATURES
 from ai.risk.phase3 import OUTCOME_CLASSES, temporal_split
 
 
@@ -143,9 +144,14 @@ def train_candidate(
     aggregation_strategy: str,
     random_seed: int = 42,
     algorithm: str = 'logistic_regression',
+    feature_contract_version: str = 'phase3-candidate-explicit-v1',
 ) -> dict[str, Any]:
     if not feature_contract or len(feature_contract) != len(set(feature_contract)):
         raise ValueError('An explicit, non-empty feature contract is required.')
+    if feature_contract_version not in {'phase3-candidate-explicit-v1', FEATURE_CONTRACT_VERSION}:
+        raise ValueError('Unsupported candidate feature-contract version.')
+    if feature_contract_version == FEATURE_CONTRACT_VERSION and feature_contract != FEATURES:
+        raise ValueError('The production feature-contract version requires the exact ordered live feature contract.')
     if any(name.casefold() in FORBIDDEN_FEATURES for name in feature_contract):
         raise ValueError('The feature contract contains identity, target, or grouping leakage fields.')
     if not target_definition.strip() or not aggregation_strategy.strip():
@@ -240,7 +246,7 @@ def train_candidate(
         'dataset_version': dataset_version,
         'dataset_fingerprint': dataset_fingerprint,
         'feature_contract': feature_contract,
-        'feature_contract_version': 'phase3-candidate-explicit-v1',
+        'feature_contract_version': feature_contract_version,
         'target_definition': target_definition,
         'aggregation_strategy': aggregation_strategy,
         'training_periods': split['training_periods'],
@@ -282,6 +288,89 @@ def train_candidate(
     metadata['artifact_hash'] = artifact_hash
     artifact_path.with_suffix('.metrics.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
     return {'artifact_path': artifact_path, 'artifact_hash': artifact_hash, 'metadata': metadata}
+
+
+def evaluate_common_test_set(
+    frame: pd.DataFrame,
+    *,
+    candidate_artifact_path: Path,
+    production_artifact_path: Path,
+) -> dict[str, Any]:
+    if frame.empty:
+        raise ValueError('A common test set must contain at least one observation.')
+    required_provenance = {
+        *FEATURES, 'risk_target', 'student_identifier', 'academic_period',
+        'independent_outcome_id', 'source_row_checksum', 'source_checksum',
+        'outcome_source', 'outcome_checksum',
+    }
+    missing = sorted(required_provenance - set(frame.columns))
+    if missing:
+        raise ValueError(f'Common test set is missing required provenance or feature columns: {", ".join(missing)}')
+    if frame[['student_identifier', 'academic_period']].duplicated().any():
+        raise ValueError('Common test set contains duplicate student-period rows.')
+    if frame[['independent_outcome_id', 'source_row_checksum', 'source_checksum']].isna().any().any():
+        raise ValueError('Common test set is missing source snapshot or independent outcome identity.')
+    if frame['risk_target'].isna().any() or not set(frame['risk_target'].astype(str).str.upper()) <= set(OUTCOME_CLASSES):
+        raise ValueError('Common test set contains missing or unsupported independent outcomes.')
+
+    candidate = joblib.load(candidate_artifact_path)
+    production = joblib.load(production_artifact_path)
+    for name, artifact in (('candidate', candidate), ('production', production)):
+        if not isinstance(artifact, dict) or not isinstance(artifact.get('pipeline'), Pipeline):
+            raise ValueError(f'The {name} artifact does not contain a compatible pipeline.')
+        metadata = artifact.get('metadata')
+        if not isinstance(metadata, dict):
+            raise ValueError(f'The {name} artifact does not contain model metadata.')
+        artifact_contract = artifact.get('feature_contract')
+        if name == 'production' and artifact_contract is None:
+            artifact_contract = metadata.get('feature_contract', FEATURES)
+        if artifact_contract != FEATURES:
+            raise ValueError(f'The {name} artifact does not use the ordered production feature contract.')
+        encoder = artifact.get('label_encoder')
+        if encoder is None or set(map(str, getattr(encoder, 'classes_', []))) != set(OUTCOME_CLASSES):
+            raise ValueError(f'The {name} artifact does not support all independent outcome classes.')
+        if not callable(getattr(artifact['pipeline'], 'predict_proba', None)):
+            raise ValueError(f'The {name} artifact does not provide class probabilities.')
+        if getattr(artifact['pipeline'], 'n_features_in_', len(FEATURES)) != len(FEATURES):
+            raise ValueError(f'The {name} artifact has an incompatible feature width.')
+
+    features = frame[FEATURES].apply(pd.to_numeric, errors='coerce')
+    if features.isna().any().any() or not np.isfinite(features.to_numpy(dtype=float)).all():
+        raise ValueError('Common test set features must all be finite numeric values.')
+    class_index = {label: index for index, label in enumerate(OUTCOME_CLASSES)}
+    expected = frame['risk_target'].astype(str).str.upper().map(class_index).to_numpy(dtype=int)
+
+    def common_probabilities(artifact: dict[str, Any]) -> np.ndarray:
+        pipeline = artifact['pipeline']
+        encoder: LabelEncoder = artifact['label_encoder']
+        encoded_classes = np.asarray(pipeline.classes_, dtype=int)
+        labels = encoder.inverse_transform(encoded_classes)
+        raw = np.asarray(pipeline.predict_proba(features[FEATURES]), dtype=float)
+        normalized = np.zeros((len(frame), len(OUTCOME_CLASSES)), dtype=float)
+        for column, label in enumerate(labels):
+            normalized[:, class_index[str(label).upper()]] = raw[:, column]
+        return normalized
+
+    candidate_probabilities = common_probabilities(candidate)
+    production_probabilities = common_probabilities(production)
+    candidate_predicted = np.argmax(candidate_probabilities, axis=1)
+    production_predicted = np.argmax(production_probabilities, axis=1)
+    identity_rows = frame[[
+        'student_identifier', 'academic_period', 'independent_outcome_id',
+        'source_row_checksum', 'source_checksum', 'outcome_source',
+        'outcome_checksum', 'risk_target',
+    ]].sort_values(['student_identifier', 'academic_period']).to_dict(orient='records')
+    identity_hash = hashlib.sha256(json.dumps(
+        identity_rows, sort_keys=True, separators=(',', ':'), default=str,
+    ).encode('utf-8')).hexdigest()
+    return {
+        'sample_count': len(frame),
+        'periods': sorted(frame['academic_period'].astype(str).unique().tolist()),
+        'row_identity_sha256': identity_hash,
+        'outcome_source': 'same imported point-in-time feature rows and independent recorded outcomes',
+        'candidate': _metrics(expected, candidate_predicted, candidate_probabilities, list(OUTCOME_CLASSES)),
+        'production': _metrics(expected, production_predicted, production_probabilities, list(OUTCOME_CLASSES)),
+    }
 
 
 def explain_candidate(artifact_path: Path, feature_values: dict[str, float], *, target_class: str | None = None) -> dict[str, Any]:

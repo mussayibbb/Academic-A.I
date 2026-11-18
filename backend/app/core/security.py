@@ -43,6 +43,12 @@ def get_current_teacher(user: Annotated[User, Depends(get_current_user)]) -> Use
     return user
 
 
+def get_current_admin(user: Annotated[User, Depends(get_current_user)]) -> User:
+    if user.role.upper() != 'ADMIN':
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Administrator access required')
+    return user
+
+
 def get_current_student(
     user: Annotated[User, Depends(get_current_user)],
     db: DatabaseSession,
@@ -57,4 +63,5 @@ def get_current_student(
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
 CurrentTeacher = Annotated[User, Depends(get_current_teacher)]
+CurrentAdmin = Annotated[User, Depends(get_current_admin)]
 CurrentStudent = Annotated[Student, Depends(get_current_student)]

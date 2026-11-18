@@ -2,7 +2,7 @@
 
 import { CheckCircle2, Clock3, FileUp, UploadCloud } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
-import { Empty, ErrorNotice, PageHeading } from '@/components/ui';
+import { Empty, ErrorNotice, Metric, PageHeading } from '@/components/ui';
 import { getAssignmentStatus } from '@/lib/academic';
 import { api } from '@/lib/api';
 
@@ -27,6 +27,12 @@ export default function StudentAssignmentsPage() {
     const status = getAssignmentStatus(assignment.status, submission?.status);
     return view === 'All' || (view === 'Active' && assignment.status === 'active') || status === view;
   }), [assignments, submissions, view]);
+  const statusCounts = assignments.reduce((counts, assignment) => {
+    const submission = submissions.find((item) => item.assignment_id === assignment.id);
+    const status = getAssignmentStatus(assignment.status, submission?.status);
+    counts[status] += 1;
+    return counts;
+  }, { Active: 0, Pending: 0, Submitted: 0, Late: 0, Completed: 0 });
 
   const upload = async (assignment: Assignment) => {
     const pages = files[assignment.id] ?? [];
@@ -46,6 +52,12 @@ export default function StudentAssignmentsPage() {
 
   return <div className="fade-up">
     <PageHeading eyebrow="Your coursework" title="Assignments" description="See what is due, submit your work, and follow feedback." action={<span className="rounded-full border border-emerald-200/15 bg-emerald-200/5 px-3 py-1.5 text-[10px] font-semibold tracking-[.1em] text-emerald-100">DEMO DATA</span>} />
+    <section aria-label="Coursework summary" className="mb-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <Metric label="Awaiting submission" value={statusCounts.Pending} detail="Published work without a submission" color="rose" />
+      <Metric label="Submitted" value={statusCounts.Submitted + statusCounts.Late} detail="Includes late submissions" color="amber" />
+      <Metric label="Completed" value={statusCounts.Completed} detail="Graded submissions" color="mint" />
+      <Metric label="Published" value={assignments.filter((assignment) => assignment.status === 'active').length} detail="Currently open assignments" color="amber" />
+    </section>
     {error && <div className="mb-4"><ErrorNotice message={error} /></div>}{message && <div role="status" className="mb-4 rounded-lg border border-emerald-200/20 bg-emerald-200/5 px-4 py-3 text-sm text-emerald-100">{message}</div>}
     <div className="mb-4 flex gap-1 overflow-x-auto border-b border-white/10">{views.map((item) => <button key={item} onClick={() => setView(item)} className={`whitespace-nowrap border-b-2 px-3 py-3 text-xs ${view === item ? 'border-cyan-200 text-cyan-100' : 'border-transparent text-slate-500 hover:text-white'}`}>{item}</button>)}</div>
     <div className="grid gap-3 xl:grid-cols-2">{filtered.map((assignment) => {

@@ -32,6 +32,7 @@ def _add_subject_observation(db, student_id, subject_id, *, period='2026-S1', ob
         assignment_observed_at=observed_at,
         attendance_rate=90,
         attendance_observed_at=observed_at,
+        temporal_evidence_verified=True,
         updated_by_user_id=teacher.id,
     )
     db.add(record)
@@ -41,6 +42,7 @@ def _add_subject_observation(db, student_id, subject_id, *, period='2026-S1', ob
         academic_period=period,
         risk_level='MEDIUM',
         observed_at=datetime(2026, 9, 15),
+        temporal_evidence_verified=True,
         outcome_source='independent faculty review',
         recorded_by_user_id=teacher.id,
     )
@@ -137,6 +139,45 @@ def test_import_or_update_timestamps_do_not_make_missing_source_dates_temporally
     assert 'missing_source_observation_date' in row['exclusion_reasons']
 
 
+def test_legacy_naive_timestamps_are_not_assumed_to_be_utc(client):
+    with client.app.state.test_session_factory() as db:
+        student = db.query(Student).filter_by(student_id='T-001').one()
+        subject = Subject(code='CN', name='Computer Networks')
+        db.add(subject)
+        db.flush()
+        db.add(StudentSubjectAcademicRecord(
+            student_id=student.id,
+            subject_id=subject.id,
+            academic_period='2026-S1',
+            fa1=20,
+            fa1_observed_at=datetime(2026, 9, 1),
+            fa2=18,
+            fa2_observed_at=datetime(2026, 9, 1),
+            assignment_mark=21,
+            assignment_observed_at=datetime(2026, 9, 1),
+            attendance_rate=90,
+            attendance_observed_at=datetime(2026, 9, 1),
+            temporal_evidence_verified=False,
+        ))
+        db.add(AcademicRiskOutcome(
+            student_id=student.id,
+            academic_period='2026-S1',
+            risk_level='MEDIUM',
+            observed_at=datetime(2026, 9, 15),
+            temporal_evidence_verified=False,
+            outcome_source='independent faculty review',
+        ))
+        db.commit()
+        result = build_phase3_dataset(db)
+
+    row = result['rows'][0]
+    assert row['temporally_aligned'] is False
+    assert row['risk_target'] is None
+    assert 'source_timestamp_timezone_unverifiable' in row['exclusion_reasons']
+    assert 'outcome_timestamp_timezone_unverifiable' in row['exclusion_reasons']
+    assert result['readiness']['training_ready'] is False
+
+
 @pytest.mark.parametrize('source', [
     'model prediction from faculty dashboard',
     'SHAP analysis',
@@ -230,6 +271,7 @@ def test_invalid_period_ranges_and_future_outcomes_are_not_eligible(client):
             assignment_observed_at=datetime(2026, 9, 1),
             attendance_rate=90,
             attendance_observed_at=datetime(2026, 9, 1),
+            temporal_evidence_verified=True,
         )
         db.add(record)
         db.add(AcademicRiskOutcome(
@@ -238,6 +280,7 @@ def test_invalid_period_ranges_and_future_outcomes_are_not_eligible(client):
             risk_level='NOT_A_CLASS',
             observed_at=datetime(2027, 1, 1),
             outcome_source='independent source',
+            temporal_evidence_verified=True,
         ))
         db.commit()
         result = build_phase3_dataset(db)

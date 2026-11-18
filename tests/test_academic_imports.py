@@ -15,12 +15,17 @@ from backend.app.models import (
     AcademicMomentum,
     AcademicRiskOutcome,
     Assessment,
+    AuditLog,
     Attendance,
     Course,
     LearningActivity,
     Mark,
     Student,
+    StudentSubjectAcademicRecord,
+    StudentSubjectAcademicRecordHistory,
     Submission,
+    Subject,
+    Teacher,
     User,
 )
 from backend.app.services.academic_imports import import_academic_data
@@ -49,7 +54,7 @@ def test_valid_csv_import_is_tracked_and_updates_canonical_features(client, teac
     response = client.post(
         '/api/v1/academic-data/import',
         data={'dataset_type': 'assessments'},
-        files=csv_file('student_id,assessment,score,maximum_marks,recorded_at,course_code\nT-001,Quiz 1,18,20,2026-09-01,AF-101\n'),
+        files=csv_file('student_id,assessment,score,maximum_marks,official_result,recorded_at,course_code\nT-001,Quiz 1,18,20,FAIL,2026-09-01,AF-101\n'),
         headers=auth(teacher_token),
     )
     assert response.status_code == 200
@@ -61,7 +66,10 @@ def test_valid_csv_import_is_tracked_and_updates_canonical_features(client, teac
         student = db.query(Student).filter(Student.student_id == 'T-001').one()
         assert db.query(Mark).count() == 1
         assert db.query(Assessment).one().title == 'Quiz 1'
+        assert db.query(Assessment).one().maximum_marks == 20
+        assert db.query(Assessment).one().maximum_marks_verified is False
         assert db.query(Mark).one().import_batch_id == result['batch_id']
+        assert db.query(Mark).one().official_result == 'FAIL'
         assert db.query(Assessment).one().import_batch_id == result['batch_id']
         observation = db.query(AcademicMomentum).filter(AcademicMomentum.import_batch_id == result['batch_id']).one()
         assert observation.value == 90
@@ -154,10 +162,59 @@ def test_marks_and_learning_activity_imports_are_provenance_linked(client, teach
     override = app.dependency_overrides[get_db]
     with next(override()) as db:
         assert db.query(Mark).one().import_batch_id == marks.json()['batch_id']
+        assert db.query(Assessment).one().maximum_marks_verified is False
         activity_row = db.query(LearningActivity).one()
         assert activity_row.import_batch_id == activity.json()['batch_id']
         assert activity_row.quantity == 4
         assert student_features(db.query(Student).filter(Student.student_id == 'T-001').one(), db)['activity_per_week'] == 4
+
+
+def test_marks_import_preserves_existing_verification_and_rejects_conflicting_maximum(client, teacher_token):
+    course_id = make_course(client)
+    override = app.dependency_overrides[get_db]
+    with next(override()) as db:
+        db.add(Assessment(
+            course_id=course_id,
+            title='Verified FA-1',
+            maximum_marks=25,
+            maximum_marks_verified=True,
+        ))
+        db.commit()
+
+    matching = client.post(
+        '/api/v1/academic-data/import',
+        data={'dataset_type': 'marks'},
+        files=csv_file(
+            'student_id,assessment,score,maximum_marks,recorded_at,course_code\n'
+            'T-001,Verified FA-1,11,25,2026-09-03,AF-101\n',
+            filename='matching-maximum.csv',
+        ),
+        headers=auth(teacher_token),
+    )
+    assert matching.status_code == 200, matching.text
+    with next(override()) as db:
+        assert db.query(Assessment).filter_by(title='Verified FA-1').one().maximum_marks_verified is True
+        assert db.query(Mark).count() == 1
+
+    conflicting = client.post(
+        '/api/v1/academic-data/import',
+        data={'dataset_type': 'assessments'},
+        files=csv_file(
+            'student_id,assessment,score,maximum_marks,recorded_at,course_code\n'
+            'T-001,Verified FA-1,11,50,2026-09-04,AF-101\n',
+            filename='conflicting-maximum.csv',
+        ),
+        headers=auth(teacher_token),
+    )
+    assert conflicting.status_code == 200, conflicting.text
+    assert conflicting.json()['imported_rows'] == 0
+    assert conflicting.json()['rejected_rows'] == 1
+    assert 'does not match the existing assessment' in conflicting.json()['validation_errors'][0]['errors'][0]
+    with next(override()) as db:
+        assessment = db.query(Assessment).filter_by(title='Verified FA-1').one()
+        assert assessment.maximum_marks == 25
+        assert assessment.maximum_marks_verified is True
+        assert db.query(Mark).count() == 1
 
 
 def test_imported_records_match_training_features_and_reach_risk_analytics(client, teacher_token):
@@ -306,6 +363,212 @@ def test_model_derived_risk_outcomes_are_rejected_with_source_row_provenance(cli
         rejected = db.query(AcademicDataImportRow).filter_by(dataset_type='risk_outcomes', status='rejected').one()
         batch = db.query(AcademicDataImportBatch).filter_by(id=rejected.batch_id).one()
         assert batch.source_filename == f'prohibited-{source.replace(" ", "-")}.csv'
+
+
+def test_risk_outcome_import_requires_timezone_and_normalizes_offset_to_utc(client, teacher_token):
+    accepted = client.post(
+        '/api/v1/academic-data/import',
+        data={'dataset_type': 'risk_outcomes'},
+        files=csv_file(
+            'student_id,academic_period,risk_target,observed_at,outcome_source\n'
+            'T-001,2026-S1,HIGH,2026-09-01T09:00:00-05:00,faculty review\n',
+            'dated-outcomes.csv',
+        ),
+        headers=auth(teacher_token),
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()['imported_rows'] == 1
+    override = app.dependency_overrides[get_db]
+    with next(override()) as db:
+        outcome = db.query(AcademicRiskOutcome).filter_by(academic_period='2026-S1').one()
+        assert outcome.observed_at.isoformat() == '2026-09-01T14:00:00'
+        assert outcome.temporal_evidence_verified is True
+
+    rejected = client.post(
+        '/api/v1/academic-data/import',
+        data={'dataset_type': 'risk_outcomes'},
+        files=csv_file(
+            'student_id,academic_period,risk_target,observed_at,outcome_source\n'
+            'T-002,2026-S1,HIGH,2026-09-01T09:00:00,faculty review\n',
+            'naive-outcomes.csv',
+        ),
+        headers=auth(teacher_token),
+    )
+    assert rejected.status_code == 200
+    assert rejected.json()['imported_rows'] == 0
+    assert rejected.json()['rejected_rows'] == 1
+    assert 'timezone offset' in rejected.json()['validation_errors'][0]['errors'][0]
+    with next(override()) as db:
+        assert db.query(AcademicRiskOutcome).filter_by(academic_period='2026-S1').count() == 1
+
+
+def test_subject_record_import_normalizes_offsets_and_rejects_naive_evidence(client, teacher_token):
+    with client.app.state.test_session_factory() as db:
+        db.add(Subject(code='CN', name='Computer Networks'))
+        db.commit()
+        teacher = db.query(User).filter_by(email='teacher@example.com').one()
+        accepted = import_academic_data(
+            db,
+            user_id=teacher.id,
+            filename='subject-observations.csv',
+            content=(
+                'student_id,subject_code,academic_period,fa1,fa1_observed_at,fa2,fa2_observed_at,'
+                'assignment_mark,assignment_observed_at,attendance_rate,attendance_observed_at\n'
+                'T-001,CN,2026-S1,12,2026-09-01T09:00:00-05:00,11,2026-09-01T16:00:00+02:00,'
+                '15,2026-09-01T14:00:00Z,80,2026-09-01T14:00:00Z\n'
+            ).encode(),
+            dataset_type='subject_records',
+        )
+        record = db.query(StudentSubjectAcademicRecord).filter_by(academic_period='2026-S1').one()
+        assert accepted['imported_rows'] == 1
+        assert record.temporal_evidence_verified is True
+        assert record.fa1_observed_at.isoformat() == '2026-09-01T14:00:00'
+        assert record.fa2_observed_at.isoformat() == '2026-09-01T14:00:00'
+
+        rejected = import_academic_data(
+            db,
+            user_id=teacher.id,
+            filename='naive-subject-observations.csv',
+            content=(
+                'student_id,subject_code,academic_period,fa1,fa1_observed_at\n'
+                'T-002,CN,2026-S1,12,2026-09-01T09:00:00\n'
+            ).encode(),
+            dataset_type='subject_records',
+        )
+        assert rejected['imported_rows'] == 0
+        assert rejected['rejected_rows'] == 1
+        assert 'timezone offset' in rejected['validation_errors'][0]['errors'][0]
+        other_student = db.query(Student).filter_by(student_id='T-002').one()
+        assert db.query(StudentSubjectAcademicRecord).filter_by(
+            student_id=other_student.id,
+            academic_period='2026-S1',
+        ).count() == 0
+
+
+def test_fa1_maximum_import_remains_unverified_until_audited_subject_review(client, teacher_token):
+    student_id = client.app.state.test_student_id
+    period = '2026-S1'
+    with client.app.state.test_session_factory() as db:
+        student = db.query(Student).filter_by(id=student_id).one()
+        teacher_user = db.query(User).filter_by(email='teacher@example.com').one()
+        teacher = Teacher(user_id=teacher_user.id, department='Engineering')
+        db.add(teacher)
+        db.flush()
+        subject = db.query(Subject).filter_by(code='CN').first()
+        if subject is None:
+            subject = Subject(code='CN', name='Computer Networks', department='Engineering')
+            db.add(subject)
+            db.flush()
+        course = Course(
+            name='Computer Networks',
+            code='CN-A',
+            section='A',
+            subject_id=subject.id,
+            teacher_id=teacher.id,
+        )
+        db.add(course)
+        db.flush()
+        student.course_id = course.id
+        db.commit()
+
+    imported = client.post(
+        '/api/v1/academic-data/import',
+        data={'dataset_type': 'subject_records'},
+        files=csv_file(
+            'student_id,subject_code,academic_period,fa1,fa1_observed_at,fa1_maximum_marks\n'
+            'T-001,CN,2026-S1,22,2026-09-01T09:00:00Z,50\n',
+            'cn-fa1-source.csv',
+        ),
+        headers=auth(teacher_token),
+    )
+    assert imported.status_code == 200
+    assert imported.json()['imported_rows'] == 1
+
+    with client.app.state.test_session_factory() as db:
+        record = db.query(StudentSubjectAcademicRecord).filter_by(
+            student_id=student_id,
+            academic_period=period,
+        ).one()
+        observed_at = record.fa1_observed_at
+        import_batch_id = record.import_batch_id
+        assert record.fa1 == 22
+        assert record.fa1_maximum_marks == 50
+        assert record.fa1_maximum_verified is False
+        assert record.temporal_evidence_verified is True
+
+    review_url = f'/api/v1/academic-register/{student_id}/CN/fa1-maximum-verification?academic_period={period}'
+    review_payload = {'source_reference': 'Official FA-1 assessment register, page 3, cell F8'}
+    with client.app.state.test_session_factory() as db:
+        record = db.query(StudentSubjectAcademicRecord).filter_by(
+            student_id=student_id,
+            academic_period=period,
+        ).one()
+        record.fa1_observed_at = None
+        record.temporal_evidence_verified = False
+        db.commit()
+    missing_date = client.post(review_url, json=review_payload, headers=auth(teacher_token))
+    assert missing_date.status_code == 409
+    with client.app.state.test_session_factory() as db:
+        record = db.query(StudentSubjectAcademicRecord).filter_by(
+            student_id=student_id,
+            academic_period=period,
+        ).one()
+        record.fa1_observed_at = observed_at
+        record.temporal_evidence_verified = True
+        record.fa1_maximum_marks = None
+        db.commit()
+    missing_maximum = client.post(review_url, json=review_payload, headers=auth(teacher_token))
+    assert missing_maximum.status_code == 409
+    with client.app.state.test_session_factory() as db:
+        record = db.query(StudentSubjectAcademicRecord).filter_by(
+            student_id=student_id,
+            academic_period=period,
+        ).one()
+        record.fa1_maximum_marks = 50
+        record.import_batch_id = None
+        db.commit()
+    missing_provenance = client.post(review_url, json=review_payload, headers=auth(teacher_token))
+    assert missing_provenance.status_code == 409
+    with client.app.state.test_session_factory() as db:
+        record = db.query(StudentSubjectAcademicRecord).filter_by(
+            student_id=student_id,
+            academic_period=period,
+        ).one()
+        record.import_batch_id = import_batch_id
+        db.commit()
+    import_filename_only = client.post(
+        review_url,
+        json={'source_reference': 'cn-fa1-source.csv'},
+        headers=auth(teacher_token),
+    )
+    assert import_filename_only.status_code == 409
+
+    reviewed = client.post(
+        review_url,
+        json=review_payload,
+        headers=auth(teacher_token),
+    )
+    assert reviewed.status_code == 200
+    assert reviewed.json()['fa1_maximum_verified'] is True
+    assert reviewed.json()['fa1_maximum_marks'] == 50
+    assert reviewed.json()['fa1_maximum_source_reference'] == 'Official FA-1 assessment register, page 3, cell F8'
+    with client.app.state.test_session_factory() as db:
+        record = db.query(StudentSubjectAcademicRecord).filter_by(
+            student_id=student_id,
+            academic_period=period,
+        ).one()
+        assert record.fa1_maximum_verified is True
+        history = db.query(StudentSubjectAcademicRecordHistory).filter_by(
+            academic_record_id=record.id,
+            change_kind='fa1_maximum_verified',
+        ).one()
+        assert history.fa1_maximum_marks == 50
+        assert history.fa1_maximum_verified is True
+        audit = db.query(AuditLog).filter_by(
+            action='academic_subject_record.fa1_maximum_verified',
+            resource_id=str(record.id),
+        ).one()
+        assert audit.detail['source_reference'] == 'Official FA-1 assessment register, page 3, cell F8'
 
 
 def test_ambiguous_student_identifier_is_rejected(client, teacher_token):

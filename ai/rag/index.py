@@ -87,3 +87,28 @@ def retrieve(query: str, top_k: int = 4, store_path: Path | None = None) -> dict
         'embedding_provider': index.get('embedding_provider', provider),
         'message': '' if sources else 'No institutional policy has been inferred. no policy has been inferred. No verified institutional resource is currently configured.',
     }
+
+
+def retrieve_scoped(query: str, documents: list[dict[str, str]], top_k: int = 8) -> list[dict[str, Any]]:
+    """Retrieve passages only from the explicitly supplied authorized documents."""
+    chunks: list[dict[str, Any]] = []
+    for document in documents:
+        text = document.get('text', '')
+        for chunk_index, chunk in enumerate(split_text(text)):
+            chunks.append({
+                'ref': f"{document.get('ref', 'source')}#chunk-{chunk_index + 1}",
+                'source': document.get('source', 'teacher-approved resource'),
+                'checksum': document.get('checksum', ''),
+                'text': chunk,
+            })
+    if not chunks or not query.strip():
+        return []
+    embeddings, _, _ = _embed([item['text'] for item in chunks], get_settings().embedding_model_name)
+    query_embedding, _, _ = _embed([query], get_settings().embedding_model_name)
+    scores = cosine_similarity(query_embedding, embeddings)[0]
+    ranked = np.argsort(scores)[::-1][:max(1, top_k)]
+    return [
+        {**chunks[int(position)], 'score': float(scores[position])}
+        for position in ranked
+        if float(scores[position]) > 0
+    ]

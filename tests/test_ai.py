@@ -56,6 +56,20 @@ def test_training_persists_evaluated_model_and_predicts(tmp_path):
     assert all(item['contribution'] == explanation['contributions'][item['feature']] for item in explanation['waterfall'])
     ranked_features = sorted(explanation['contributions'], key=lambda name: abs(explanation['contributions'][name]), reverse=True)
     assert all(item.startswith(name.replace('_', ' ').capitalize()) for item, name in zip(explanation['summary'], ranked_features))
+    assert all(f'P({result["risk_level"]})' in item for item in explanation['summary'])
+
+    other_class = next(name for name in result['class_probabilities'] if name != result['risk_level'])
+    other_explanation = explain_student(
+        {name: rows[0][name] for name in FEATURES},
+        model_path,
+        target_class=other_class,
+    )
+    assert other_explanation['target_class'] == other_class
+    assert all(f'P({other_class})' in item for item in other_explanation['summary'])
+    assert other_explanation['base_value'] + sum(other_explanation['contributions'].values()) == pytest.approx(
+        result['class_probabilities'][other_class],
+        abs=1e-5,
+    )
 
 
 def artifact_classes(model_path):

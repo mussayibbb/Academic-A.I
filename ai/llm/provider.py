@@ -1,15 +1,24 @@
 import json
 import time
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ai.llm.grounding import build_intervention_prompt
+from ai.llm.grounding import (
+    build_intervention_prompt,
+    build_recovery_tutor_prompt,
+    build_recovery_blueprint_prompt,
+    build_risk_summary_prompt,
+    build_short_answer_evaluation_prompt,
+    build_topic_assessment_prompt,
+    build_topic_map_prompt,
+)
 
 
 REVIEW_HEADER = 'AI-GENERATED DRAFT - FACULTY REVIEW REQUIRED'
+RISK_SUMMARY_TIMEOUT_SECONDS = 15
 
 
 class InterventionContext(BaseModel):
@@ -33,10 +42,41 @@ class InterventionContext(BaseModel):
     source_notice: str = 'No matching institutional source was found; do not state institutional policy.'
 
 
+class RiskSummaryEvidence(BaseModel):
+    feature: str
+    value: float = Field(allow_inf_nan=False)
+    contribution: float = Field(allow_inf_nan=False)
+
+
+class RiskSummaryContext(BaseModel):
+    target_class: Literal['HIGH', 'MEDIUM', 'LOW']
+    risk_probability: float = Field(ge=0, le=1, allow_inf_nan=False)
+    evidence: list[RiskSummaryEvidence] = Field(min_length=1, max_length=5)
+
+
+class RecoveryTutorContext(BaseModel):
+    question: str = Field(min_length=1, max_length=2000)
+    academic_evidence: list[dict[str, Any]] = Field(max_length=40)
+    missing_information: list[str] = Field(max_length=20)
+    conversation_history: list[dict[str, str]] = Field(default_factory=list, max_length=6)
+
+
 class LLMProvider(Protocol):
     provider_name: str
 
     def generate_intervention(self, context: InterventionContext) -> str: ...
+
+    def generate_risk_summary(self, context: RiskSummaryContext) -> str: ...
+
+    def generate_recovery_tutor(self, context: RecoveryTutorContext) -> str: ...
+
+    def generate_topic_assessment(self, context: dict[str, Any]) -> str: ...
+
+    def generate_topic_map(self, context: dict[str, Any]) -> str: ...
+
+    def generate_recovery_blueprint(self, context: dict[str, Any]) -> str: ...
+
+    def evaluate_short_answer(self, context: dict[str, Any]) -> str: ...
 
 
 class LocalLLMProvider:
@@ -89,7 +129,10 @@ class LocalLLMProvider:
             raise RuntimeError(health.get('error') or f'Ollama is reachable at {self.base_url}, but the required model "{self.model_name}" is not installed.')
 
         prompt = build_intervention_prompt(context)
-        body = json.dumps({'model': self.model_name, 'prompt': prompt, 'stream': False}).encode('utf-8')
+        request_payload: dict[str, Any] = {'model': self.model_name, 'prompt': prompt, 'stream': False}
+        if self.model_name.casefold().startswith('qwen3'):
+            request_payload['think'] = False
+        body = json.dumps(request_payload).encode('utf-8')
         try:
             result = self._request_json('/api/generate', method='POST', payload=body, timeout=self.timeout_seconds)
         except TimeoutError as exc:
@@ -102,6 +145,157 @@ class LocalLLMProvider:
         if not generated:
             raise RuntimeError('Ollama returned an empty response.')
         return f'{REVIEW_HEADER}\n{generated}'
+
+    def generate_risk_summary(self, context: RiskSummaryContext) -> str:
+        prompt = build_risk_summary_prompt(context)
+        request_payload: dict[str, Any] = {
+            'model': self.model_name,
+            'prompt': prompt,
+            'format': 'json',
+            'options': {'temperature': 0},
+            'stream': False,
+        }
+        if self.model_name.casefold().startswith('qwen3'):
+            request_payload['think'] = False
+        body = json.dumps(request_payload).encode('utf-8')
+        try:
+            result = self._request_json('/api/generate', method='POST', payload=body, timeout=self.timeout_seconds)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError('Ollama returned an invalid risk-summary response.') from exc
+        except TimeoutError as exc:
+            raise RuntimeError(f'Ollama risk-summary generation timed out after {self.timeout_seconds} seconds. Please retry or increase LLM_TIMEOUT_SECONDS.') from exc
+        except HTTPError as exc:
+            if exc.code == 404:
+                try:
+                    error_body = json.loads(exc.read().decode('utf-8'))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    error_body = {}
+                detail = error_body.get('error') if isinstance(error_body, dict) else None
+                if isinstance(detail, str) and 'model' in detail.casefold() and 'not found' in detail.casefold():
+                    raise RuntimeError(f'Ollama model "{self.model_name}" is not installed. Install it with `ollama pull {self.model_name}`.') from exc
+            raise RuntimeError(f'Ollama risk-summary request failed with HTTP {exc.code} at {self.base_url}/api/generate: {exc.reason}.') from exc
+        except URLError as exc:
+            if isinstance(exc.reason, TimeoutError):
+                raise RuntimeError(f'Ollama risk-summary generation timed out after {self.timeout_seconds} seconds. Please retry or increase LLM_TIMEOUT_SECONDS.') from exc
+            raise RuntimeError(f'Ollama service is not reachable at {self.base_url}. Start the Ollama service and retry.') from exc
+        except (OSError, ConnectionError) as exc:
+            raise RuntimeError(f'Ollama service is not reachable at {self.base_url}. Start the Ollama service and retry.') from exc
+        if not isinstance(result, dict):
+            raise RuntimeError('Ollama returned a non-object risk-summary response.')
+        generated = str(result.get('response', '')).strip()
+        if not generated:
+            raise RuntimeError('Ollama returned an empty risk-summary selection.')
+        return generated
+
+    def generate_recovery_tutor(self, context: RecoveryTutorContext) -> str:
+        health = self.get_health_status()
+        if not health['reachable']:
+            raise RuntimeError(health.get('error') or f'Ollama service is not reachable at {self.base_url}.')
+        if not health['model_available']:
+            raise RuntimeError(health.get('error') or f'Ollama model "{self.model_name}" is not available.')
+
+        prompt = build_recovery_tutor_prompt(context)
+        body = json.dumps({
+            'model': self.model_name,
+            'prompt': prompt,
+            'format': 'json',
+            'options': {'temperature': 0},
+            'stream': False,
+        }).encode('utf-8')
+        try:
+            result = self._request_json('/api/generate', method='POST', payload=body, timeout=self.timeout_seconds)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError('Ollama returned an invalid recovery-tutor response.') from exc
+        except TimeoutError as exc:
+            raise RuntimeError(f'Ollama recovery-tutor generation timed out after {self.timeout_seconds} seconds.') from exc
+        except HTTPError as exc:
+            raise RuntimeError(f'Ollama recovery-tutor request failed with HTTP {exc.code}.') from exc
+        except (URLError, OSError, ConnectionError) as exc:
+            raise RuntimeError(f'Ollama service is unavailable at {self.base_url}.') from exc
+        generated = result.get('response') if isinstance(result, dict) else None
+        if not isinstance(generated, str) or not generated.strip():
+            raise RuntimeError('Ollama returned an empty or malformed recovery-tutor response.')
+        return generated.strip()
+
+    def generate_topic_assessment(self, context: dict[str, Any]) -> str:
+        health = self.get_health_status()
+        if not health['reachable'] or not health['model_available']:
+            raise RuntimeError(health.get('error') or 'Configured Ollama model is unavailable.')
+        payload = json.dumps({
+            'model': self.model_name,
+            'prompt': build_topic_assessment_prompt(context),
+            'format': 'json',
+            'options': {'temperature': 0},
+            'stream': False,
+        }).encode('utf-8')
+        try:
+            result = self._request_json('/api/generate', method='POST', payload=payload, timeout=self.timeout_seconds)
+        except (HTTPError, URLError, TimeoutError, OSError, ConnectionError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f'Ollama assessment generation failed: {exc}') from exc
+        generated = result.get('response') if isinstance(result, dict) else None
+        if not isinstance(generated, str) or not generated.strip():
+            raise RuntimeError('Ollama returned an empty assessment response.')
+        return generated.strip()
+
+    def generate_topic_map(self, context: dict[str, Any]) -> str:
+        health = self.get_health_status()
+        if not health['reachable'] or not health['model_available']:
+            raise RuntimeError(health.get('error') or 'Configured Ollama model is unavailable.')
+        payload = json.dumps({
+            'model': self.model_name,
+            'prompt': build_topic_map_prompt(context),
+            'format': 'json',
+            'options': {'temperature': 0},
+            'stream': False,
+        }).encode('utf-8')
+        try:
+            result = self._request_json('/api/generate', method='POST', payload=payload, timeout=self.timeout_seconds)
+        except (HTTPError, URLError, TimeoutError, OSError, ConnectionError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f'Ollama topic extraction failed: {exc}') from exc
+        generated = result.get('response') if isinstance(result, dict) else None
+        if not isinstance(generated, str) or not generated.strip():
+            raise RuntimeError('Ollama returned an empty topic-map response.')
+        return generated.strip()
+
+    def generate_recovery_blueprint(self, context: dict[str, Any]) -> str:
+        health = self.get_health_status()
+        if not health['reachable'] or not health['model_available']:
+            raise RuntimeError(health.get('error') or 'Configured Ollama model is unavailable.')
+        payload = json.dumps({
+            'model': self.model_name,
+            'prompt': build_recovery_blueprint_prompt(context),
+            'format': 'json',
+            'options': {'temperature': 0},
+            'stream': False,
+        }).encode('utf-8')
+        try:
+            result = self._request_json('/api/generate', method='POST', payload=payload, timeout=self.timeout_seconds)
+        except (HTTPError, URLError, TimeoutError, OSError, ConnectionError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f'Ollama recovery blueprint generation failed: {exc}') from exc
+        generated = result.get('response') if isinstance(result, dict) else None
+        if not isinstance(generated, str) or not generated.strip():
+            raise RuntimeError('Ollama returned an empty recovery blueprint response.')
+        return generated.strip()
+
+    def evaluate_short_answer(self, context: dict[str, Any]) -> str:
+        health = self.get_health_status()
+        if not health['reachable'] or not health['model_available']:
+            raise RuntimeError(health.get('error') or 'Configured Ollama model is unavailable.')
+        payload = json.dumps({
+            'model': self.model_name,
+            'prompt': build_short_answer_evaluation_prompt(context),
+            'format': 'json',
+            'options': {'temperature': 0},
+            'stream': False,
+        }).encode('utf-8')
+        try:
+            result = self._request_json('/api/generate', method='POST', payload=payload, timeout=self.timeout_seconds)
+        except (HTTPError, URLError, TimeoutError, OSError, ConnectionError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f'Ollama short-answer evaluation failed: {exc}') from exc
+        generated = result.get('response') if isinstance(result, dict) else None
+        if not isinstance(generated, str) or not generated.strip():
+            raise RuntimeError('Ollama returned an empty short-answer evaluation.')
+        return generated.strip()
 
 
 class GeminiProvider:
@@ -134,10 +328,121 @@ class GeminiProvider:
             raise RuntimeError(f'Gemini is unavailable: {exc}') from exc
         candidates = result.get('candidates') or []
         parts = candidates[0].get('content', {}).get('parts', []) if candidates else []
-        generated = '\n'.join(str(part.get('text', '')).strip() for part in parts if part.get('text')).strip()
+        generated = '\n'.join(str(part.get('text', '')).strip() for part in parts if isinstance(part, dict) and part.get('text')).strip()
         if not generated:
             raise RuntimeError('Gemini returned an empty response')
         return f'{REVIEW_HEADER}\n{generated}'
+
+    def generate_risk_summary(self, context: RiskSummaryContext) -> str:
+        prompt = build_risk_summary_prompt(context)
+        payload = json.dumps({
+            'contents': [{'parts': [{'text': prompt}]}],
+            'generationConfig': {'responseMimeType': 'application/json', 'temperature': 0},
+        }).encode('utf-8')
+        request = Request(
+            f'https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent',
+            data=payload,
+            headers={'Content-Type': 'application/json', 'x-goog-api-key': self.api_key},
+            method='POST',
+        )
+        timeout = min(self.timeout_seconds, RISK_SUMMARY_TIMEOUT_SECONDS)
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                result = json.loads(response.read().decode('utf-8'))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError('Gemini returned an invalid risk-summary response.') from exc
+        except HTTPError as exc:
+            raise RuntimeError(f'Gemini risk-summary request failed with HTTP {exc.code}.') from exc
+        except (URLError, TimeoutError) as exc:
+            raise RuntimeError(f'Gemini risk-summary service is unavailable: {exc}') from exc
+        if not isinstance(result, dict):
+            raise RuntimeError('Gemini returned a non-object risk-summary response.')
+        candidates = result.get('candidates')
+        first_candidate = candidates[0] if isinstance(candidates, list) and candidates else {}
+        content = first_candidate.get('content') if isinstance(first_candidate, dict) else None
+        parts = content.get('parts', []) if isinstance(content, dict) else []
+        if not isinstance(parts, list):
+            raise RuntimeError('Gemini returned an invalid risk-summary response structure.')
+        generated = '\n'.join(str(part.get('text', '')).strip() for part in parts if isinstance(part, dict) and part.get('text')).strip()
+        if not generated:
+            raise RuntimeError('Gemini returned an empty risk-summary selection.')
+        return generated
+
+    def generate_recovery_tutor(self, context: RecoveryTutorContext) -> str:
+        prompt = build_recovery_tutor_prompt(context)
+        payload = json.dumps({
+            'contents': [{'parts': [{'text': prompt}]}],
+            'generationConfig': {'responseMimeType': 'application/json', 'temperature': 0},
+        }).encode('utf-8')
+        request = Request(
+            f'https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent',
+            data=payload,
+            headers={'Content-Type': 'application/json', 'x-goog-api-key': self.api_key},
+            method='POST',
+        )
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                result = json.loads(response.read().decode('utf-8'))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError('Gemini returned an invalid recovery-tutor response.') from exc
+        except HTTPError as exc:
+            raise RuntimeError(f'Gemini recovery-tutor request failed with HTTP {exc.code}.') from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError(f'Gemini recovery-tutor service is unavailable: {exc}') from exc
+        if not isinstance(result, dict):
+            raise RuntimeError('Gemini returned a malformed recovery-tutor response.')
+        candidates = result.get('candidates')
+        first_candidate = candidates[0] if isinstance(candidates, list) and candidates else {}
+        content = first_candidate.get('content') if isinstance(first_candidate, dict) else None
+        parts = content.get('parts', []) if isinstance(content, dict) else []
+        generated = '\n'.join(
+            str(part.get('text', '')).strip()
+            for part in parts
+            if isinstance(part, dict) and isinstance(part.get('text'), str)
+        ).strip() if isinstance(parts, list) else ''
+        if not generated:
+            raise RuntimeError('Gemini returned an empty recovery-tutor response.')
+        return generated
+
+    def _generate_structured(self, prompt: str, operation: str) -> str:
+        payload = json.dumps({
+            'contents': [{'parts': [{'text': prompt}]}],
+            'generationConfig': {'responseMimeType': 'application/json', 'temperature': 0},
+        }).encode('utf-8')
+        request = Request(
+            f'https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent',
+            data=payload,
+            headers={'Content-Type': 'application/json', 'x-goog-api-key': self.api_key},
+            method='POST',
+        )
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                result = json.loads(response.read().decode('utf-8'))
+        except (json.JSONDecodeError, HTTPError, URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError(f'Gemini {operation} failed: {exc}') from exc
+        candidates = result.get('candidates') if isinstance(result, dict) else None
+        first = candidates[0] if isinstance(candidates, list) and candidates else {}
+        content = first.get('content') if isinstance(first, dict) else None
+        parts = content.get('parts', []) if isinstance(content, dict) else []
+        generated = '\n'.join(
+            part['text'].strip() for part in parts
+            if isinstance(part, dict) and isinstance(part.get('text'), str)
+        ).strip() if isinstance(parts, list) else ''
+        if not generated:
+            raise RuntimeError(f'Gemini returned an empty {operation} response.')
+        return generated
+
+    def generate_topic_assessment(self, context: dict[str, Any]) -> str:
+        return self._generate_structured(build_topic_assessment_prompt(context), 'assessment generation')
+
+    def generate_topic_map(self, context: dict[str, Any]) -> str:
+        return self._generate_structured(build_topic_map_prompt(context), 'topic extraction')
+
+    def generate_recovery_blueprint(self, context: dict[str, Any]) -> str:
+        return self._generate_structured(build_recovery_blueprint_prompt(context), 'recovery blueprint generation')
+
+    def evaluate_short_answer(self, context: dict[str, Any]) -> str:
+        return self._generate_structured(build_short_answer_evaluation_prompt(context), 'short-answer evaluation')
 
 
 def build_provider(settings) -> LLMProvider:
@@ -176,3 +481,21 @@ class DevelopmentDraftProvider:
             f'RECOMMENDATIONS:\nConsider discussing one practical next step together with the student.{sources}\n'
             '[Development template; this was not generated by a language model.]'
         )
+
+    def generate_risk_summary(self, context: RiskSummaryContext) -> str:
+        raise RuntimeError(f'No language-model provider is configured to summarize P({context.target_class}).')
+
+    def generate_recovery_tutor(self, context: RecoveryTutorContext) -> str:
+        raise RuntimeError('No language-model provider is configured for the recovery tutor.')
+
+    def generate_topic_assessment(self, context: dict[str, Any]) -> str:
+        raise RuntimeError('No language-model provider is configured for assessment generation.')
+
+    def generate_topic_map(self, context: dict[str, Any]) -> str:
+        raise RuntimeError('No language-model provider is configured for topic extraction.')
+
+    def generate_recovery_blueprint(self, context: dict[str, Any]) -> str:
+        raise RuntimeError('No language-model provider is configured for recovery blueprint generation.')
+
+    def evaluate_short_answer(self, context: dict[str, Any]) -> str:
+        raise RuntimeError('No language-model provider is configured for short-answer evaluation.')

@@ -5,7 +5,7 @@ import { useEffect, useState } from 'react';
 import { ErrorNotice, PageHeading } from '@/components/ui';
 import { API_BASE, api, readToken } from '@/lib/api';
 
-type DatasetType = 'marks' | 'assessments' | 'attendance' | 'learning_activities' | 'subject_records' | 'risk_outcomes';
+type DatasetType = 'marks' | 'assessments' | 'attendance' | 'learning_activities' | 'subject_records' | 'risk_outcomes' | 'production_feature_snapshots';
 type ImportResult = {
   batch_id: number;
   dataset_type: DatasetType;
@@ -25,8 +25,32 @@ const schemas: Record<DatasetType, string[]> = {
   assessments: ['student_id', 'assessment', 'score', 'maximum_marks', 'recorded_at', 'course_code (optional)'],
   attendance: ['student_id', 'attendance_rate', 'observed_at', 'attended (optional)', 'course_code (optional)'],
   learning_activities: ['student_id', 'activity_type', 'quantity', 'occurred_at', 'course_code (optional)'],
-  subject_records: ['USN', 'Subject', 'Academic_Period', 'FA1 (optional)', 'FA1_Observed_At (optional)', 'FA2 (optional)', 'FA2_Observed_At (optional)', 'Assignment (optional)', 'Assignment_Observed_At (optional)', 'Attendance (optional)', 'Attendance_Observed_At (optional)'],
+  subject_records: ['USN', 'Subject', 'Academic_Period', 'FA1 (optional)', 'FA1_Observed_At (optional; timezone required for temporal verification)', 'FA1_Maximum_Marks (optional; unverified until source review)', 'FA2 (optional)', 'FA2_Observed_At (optional)', 'Assignment (optional)', 'Assignment_Observed_At (optional)', 'Attendance (optional)', 'Attendance_Observed_At (optional)'],
   risk_outcomes: ['USN', 'Academic_Period', 'Risk_Target', 'Observed_At', 'Outcome_Source'],
+  production_feature_snapshots: [
+    'student_id',
+    'academic_period',
+    'attendance',
+    'assessment',
+    'previous_gpa',
+    'current_gpa',
+    'assignments_completed',
+    'activity_per_week',
+    'missing_submissions',
+    'attendance_change',
+    'assessment_change',
+    'momentum_score',
+    'attendance_observed_at',
+    'assessment_observed_at',
+    'previous_gpa_observed_at',
+    'current_gpa_observed_at',
+    'assignments_completed_observed_at',
+    'activity_per_week_observed_at',
+    'missing_submissions_observed_at',
+    'attendance_change_observed_at',
+    'assessment_change_observed_at',
+    'momentum_score_observed_at',
+  ],
 };
 
 export default function AcademicDataPage() {
@@ -66,19 +90,19 @@ export default function AcademicDataPage() {
   };
 
   return <div className="fade-up">
-    <PageHeading eyebrow="Academic records · faculty" title="Academic data" description="Import validated, period-scoped subject marks and dated academic observations." />
+    <PageHeading eyebrow="Academic records · faculty" title="Academic data" description="Import validated subject records, independent outcomes, and dated point-in-time model feature snapshots." />
     {error && <div className="mb-4"><ErrorNotice message={error} /></div>}
     <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_minmax(320px,.72fr)]">
       <section className="surface rounded-xl p-5">
         <div className="flex items-center gap-2"><FileSpreadsheet size={16} className="text-cyan-100" /><h2 className="text-sm font-semibold">New import</h2></div>
         <div className="mt-5 grid gap-4 sm:grid-cols-2">
-          <label className="text-xs text-slate-400">Record type<select value={datasetType} onChange={(event) => setDatasetType(event.target.value as DatasetType)} className="form-input"><option value="marks">Marks / internal scores</option><option value="assessments">Assessments</option><option value="attendance">Attendance</option><option value="learning_activities">Learning activities</option><option value="subject_records">FA1 / FA2 subject marks</option><option value="risk_outcomes">Independent academic-period risk outcome</option></select></label>
+          <label className="text-xs text-slate-400">Record type<select value={datasetType} onChange={(event) => setDatasetType(event.target.value as DatasetType)} className="form-input"><option value="marks">Marks / internal scores</option><option value="assessments">Assessments</option><option value="attendance">Attendance</option><option value="learning_activities">Learning activities</option><option value="subject_records">FA1 / FA2 subject marks</option><option value="risk_outcomes">Independent academic-period risk outcome</option><option value="production_feature_snapshots">Point-in-time production feature snapshot</option></select></label>
           <label className="text-xs text-slate-400">Academic data file<input type="file" accept=".csv,.xlsx" onChange={(event) => setFile(event.target.files?.[0] ?? null)} className="form-input file:mr-3 file:border-0 file:bg-transparent file:text-xs file:text-cyan-100" /></label>
         </div>
         <div className="mt-4 border-y border-white/8 py-4">
           <div className="text-[10px] font-semibold uppercase text-slate-500">Required columns</div>
           <div className="mt-2 flex flex-wrap gap-1.5">{schemas[datasetType].map((column) => <span key={column} className="rounded border border-white/8 bg-black/10 px-2 py-1 font-mono text-[10px] text-slate-300">{column}</span>)}</div>
-          <p className="mt-3 text-[11px] leading-5 text-slate-500">Match an existing USN. Marks require a period code (for example, 2026-S1); FA1/FA2/assignment are 0–25. Add each field&apos;s source-observation date for future time-aligned ML eligibility. Outcomes must come from an independent, documented source, never this model or labels derived from these marks.</p>
+          <p className="mt-3 text-[11px] leading-5 text-slate-500">Match an existing USN. Marks require a period code (for example, 2026-S1); FA1/FA2/assignment are 0–25. Add each field&apos;s source-observation date for time-aligned ML eligibility. Outcomes must come from an independent, documented source, never this model or labels derived from these marks. A filename, checksum, and importing teacher provide traceability, not independent proof that uploaded records are authentic.</p>
         </div>
         <button type="button" disabled={busy || !file} onClick={() => void upload()} className="mt-4 inline-flex items-center gap-2 rounded-md bg-cyan-200 px-3 py-2.5 text-xs font-semibold text-[#07141b] disabled:opacity-50"><UploadCloud size={14} />{busy ? 'Validating and importing…' : 'Validate and import'}</button>
         {result && <div role="status" className="mt-5 border-t border-white/8 pt-4">

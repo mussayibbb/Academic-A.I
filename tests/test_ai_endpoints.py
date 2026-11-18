@@ -1,3 +1,6 @@
+import json
+from datetime import datetime, timezone
+
 import pandas as pd
 import pytest
 
@@ -60,6 +63,8 @@ def test_prediction_shap_and_intervention_review_flow(client, teacher_token, stu
     assert explanation_data['explanation']['target_class'] == explanation_data['prediction']['risk_level']
     assert explanation_data['explanation']['target'] == f"P({explanation_data['prediction']['risk_level']})"
     assert explanation_data['explanation']['base_value'] + sum(explanation_data['explanation']['contributions'].values()) == pytest.approx(explanation_data['prediction']['risk_probability'], abs=1e-5)
+    assert explanation_data['risk_summary']['status'] == 'unavailable'
+    assert 'language-model provider is configured' in explanation_data['risk_summary']['error']
     draft = client.post('/api/v1/interventions/generate', json={'student_id': student_id}, headers=teacher)
     assert draft.status_code == 201
     assert draft.json()['provider'] == 'development-template-not-an-llm'
@@ -204,3 +209,103 @@ def test_read_only_student_explanation_uses_canonical_shap_target(client, teache
     assert client.get('/api/v1/students/1/explanation', headers=student).status_code == 403
     assert client.get('/api/v1/students/1/explanation').status_code == 401
     assert client.get('/api/v1/students/1', headers=teacher).json()['student'] == before
+
+
+def test_shap_includes_ai_selected_verified_evidence_without_repeating_model_calls(client, teacher_token, student_token, monkeypatch):
+    student_id = client.app.state.test_student_id
+    features = {name: float(index + 1) for index, name in enumerate(FEATURES)}
+    contributions = {
+        'attendance': 0.12,
+        'assessment': 0.03,
+        'previous_gpa': -0.02,
+        'current_gpa': 0.01,
+        'assignments_completed': -0.008,
+        'activity_per_week': 0.003,
+        'missing_submissions': -0.002,
+        'attendance_change': 0.001,
+        'assessment_change': 0.001,
+        'momentum_score': 0.001,
+    }
+    prediction = {
+        'risk_level': 'HIGH',
+        'risk_probability': 0.82,
+        'risk_probability_semantics': 'P(risk_level)',
+        'risk_level_policy': 'argmax(class_probabilities)',
+        'class_probabilities': {'HIGH': 0.82, 'MEDIUM': 0.08, 'LOW': 0.10},
+        'model_version': 'risk-summary-test',
+        'prediction_timestamp': datetime(2026, 1, 1, tzinfo=timezone.utc),
+    }
+    explanation = {
+        'target': 'P(HIGH)',
+        'target_class': 'HIGH',
+        'base_value': 0.684,
+        'contributions': contributions,
+        'feature_values': features,
+        'model_version': 'risk-summary-test',
+        'summary': [],
+        'waterfall': [
+            {'feature': name, 'value': features[name], 'contribution': contributions[name]}
+            for name in FEATURES
+        ],
+    }
+    calls = {'prediction': 0, 'explanation': 0, 'provider': 0}
+
+    def predict_once(feature_values, db):
+        calls['prediction'] += 1
+        return prediction
+
+    def explain_once(feature_values, db, *, target_class=None):
+        calls['explanation'] += 1
+        assert target_class == 'HIGH'
+        return explanation
+
+    class SelectionProvider:
+        provider_name = 'test-language-model'
+        response = json.dumps({'signals': ['attendance', 'assessment']})
+        error = None
+
+        def generate_risk_summary(self, context):
+            calls['provider'] += 1
+            assert context.target_class == 'HIGH'
+            assert context.evidence[0].feature == 'attendance'
+            if self.error:
+                raise RuntimeError(self.error)
+            return self.response
+
+    provider = SelectionProvider()
+    monkeypatch.setattr('backend.app.main.student_features', lambda student, db: features)
+    monkeypatch.setattr('backend.app.main.predict_with_active_model', predict_once)
+    monkeypatch.setattr('backend.app.main.explain_with_active_model', explain_once)
+    monkeypatch.setattr('backend.app.main.build_provider', lambda _: provider)
+    endpoint = f'/api/v1/students/{student_id}/shap'
+
+    assert client.get(endpoint).status_code == 401
+    assert client.get(endpoint, headers={'Authorization': f'Bearer {student_token}'}).status_code == 403
+    response = client.get(endpoint, headers={'Authorization': f'Bearer {teacher_token}'})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert calls == {'prediction': 1, 'explanation': 1, 'provider': 1}
+    assert data['explanation']['target'] == 'P(HIGH)'
+    assert data['explanation']['base_value'] + sum(data['explanation']['contributions'].values()) == pytest.approx(0.82)
+    assert data['risk_summary']['status'] == 'ready'
+    assert data['risk_summary']['provider'] == 'test-language-model'
+    assert data['risk_summary']['selected_signals'] == [
+        {'feature': 'attendance', 'value': 1.0, 'contribution': 0.12},
+        {'feature': 'assessment', 'value': 2.0, 'contribution': 0.03},
+    ]
+
+    provider.response = '{"signals":["invented_feature"]}'
+    invalid_response = client.get(endpoint, headers={'Authorization': f'Bearer {teacher_token}'})
+    assert invalid_response.status_code == 200
+    assert invalid_response.json()['explanation']['target'] == 'P(HIGH)'
+    assert invalid_response.json()['risk_summary']['status'] == 'unavailable'
+    assert 'outside the verified evidence' in invalid_response.json()['risk_summary']['error']
+
+    provider.error = 'Ollama risk-summary generation timed out after 300 seconds.'
+    timed_out_response = client.get(endpoint, headers={'Authorization': f'Bearer {teacher_token}'})
+    assert timed_out_response.status_code == 200
+    timed_out_data = timed_out_response.json()
+    assert timed_out_data['explanation']['waterfall']
+    assert timed_out_data['risk_summary']['status'] == 'unavailable'
+    assert timed_out_data['risk_summary']['error'] == provider.error

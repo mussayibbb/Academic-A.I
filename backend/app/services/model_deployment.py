@@ -1,5 +1,6 @@
 import hashlib
 import pickle
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -7,11 +8,64 @@ import joblib
 from sqlalchemy.orm import Session
 
 from ai.risk.features import FEATURE_CONTRACT_VERSION, FEATURES
-from backend.app.models import ModelDeploymentState, ModelRegistryEntry
+from backend.app.models import AuditLog, ModelDeploymentState, ModelRegistryEntry, User
 
 
 class DeploymentArtifactError(ValueError):
     pass
+
+
+def independent_candidate_approval_error(db: Session, entry: ModelRegistryEntry) -> str | None:
+    if (
+        entry.approval_status != 'approved'
+        or entry.approved_by_user_id is None
+        or not isinstance(entry.approved_at, datetime)
+    ):
+        return 'Candidate approval is not recorded.'
+    if entry.created_by_user_id is None or entry.approved_by_user_id == entry.created_by_user_id:
+        return 'Candidate approval must be recorded by a teacher other than its creator.'
+    creator = db.query(User).filter(User.id == entry.created_by_user_id).first()
+    approver = db.query(User).filter(User.id == entry.approved_by_user_id).first()
+    if creator is None or approver is None:
+        return 'Candidate creator or approver identity is unavailable.'
+    if (
+        not isinstance(creator.role, str)
+        or creator.role.upper() != 'TEACHER'
+        or not isinstance(approver.role, str)
+        or approver.role.upper() != 'TEACHER'
+    ):
+        return 'Candidate creator and approver must be teachers.'
+    approval_event = db.query(AuditLog).filter_by(
+        action='model.candidate.approval.granted',
+        resource_type='phase3_model_governance',
+        resource_id=str(entry.id),
+    ).order_by(AuditLog.id.desc()).first()
+    if approval_event is None:
+        return 'Candidate approval audit evidence is not recorded.'
+    detail = approval_event.detail if isinstance(approval_event.detail, dict) else {}
+    new_state = detail.get('new_state')
+    audit_created_at = approval_event.created_at
+    approved_at = entry.approved_at
+    if not isinstance(audit_created_at, datetime) or not isinstance(approved_at, datetime):
+        return 'Candidate approval audit evidence does not match persisted approval.'
+    approval_awareness = approved_at.tzinfo is not None and approved_at.utcoffset() is not None
+    audit_awareness = audit_created_at.tzinfo is not None and audit_created_at.utcoffset() is not None
+    if approval_awareness != audit_awareness:
+        return 'Candidate approval audit evidence does not match persisted approval.'
+    if approval_awareness:
+        audit_created_at = audit_created_at.astimezone(timezone.utc)
+        approved_at = approved_at.astimezone(timezone.utc)
+    if (
+        approval_event.actor_user_id != entry.approved_by_user_id
+        or audit_created_at < approved_at
+        or detail.get('result') != 'approved_for_review'
+        or detail.get('model_version') != entry.model_version
+        or detail.get('actor_role') != 'TEACHER'
+        or not isinstance(new_state, dict)
+        or new_state.get('approval_status') != 'approved'
+    ):
+        return 'Candidate approval audit evidence does not match persisted approval.'
+    return None
 
 
 def sha256_file(path: Path) -> str:
@@ -129,8 +183,11 @@ def active_artifact_path(
         raise DeploymentArtifactError('The active local model version has no registry entry; refusing to fall back silently.')
     if entry.status != 'candidate' or entry.deployment_status != 'LOCAL_ACTIVE':
         raise DeploymentArtifactError('The selected registry version is not an active local candidate.')
-    if entry.validation_status != 'passed' or entry.approval_status != 'approved':
-        raise DeploymentArtifactError('The selected local candidate no longer satisfies validation and approval state.')
+    if entry.validation_status != 'passed':
+        raise DeploymentArtifactError('The selected local candidate no longer satisfies validation state.')
+    approval_error = independent_candidate_approval_error(db, entry)
+    if approval_error:
+        raise DeploymentArtifactError(approval_error)
     if state.active_artifact_hash.casefold() != (entry.artifact_hash or '').casefold():
         raise DeploymentArtifactError('Active deployment state artifact hash differs from registry metadata.')
     path, _ = verify_candidate_artifact(entry, candidate_directory)
