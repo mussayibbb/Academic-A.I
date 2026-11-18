@@ -5,6 +5,7 @@ import { ArrowRight, Check, Clock3, FileText, MessageSquareText, RotateCcw, Send
 import { FormEvent, useCallback, useEffect, useState } from 'react';
 import { Empty, ErrorNotice, Metric, PageHeading } from '@/components/ui';
 import StudentLearningRecoveryPanel from '@/components/StudentLearningRecoveryPanel';
+import StudentRecoveryQuizzes from '@/components/StudentRecoveryQuizzes';
 import StudentRecoveryRoadmapCards from '@/components/StudentRecoveryRoadmapCards';
 import { api } from '@/lib/api';
 
@@ -270,6 +271,7 @@ export default function StudentRecoveryPage() {
       title={selectedSubjectName ? `${selectedSubjectName} recovery tasks` : subjectIdFilter ? 'Subject recovery tasks' : 'Recovery tasks'}
       description={subjectFilter || subjectIdFilter ? 'Your published tasks and feedback for this subject.' : 'Work through tasks your teacher has published. Your progress and submissions are visible only to you and authorized teachers.'}
     />
+    <StudentRecoveryQuizzes />
     {!subjectFilter && !subjectIdFilter && tasks && <section aria-label="Persisted recovery progress" className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
       <Metric label="Published tasks" value={tasks.length} detail="Persisted across all recovery subjects" color="rose" />
       <Metric label="Completed" value={completedTaskCount} detail="Teacher-assessed complete" color="mint" />
