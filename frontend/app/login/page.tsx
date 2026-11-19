@@ -37,12 +37,13 @@ export default function LoginPage() {
     setLoading(true);
     setError('');
     try {
-      const response = await fetch(`${API_BASE}/api/v1/auth/login`, {
+      const response = await fetch(apiUrl('/api/v1/auth/login'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password }),
       });
       const data = await parseLoginResponse(response);
+      clearApiCache();
       window.localStorage.setItem('token', data.access_token);
       router.push(data.user.role === 'TEACHER' ? '/teacher/dashboard' : '/student/dashboard');
     } catch (requestError) {
