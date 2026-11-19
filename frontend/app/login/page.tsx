@@ -1,19 +1,36 @@
 'use client';
 
-import { motion, useReducedMotion } from 'framer-motion';
-import { ArrowRight, BookOpenCheck, LockKeyhole } from 'lucide-react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useState } from 'react';
+import MarketingShell from '@/components/marketing/MarketingShell';
+import {
+  DEMO_ACCOUNTS,
+  DEMO_PLAN,
+  DEMO_STUDENTS,
+  type DemoRole,
+} from '@/components/marketing/demo-data';
 import { API_BASE } from '@/lib/api';
 import { parseLoginResponse } from '@/lib/login';
+import styles from '@/components/marketing/marketing.module.css';
+
+type PreviewStyle = React.CSSProperties & {
+  '--progress': string;
+  '--progress-color': string;
+};
+
+function studentRiskLabel(risk: number) {
+  return risk >= 70 ? 'At risk' : risk >= 40 ? 'Needs attention' : 'On track';
+}
 
 export default function LoginPage() {
-  const [email, setEmail] = useState('teacher@example.com');
-  const [password, setPassword] = useState('teacher123');
+  const [selectedRole, setSelectedRole] = useState<DemoRole>('faculty');
+  const [email, setEmail] = useState(DEMO_ACCOUNTS.faculty.email);
+  const [password, setPassword] = useState(DEMO_ACCOUNTS.faculty.password);
+  const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const router = useRouter();
-  const reduceMotion = useReducedMotion() ?? false;
 
   async function onSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -35,42 +52,132 @@ export default function LoginPage() {
     }
   }
 
-  return (
-    <main className="relative grid min-h-screen overflow-hidden lg:grid-cols-[1.05fr_.95fr]">
-      <section className="relative isolate flex min-h-[42vh] flex-col justify-between overflow-hidden border-b border-white/8 px-6 py-8 sm:px-12 lg:min-h-screen lg:border-b-0 lg:border-r lg:border-white/8 lg:px-16 lg:py-12">
-        <div aria-hidden="true" className="pointer-events-none absolute -right-32 top-1/4 -z-10 size-[30rem] rounded-full border border-white/[.04]"><span className="absolute inset-8 rounded-full border border-rose-300/[.12]" /><span className="absolute inset-20 rounded-full border border-white/[.04]" /><span className="ambient-orb absolute right-[18%] top-[18%] size-3 rounded-full bg-rose-400 shadow-[0_0_32px_rgba(255,51,71,.7)]" /><span className="absolute bottom-[14%] left-[20%] size-1 rounded-full bg-white/60" /></div>
-        <div className="flex items-center gap-3"><span className="grid size-10 place-items-center rounded-lg border border-rose-300/25 bg-rose-300/[.08] text-rose-200"><BookOpenCheck size={20} /></span><div className="text-sm font-semibold">Academic AI <span className="font-normal text-slate-500">for Impact</span></div></div>
-        <div className="fade-up max-w-2xl py-12">
-          <p className="eyebrow">Student support, made timely</p>
-          <h1 className="mt-5 max-w-xl text-4xl font-semibold leading-[1.04] tracking-[-.045em] text-white sm:text-6xl">Notice the change.<br /><span className="text-rose-200">Make room to help.</span></h1>
-          <p className="mt-6 max-w-lg text-base leading-7 text-slate-400">A shared academic workspace for educators and students, built around early signals and thoughtful action.</p>
-          <div className="mt-12 grid max-w-xl grid-cols-3 border-y border-white/10 py-5">
-            <div><div className="text-xl font-semibold text-white">01</div><div className="mt-1 text-xs text-slate-500">Observe</div></div>
-            <div className="border-l border-white/10 pl-5"><div className="text-xl font-semibold text-white">02</div><div className="mt-1 text-xs text-slate-500">Understand</div></div>
-            <div className="border-l border-white/10 pl-5"><div className="text-xl font-semibold text-white">03</div><div className="mt-1 text-xs text-slate-500">Support</div></div>
-          </div>
-        </div>
-        <div className="flex items-center gap-2 text-[11px] text-slate-600"><LockKeyhole size={13} /> Private academic workspace</div>
-      </section>
+  const chooseRole = (role: DemoRole) => {
+    setSelectedRole(role);
+    setEmail(DEMO_ACCOUNTS[role].email);
+    setPassword(DEMO_ACCOUNTS[role].password);
+    setError('');
+  };
 
-      <section className="auth-panel relative flex items-center justify-center bg-[#f7f8fa] px-5 py-12 text-[#111214] sm:px-10 lg:px-14">
-        <motion.div initial={reduceMotion ? false : { opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: reduceMotion ? 0 : .4 }} className="w-full max-w-[410px]">
-          <p className="eyebrow">Welcome back</p>
-          <h2 className="mt-3 text-3xl font-semibold tracking-[-.035em] text-[#111214]">Sign in to continue</h2>
-          <p className="mt-2 text-sm text-[#60666e]">Use your faculty or student account.</p>
-          <form onSubmit={onSubmit} className="mt-8 space-y-5">
-            <div><label htmlFor="email" className="mb-2 block text-xs font-semibold text-[#454a52]">Email address</label><input id="email" type="email" autoComplete="username" required value={email} onChange={(event) => setEmail(event.target.value)} className="h-12 w-full rounded-lg border border-[#d1d4d8] bg-white px-4 text-sm text-[#111214] outline-none transition focus:border-[#e11d32] focus:ring-2 focus:ring-[#e11d32]/10" /></div>
-            <div><label htmlFor="password" className="mb-2 block text-xs font-semibold text-[#454a52]">Password</label><input id="password" type="password" autoComplete="current-password" required value={password} onChange={(event) => setPassword(event.target.value)} className="h-12 w-full rounded-lg border border-[#d1d4d8] bg-white px-4 text-sm text-[#111214] outline-none transition focus:border-[#e11d32] focus:ring-2 focus:ring-[#e11d32]/10" /></div>
-            {error && <p role="alert" className="rounded-lg border border-[#e11d32]/20 bg-[#fff0f2] px-3 py-2 text-sm text-[#a80f24]">{error}</p>}
-            <button disabled={loading} className="group flex h-12 w-full items-center justify-center gap-2 rounded-lg bg-[#e11d32] px-4 font-semibold text-white transition hover:bg-[#a80f24] disabled:cursor-wait disabled:opacity-60">{loading ? 'Signing in...' : 'Continue'}{!loading && <ArrowRight size={16} className="transition-transform group-hover:translate-x-1" />}</button>
+  return (
+    <MarketingShell>
+      <main className={styles.loginPage}>
+        <Link className={styles.back} href="/">← Back to home</Link>
+        <div className={styles.loginCard} data-role={selectedRole}>
+          <aside className={styles.preview} aria-label="Sample workspace preview">
+            <span className={styles.previewLabel}>Sample data</span>
+            <div id="faculty-preview" className={styles.previewPane} role="tabpanel" aria-labelledby="faculty-tab" data-active={selectedRole === 'faculty'} aria-hidden={selectedRole !== 'faculty'}>
+              <h3>Faculty workspace</h3>
+              <p>See who needs attention before the next assessment.</p>
+              {DEMO_STUDENTS.slice(0, 3).map((student) => {
+                const color = student.risk >= 70 ? 'var(--red)' : student.risk >= 40 ? '#ffb020' : 'var(--mint)';
+                const style: PreviewStyle = {
+                  '--progress': `${student.risk}%`,
+                  '--progress-color': color,
+                };
+                return (
+                  <div className={styles.previewRow} key={student.name}>
+                    <b>{student.name}</b>
+                    <em style={{ color }}>{studentRiskLabel(student.risk)}</em>
+                    <span className={styles.previewTrack}><i style={style} /></span>
+                  </div>
+                );
+              })}
+            </div>
+            <div id="student-preview" className={styles.previewPane} role="tabpanel" aria-labelledby="student-tab" data-active={selectedRole === 'student'} aria-hidden={selectedRole !== 'student'}>
+              <h3>Student workspace</h3>
+              <p>Your support plan, shared by your teacher.</p>
+              {DEMO_PLAN.map((item) => {
+                const color = item.status === 'Up next' ? 'var(--blue)' : 'var(--mint)';
+                const style: PreviewStyle = {
+                  '--progress': `${item.progress}%`,
+                  '--progress-color': color,
+                };
+                return (
+                  <div className={styles.previewRow} key={item.title}>
+                    <b>{item.title}</b>
+                    <em style={{ color }}>{item.status}</em>
+                    <span className={styles.previewTrack}><i style={style} /></span>
+                  </div>
+                );
+              })}
+            </div>
+          </aside>
+
+          <form className={styles.loginForm} onSubmit={onSubmit}>
+            <div className={styles.loginLogo}><i aria-hidden="true">A</i>Academic AI for Impact</div>
+            <h1 className={styles.loginTitle}>Welcome back</h1>
+            <p className={styles.loginSubtitle}>Choose how you&apos;re signing in.</p>
+            <div className={styles.roleTabs} role="tablist" aria-label="Choose account type">
+              <span className={styles.tabHighlight} aria-hidden="true" />
+              <button
+                type="button"
+                role="tab"
+                id="faculty-tab"
+                aria-controls="faculty-preview"
+                aria-selected={selectedRole === 'faculty'}
+                onClick={() => chooseRole('faculty')}
+              >
+                Faculty
+              </button>
+              <button
+                type="button"
+                role="tab"
+                id="student-tab"
+                aria-controls="student-preview"
+                aria-selected={selectedRole === 'student'}
+                onClick={() => chooseRole('student')}
+              >
+                Student
+              </button>
+            </div>
+            <div className={styles.field}>
+              <input
+                id="email"
+                type="email"
+                placeholder=" "
+                autoComplete="username"
+                required
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+              />
+              <label htmlFor="email">Email address</label>
+            </div>
+            <div className={styles.field}>
+              <input
+                className={styles.passwordInput}
+                id="password"
+                type={showPassword ? 'text' : 'password'}
+                placeholder=" "
+                autoComplete="current-password"
+                required
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+              />
+              <label htmlFor="password">Password</label>
+              <button
+                className={styles.passwordToggle}
+                type="button"
+                aria-label={showPassword ? 'Hide password' : 'Show password'}
+                onClick={() => setShowPassword((current) => !current)}
+              >
+                {showPassword ? 'Hide' : 'Show'}
+              </button>
+            </div>
+            <button className={styles.continueButton} type="submit" disabled={loading}>
+              {loading ? 'Signing in...' : 'Continue'}
+            </button>
+            <p className={`${styles.message} ${error ? styles.messageError : ''}`} aria-live="polite" aria-atomic="true">
+              {error}
+            </p>
+            <div className={styles.demoAccount}>
+              <strong>Demo data account</strong>
+              <code>{DEMO_ACCOUNTS[selectedRole].email} / {DEMO_ACCOUNTS[selectedRole].password}</code>
+            </div>
+            <small className={styles.loginNote}>Fictional demonstration accounts; do not use real student data.</small>
           </form>
-          <div className="mt-7 rounded-lg border border-[#d1d4d8] bg-white p-4">
-            <div className="eyebrow">Demo data account</div>
-            <div className="mt-3 grid grid-cols-[72px_1fr] gap-y-2 text-xs"><span className="text-[#60666e]">Faculty</span><span className="break-all font-mono text-[#303338]">teacher@example.com / teacher123</span><span className="text-[#60666e]">Student</span><span className="break-all font-mono text-[#303338]">student@example.com / student123</span></div>
-          </div>
-          <p className="mt-5 text-center text-[10px] text-[#60666e]">Fictional demonstration accounts; do not use real student data.</p>
-        </motion.div>
-      </section>
-    </main>
+        </div>
+      </main>
+    </MarketingShell>
   );
 }
