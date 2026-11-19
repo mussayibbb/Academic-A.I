@@ -10,7 +10,7 @@ import {
   DEMO_STUDENTS,
   type DemoRole,
 } from '@/components/marketing/demo-data';
-import { API_BASE } from '@/lib/api';
+import { apiUrl, clearApiCache } from '@/lib/api';
 import { parseLoginResponse } from '@/lib/login';
 import styles from '@/components/marketing/marketing.module.css';
 
