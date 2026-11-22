@@ -566,6 +566,7 @@ class RiskSnapshot(Timestamps, Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     student_id: Mapped[int] = mapped_column(ForeignKey('students.id', ondelete='CASCADE'), index=True)
+    model_version: Mapped[str | None] = mapped_column(String(80), index=True, default=None)
     risk_level: Mapped[str] = mapped_column(String(20), index=True)
     probability: Mapped[float] = mapped_column(Float, default=0.0)
     recorded_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)

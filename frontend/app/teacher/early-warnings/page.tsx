@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import EarlyWarningRiskTrajectory from '@/components/EarlyWarningRiskTrajectory';
 import { api } from '@/lib/api';
 
 type Priority = 'High' | 'Medium' | 'Low';
@@ -140,6 +141,23 @@ export default function EarlyWarningsPage() {
   const simTimer = useRef<ReturnType<typeof setTimeout>>();
   const simRequestRef = useRef(0);
   const simAbortRef = useRef<AbortController | null>(null);
+  const [animateIn, setAnimateIn] = useState(false);
+
+  useEffect(() => {
+    setAnimateIn(false);
+    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+      setAnimateIn(true);
+      return;
+    }
+    let secondFrame = 0;
+    const firstFrame = requestAnimationFrame(() => {
+      secondFrame = requestAnimationFrame(() => setAnimateIn(true));
+    });
+    return () => {
+      cancelAnimationFrame(firstFrame);
+      cancelAnimationFrame(secondFrame);
+    };
+  }, [selectedId, detail]);
 
   const showToast = (message: string) => {
     setToast(message);
@@ -323,7 +341,8 @@ export default function EarlyWarningsPage() {
         .ew-acts{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}.ew-act{text-align:left;background:var(--ew-panel2);border:1px solid var(--ew-line);color:inherit;border-radius:14px;padding:14px;cursor:pointer;transition:.2s}.ew-act:hover{transform:translateY(-3px);border-color:var(--hi)}.ew-act.pri{background:var(--hi);border-color:var(--hi);color:#fff}.ew-act b{display:block}.ew-act small{color:var(--ew-mute)}.ew-act.pri small{color:rgba(255,255,255,.85)}
         .ew-composer{display:none;margin-top:14px}.ew-composer.open{display:block;animation:ewExpand .35s both}.ew-composer-box{border:1px dashed var(--hi);border-radius:14px;padding:14px}.ew-composer input{width:100%;margin:8px 0;border:1px solid var(--ew-line);background:var(--ew-panel2);color:var(--ew-tx);border-radius:8px;padding:9px}.ew-go{background:var(--hi);color:#fff;border:0;border-radius:10px;padding:10px 16px;font-weight:700}
         .ew-log{margin:14px 0 0;padding:0;list-style:none;font-size:13px;color:var(--ew-mute)}.ew-log li{padding:6px 0;border-top:1px solid var(--ew-line)}.ew-toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,40px);opacity:0;background:var(--ew-tx);color:var(--ew-bg);padding:11px 18px;border-radius:12px;font-weight:700;z-index:50;transition:.35s}.ew-toast.show{transform:translate(-50%,0);opacity:1}.ew-note{color:var(--ew-mute);font-size:12px;margin-top:12px}
-        @keyframes ewIn{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}@keyframes ewPulse{0%{box-shadow:0 0 0 0 rgba(61,220,151,.6)}100%{box-shadow:0 0 0 10px rgba(61,220,151,0)}}@keyframes ewRing{0%{box-shadow:0 0 0 0 rgba(255,59,92,.5)}100%{box-shadow:0 0 0 9px rgba(255,59,92,0)}}@keyframes ewGlow{0%,100%{box-shadow:0 0 0 0 rgba(255,59,92,0)}50%{box-shadow:0 0 38px 0 rgba(255,59,92,.28)}}@keyframes ewExpand{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+        .ew-tr-card svg{display:block;width:100%;height:auto;overflow:visible}.ew-trend-line{fill:none;stroke-width:3;stroke-linecap:round;stroke-linejoin:round;stroke-dasharray:1;stroke-dashoffset:1;transition:stroke-dashoffset 1.5s cubic-bezier(.4,0,.2,1)}.ew-trend-line.animate{stroke-dashoffset:0}.ew-area{opacity:0;transition:opacity 1s .6s}.ew-area.animate{opacity:1}.ew-forecast{fill:none;stroke-width:2.5;stroke-dasharray:5 5;opacity:0;transition:opacity .8s 1.4s}.ew-forecast.animate{opacity:1}.ew-forecast-red{stroke:var(--hi)}.ew-forecast-green{stroke:var(--lo)}.ew-now-dot{transform-box:fill-box;transform-origin:center}.ew-now-dot.animate{animation:ewBlink 2s infinite}.ew-history-note{color:var(--ew-mute);font-size:12px;margin:6px 0}.ew-legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:8px;color:var(--ew-mute);font-size:12px}.ew-legend span{display:inline-flex;align-items:center;gap:6px}.ew-legend i{width:10px;height:10px;border-radius:50%}.ew-legend-red{background:var(--hi)}.ew-legend-green{background:var(--lo)}
+        @keyframes ewIn{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}@keyframes ewPulse{0%{box-shadow:0 0 0 0 rgba(61,220,151,.6)}100%{box-shadow:0 0 0 10px rgba(61,220,151,0)}}@keyframes ewRing{0%{box-shadow:0 0 0 0 rgba(255,59,92,.5)}100%{box-shadow:0 0 0 9px rgba(255,59,92,0)}}@keyframes ewGlow{0%,100%{box-shadow:0 0 0 0 rgba(255,59,92,0)}50%{box-shadow:0 0 38px 0 rgba(255,59,92,.28)}}@keyframes ewExpand{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}@keyframes ewBlink{50%{transform:scale(1.9);opacity:.35}}
         @media(max-width:980px){.ew-split{grid-template-columns:1fr}.ew-list{position:static}.ew-rows{max-height:340px}.ew-stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
         @media(max-width:560px){.ew-hero{grid-template-columns:1fr;justify-items:center;text-align:center}.ew-param{grid-template-columns:1fr 60px}.ew-param .ew-bar{grid-column:1/-1;order:3}.ew-sl{grid-template-columns:1fr 46px}.ew-sl input{grid-column:1/-1;order:3}.ew-stats{grid-template-columns:1fr 1fr}.ew-proj{grid-template-columns:1fr}}
         @media(prefers-reduced-motion:reduce){.ew-page *{animation:none!important;transition:none!important}}
@@ -389,17 +408,7 @@ export default function EarlyWarningsPage() {
               </div>
             </div>
 
-            <div className="ew-card">
-              <h3>Risk trajectory</h3><p className="ew-lead">Predicted risk for the available weeks and a 2-week forecast.</p>
-              {detail.trend.length ? <svg viewBox="0 0 400 136" role="img" aria-label="Risk trajectory" className="w-full">
-                <line x1="10" x2="390" y1={112 - 75 * 1.04} y2={112 - 75 * 1.04} stroke="var(--hi)" strokeOpacity=".4" strokeDasharray="3 4" />
-                <text x="390" y={112 - 75 * 1.04 - 4} fontSize="9" textAnchor="end" fill="var(--hi)">Danger zone starts at 75%</text>
-                <polyline fill="none" stroke={riskColor} strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" points={detail.trend.map((point, index) => `${10 + index * (380 / Math.max(1, detail.trend.length - 1))},${112 - point.risk * 104}`).join(' ')} />
-                <line x1={390} x2={390} y1={112 - detail.forecast.noAction * 104} y2={112 - detail.forecast.noAction * 104} stroke="var(--hi)" strokeDasharray="5 5" />
-                <circle cx={10 + (detail.trend.length - 1) * (380 / Math.max(1, detail.trend.length - 1))} cy={112 - detail.trend[detail.trend.length - 1].risk * 104} r="5" fill={riskColor} />
-              </svg> : <p className="ew-lead">Not enough history to draw a trend.</p>}
-              <div className="ew-chipline"><span>No action <b>{Math.round(detail.forecast.noAction * 100)}%</b></span><span>With plan <b>{Math.round(detail.forecast.withPlan * 100)}%</b></span></div>
-            </div>
+            <EarlyWarningRiskTrajectory trend={detail.trend} forecast={detail.forecast} currentRisk={detail.riskProbability} animateIn={animateIn} />
 
             <div className="ew-card">
               <h3>Why the model flagged this student</h3><p className="ew-lead">Positive SHAP factors, normalised across this student’s factors.</p>

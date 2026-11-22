@@ -178,6 +178,7 @@ from backend.app.services.model_deployment import (
     verify_candidate_artifact,
 )
 from backend.app.services.academic_imports import ImportValidationError, import_academic_data
+from backend.app.services.early_warning_snapshots import weekly_snapshot_trend
 from ai.risk.academic_dataset import DATASET_FIELDS, build_observation_rows, readiness_report
 from ai.risk.phase3 import (
     DATASET_FIELDS as PHASE3_DATASET_FIELDS,
@@ -6805,13 +6806,7 @@ def early_warning_detail(student_id: int, user: CurrentTeacher, db: Session = De
             'contributionShare': round(contribution, 6),
         })
 
-    snapshots = db.query(RiskSnapshot).filter(
-        RiskSnapshot.student_id == student.id,
-    ).order_by(RiskSnapshot.recorded_at.asc()).all()
-    trend = [
-        {'weekStart': snapshot.recorded_at.date().isoformat(), 'risk': round(float(snapshot.probability), 6)}
-        for snapshot in snapshots[-8:]
-    ]
+    trend = weekly_snapshot_trend(db, student.id)
     if trend:
         week_change = round((trend[-1]['risk'] - trend[-2]['risk']) * 100, 1) if len(trend) > 1 else 0.0
     else:

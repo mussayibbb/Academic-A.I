@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import EarlyWarningRiskTrajectory from '@/components/EarlyWarningRiskTrajectory';
 import EarlyWarningsPage from './page';
 
 const mocks = vi.hoisted(() => ({ api: vi.fn() }));
@@ -105,4 +106,29 @@ describe('teacher early warnings', () => {
     expect(screen.getByText('Predicted risk').parentElement?.textContent).toContain('82%');
     expect(screen.queryByText('Could not load student detail')).toBeNull();
   }, 15000);
+
+  it('draws an eight-point history and both forecast paths', () => {
+    const trend = Array.from({ length: 8 }, (_, index) => ({
+      weekStart: `2026-0${index + 1}-01`,
+      risk: 0.3 + index * 0.05,
+    }));
+    const { container } = render(
+      <EarlyWarningRiskTrajectory trend={trend} forecast={{ noAction: 0.8, withPlan: 0.4 }} currentRisk={0.65} animateIn />,
+    );
+    expect(container.querySelector('.ew-trend-line')?.getAttribute('pathLength')).toBe('1');
+    expect(container.querySelector('.ew-area')).toBeTruthy();
+    expect(container.querySelectorAll('.ew-forecast')).toHaveLength(2);
+    expect(container.querySelector('.ew-now-dot')).toBeTruthy();
+  });
+
+  it('keeps the chart and forecast paths visible with no weekly history', () => {
+    const { container } = render(
+      <EarlyWarningRiskTrajectory trend={[]} forecast={{ noAction: 0.8, withPlan: 0.4 }} currentRisk={0.65} animateIn />,
+    );
+    expect(container.querySelector('svg[viewBox="0 0 400 136"]')).toBeTruthy();
+    expect(container.querySelector('.ew-trend-line')).toBeNull();
+    expect(container.querySelectorAll('.ew-forecast')).toHaveLength(2);
+    expect(container.querySelector('.ew-now-dot')).toBeTruthy();
+    expect(screen.getByText('Weekly history is still building. The forecast is based on the latest data.')).toBeTruthy();
+  });
 });
