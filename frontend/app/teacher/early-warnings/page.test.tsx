@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import EarlyWarningsPage from './page';
 
@@ -43,6 +43,9 @@ describe('teacher early warnings', () => {
         precautions: [{ factorKey: 'attendance', text: 'Agree on an attendance target of 85%.' }],
         actions: [],
       };
+      if (path === '/api/v1/early-warnings/17/simulate' && init?.method === 'POST') {
+        return { riskProbability: 0.68, riskClass: 'Medium', delta: -14 };
+      }
       if (path === '/api/v1/interventions/meetings' && init?.method === 'POST') {
         return { type: 'meeting', label: 'Host a meeting', at: '2026-11-22T12:00:00Z', by: 3 };
       }
@@ -59,10 +62,47 @@ describe('teacher early warnings', () => {
     render(<EarlyWarningsPage />);
     expect(await screen.findByText('Test Student')).toBeTruthy();
     expect(await screen.findByRole('heading', { name: 'Why the model flagged this student' })).toBeTruthy();
+    expect(await screen.findByText('Predicted risk')).toBeTruthy();
+    expect(screen.getByText('Predicted risk').parentElement?.textContent).toContain('82%');
+    expect(screen.getByLabelText('Attendance recovers')).toBeTruthy();
+    expect(screen.getByText('Currently 82%. This scenario changes it by 0 pts.')).toBeTruthy();
+    const slider = screen.getByLabelText('Attendance recovers') as HTMLInputElement;
+    fireEvent.change(slider, { target: { value: '50' } });
+    await waitFor(() => expect(mocks.api).toHaveBeenCalledWith(
+      '/api/v1/early-warnings/17/simulate',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ recoveries: { attendance: 0.5 } }) }),
+    ));
+    expect(await screen.findByText('68%')).toBeTruthy();
+    expect(within(slider.closest('.ew-card') as HTMLElement).getByText('Watch')).toBeTruthy();
     const meeting = await screen.findByRole('button', { name: /Host a meeting/i });
     meeting.click();
     await waitFor(() => expect(screen.getByText('Schedule a meeting')).toBeTruthy());
     screen.getByRole('button', { name: 'Confirm' }).click();
     expect(await screen.findByText(/Host a meeting ·/)).toBeTruthy();
+  }, 15000);
+
+  it('keeps detail and the last prediction when simulation fails', async () => {
+    mocks.api.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path.startsWith('/api/v1/early-warnings?')) return {
+        summary: { signals: 1, highPriority: 1, watchList: 0, recoveredThisMonth: 0, modelRefreshedAt: '2026-11-22T12:00:00Z' },
+        items: [{ studentId: 17, name: 'Test Student', department: 'Sciences', riskProbability: 0.82, riskClass: 'At risk', priority: 'High', topFactor: 'Attendance' }],
+        nextPage: null,
+      };
+      if (path === '/api/v1/early-warnings/17') return {
+        studentId: 17, name: 'Test Student', department: 'Sciences', riskProbability: 0.82, riskClass: 'At risk', priority: 'High',
+        confidence: 0.9, signalsUsed: 4, weekChange: 5, insufficientData: false, trend: [], forecast: { noAction: 0.9, withPlan: 0.35 },
+        factors: [{ key: 'attendance', label: 'Attendance', detail: '71% now', currentValue: 71, previousValue: 84, unit: '%', contributionShare: 1 }],
+        precautions: [], actions: [],
+      };
+      if (path.endsWith('/simulate') && init?.method === 'POST') throw new Error('Temporary model failure');
+      throw new Error(`Unexpected API call: ${path}`);
+    });
+    render(<EarlyWarningsPage />);
+    expect(await screen.findByText('Predicted risk')).toBeTruthy();
+    const slider = screen.getByLabelText('Attendance recovers') as HTMLInputElement;
+    fireEvent.change(slider, { target: { value: '50' } });
+    expect(await screen.findByText(/Temporary model failure/)).toBeTruthy();
+    expect(screen.getByText('Predicted risk').parentElement?.textContent).toContain('82%');
+    expect(screen.queryByText('Could not load student detail')).toBeNull();
   }, 15000);
 });

@@ -58,16 +58,40 @@ type WarningDetail = {
   actions: { type: string; label: string; at: string; by: number | null }[];
 };
 
+type SimulationResult = { riskProbability: number; delta: number };
+
 const priorityColor = (priority: Priority) =>
   priority === 'High' ? 'var(--hi)' : priority === 'Medium' ? 'var(--md)' : 'var(--lo)';
 
-const factorOverrideKey: Record<string, string> = {
-  attendance: 'attendancePct',
-  assessment: 'assessmentAvg',
-  missing_submissions: 'missingSubmissions',
-  activity_per_week: 'portalLoginsPerWeek',
-  current_gpa: 'internalMarksPct',
-};
+const supportedRecoveryFactors = new Set([
+  'attendance', 'assessment', 'missing_submissions', 'activity_per_week',
+  'attendance_change', 'assessment_change', 'momentum_score', 'current_gpa',
+]);
+
+function PredictedRisk({ value }: { value: number }) {
+  const [shown, setShown] = useState(value);
+  const shownRef = useRef(value);
+  useEffect(() => {
+    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+      setShown(value);
+      shownRef.current = value;
+      return;
+    }
+    let frame = 0;
+    const startValue = shownRef.current;
+    const startAt = performance.now();
+    const tick = (now: number) => {
+      const progress = Math.min(1, (now - startAt) / 400);
+      const current = startValue + (value - startValue) * progress;
+      shownRef.current = current;
+      setShown(current);
+      if (progress < 1) frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [value]);
+  return <>{Math.round(shown * 100)}%</>;
+}
 
 function CountUp({ value }: { value: number }) {
   const [shown, setShown] = useState(0);
@@ -102,16 +126,20 @@ export default function EarlyWarningsPage() {
   const [detail, setDetail] = useState<WarningDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState('');
+  const [simulationError, setSimulationError] = useState('');
+  const [simulationLoading, setSimulationLoading] = useState(false);
   const [toast, setToast] = useState('');
   const [composer, setComposer] = useState<number | null>(null);
   const [composerValue, setComposerValue] = useState('');
   const [composerDate, setComposerDate] = useState('');
   const [actions, setActions] = useState<WarningDetail['actions']>([]);
   const [simulations, setSimulations] = useState<Record<string, number>>({});
-  const [simulatedRisk, setSimulatedRisk] = useState<number | null>(null);
+  const [simulationResult, setSimulationResult] = useState<SimulationResult | null>(null);
   const rowsRef = useRef<HTMLDivElement>(null);
   const requestRef = useRef(0);
   const simTimer = useRef<ReturnType<typeof setTimeout>>();
+  const simRequestRef = useRef(0);
+  const simAbortRef = useRef<AbortController | null>(null);
 
   const showToast = (message: string) => {
     setToast(message);
@@ -157,15 +185,23 @@ export default function EarlyWarningsPage() {
     let active = true;
     setDetailLoading(true);
     setDetailError('');
+    setSimulationError('');
+    setSimulationLoading(false);
     setDetail(null);
     setComposer(null);
-    setSimulatedRisk(null);
+    setSimulationResult(null);
     setSimulations({});
+    simAbortRef.current?.abort();
+    if (simTimer.current) clearTimeout(simTimer.current);
     api<WarningDetail>(`/api/v1/early-warnings/${selectedId}`)
       .then((data) => {
         if (!active) return;
         setDetail(data);
         setActions(data.actions);
+        setSimulationResult({ riskProbability: data.riskProbability, delta: 0 });
+        setSimulations(Object.fromEntries(data.factors.slice(0, 3)
+          .filter((factor) => supportedRecoveryFactors.has(factor.key))
+          .map((factor) => [factor.key, 0])));
       })
       .catch((requestError: Error) => {
         if (active) setDetailError(requestError.message);
@@ -190,16 +226,31 @@ export default function EarlyWarningsPage() {
   const runSimulation = (values: Record<string, number>) => {
     if (!selectedId) return;
     if (simTimer.current) clearTimeout(simTimer.current);
+    simAbortRef.current?.abort();
+    const requestId = ++simRequestRef.current;
+    setSimulationError('');
+    setSimulationLoading(true);
     simTimer.current = setTimeout(() => {
-      const overrides: Record<string, number> = {};
-      for (const [factor, value] of Object.entries(values)) {
-        const mapped = factorOverrideKey[factor];
-        if (mapped) overrides[mapped] = value;
-      }
-      api<{ riskProbability: number; riskClass: RiskClass }>(
+      const controller = new AbortController();
+      simAbortRef.current = controller;
+      const recoveries = Object.fromEntries(
+        Object.entries(values).map(([feature, value]) => [feature, value / 100]),
+      );
+      api<{ riskProbability: number; riskClass: RiskClass; delta: number }>(
         `/api/v1/early-warnings/${selectedId}/simulate`,
-        { method: 'POST', body: JSON.stringify({ overrides }) },
-      ).then((result) => setSimulatedRisk(result.riskProbability)).catch(() => setDetailError('Could not update the what-if simulation.'));
+        { method: 'POST', body: JSON.stringify({ recoveries }), signal: controller.signal },
+      ).then((result) => {
+        if (requestId === simRequestRef.current) {
+          setSimulationResult({ riskProbability: result.riskProbability, delta: result.delta });
+          setSimulationError('');
+        }
+      }).catch((requestError: Error) => {
+        if (requestId === simRequestRef.current && requestError.name !== 'AbortError') {
+          setSimulationError(requestError.message || 'Could not update the simulation.');
+        }
+      }).finally(() => {
+        if (requestId === simRequestRef.current) setSimulationLoading(false);
+      });
     }, 150);
   };
 
@@ -255,7 +306,7 @@ export default function EarlyWarningsPage() {
 
   return (
     <div className="ew-page">
-      <style jsx global>{`
+      <style>{`
         .ew-page{--ew-bg:#0e0d10;--ew-panel:#17151a;--ew-panel2:#1f1c23;--ew-line:#2c2831;--ew-tx:#f4f1f5;--ew-mute:#a49eab;--hi:#ff3b5c;--md:#ffb020;--lo:#3ddc97;min-width:0;color:var(--ew-tx)}
         .ew-page h1,.ew-page h2,.ew-page h3{font-family:"Bricolage Grotesque","DM Sans",sans-serif;letter-spacing:-.02em}
         .ew-top{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap}.ew-top h1{font-size:clamp(30px,4vw,46px);line-height:1}.ew-sub{color:var(--ew-mute);margin:8px 0 0;max-width:56ch}
@@ -268,7 +319,7 @@ export default function EarlyWarningsPage() {
         .ew-zone{height:10px;border-radius:9px;background:linear-gradient(90deg,var(--lo),var(--md) 55%,var(--hi));position:relative;margin:8px 0 6px}.ew-zone i{position:absolute;top:-5px;width:4px;height:20px;border-radius:3px;background:var(--ew-tx);left:calc(var(--risk)*1% - 2px);transition:left 1.2s cubic-bezier(.2,.8,.2,1);box-shadow:0 0 0 3px var(--ew-bg)}.ew-zl{display:flex;justify-content:space-between;font-size:12px;color:var(--ew-mute)}
         .ew-param{display:grid;grid-template-columns:200px 1fr 70px;gap:14px;align-items:center;padding:11px 0;border-top:1px solid var(--ew-line);animation:ewIn .5s both}.ew-param:first-of-type{border-top:0}.ew-param b{font-size:14px;display:block}.ew-param small{color:var(--ew-mute);font-size:12px}.ew-bar{height:9px;background:var(--ew-panel2);border-radius:9px;overflow:hidden}.ew-bar i{display:block;height:100%;border-radius:9px;background:linear-gradient(90deg,var(--md),var(--hi));transition:width 1s cubic-bezier(.2,.8,.2,1)}.ew-param em{font-style:normal;font-weight:700;text-align:right;color:var(--hi)}
         .ew-prec{display:grid;gap:10px}.ew-prec div{display:grid;grid-template-columns:28px 1fr;gap:12px;padding:12px 14px;background:var(--ew-panel2);border-radius:12px;font-size:14px;animation:ewIn .45s both}.ew-proj{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:14px}.ew-proj div{padding:12px 14px;border-radius:12px;background:var(--ew-panel2);font-size:13px;color:var(--ew-mute)}.ew-proj b{display:block;font:800 26px "Bricolage Grotesque",sans-serif}
-        .ew-sl{display:grid;grid-template-columns:200px 1fr 46px;gap:14px;align-items:center;padding:8px 0;font-size:14px}.ew-sl input{accent-color:var(--hi);width:100%}.ew-sres{display:flex;align-items:center;gap:16px;margin-top:14px;padding:14px;border-radius:14px;background:var(--ew-panel2)}.ew-sres b{font:800 34px "Bricolage Grotesque",sans-serif;min-width:80px}.ew-sres .ew-bar{flex:1}
+        .ew-sl{display:grid;grid-template-columns:200px 1fr 46px;gap:14px;align-items:center;padding:8px 0;font-size:14px}.ew-sl input{accent-color:var(--hi);width:100%}.ew-sres{display:flex;flex-direction:column;align-items:stretch;gap:6px;margin-top:14px;padding:14px;border-radius:14px;background:var(--ew-panel2)}.ew-sres-row{display:flex;align-items:center;gap:16px}.ew-sres b{font:800 34px "Bricolage Grotesque",sans-serif;min-width:80px;transition:color .3s}.ew-sres .ew-bar{flex:1}.ew-sres .ew-bar i{transition:width .5s,background-color .3s}.ew-simline{color:var(--ew-mute);font-size:12px}.ew-simerror{color:var(--ew-mute);font-size:12px;margin:8px 0 0}.ew-simerror button{border:0;background:none;color:var(--ew-tx);text-decoration:underline;padding:0;cursor:pointer}
         .ew-acts{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}.ew-act{text-align:left;background:var(--ew-panel2);border:1px solid var(--ew-line);color:inherit;border-radius:14px;padding:14px;cursor:pointer;transition:.2s}.ew-act:hover{transform:translateY(-3px);border-color:var(--hi)}.ew-act.pri{background:var(--hi);border-color:var(--hi);color:#fff}.ew-act b{display:block}.ew-act small{color:var(--ew-mute)}.ew-act.pri small{color:rgba(255,255,255,.85)}
         .ew-composer{display:none;margin-top:14px}.ew-composer.open{display:block;animation:ewExpand .35s both}.ew-composer-box{border:1px dashed var(--hi);border-radius:14px;padding:14px}.ew-composer input{width:100%;margin:8px 0;border:1px solid var(--ew-line);background:var(--ew-panel2);color:var(--ew-tx);border-radius:8px;padding:9px}.ew-go{background:var(--hi);color:#fff;border:0;border-radius:10px;padding:10px 16px;font-weight:700}
         .ew-log{margin:14px 0 0;padding:0;list-style:none;font-size:13px;color:var(--ew-mute)}.ew-log li{padding:6px 0;border-top:1px solid var(--ew-line)}.ew-toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,40px);opacity:0;background:var(--ew-tx);color:var(--ew-bg);padding:11px 18px;border-radius:12px;font-weight:700;z-index:50;transition:.35s}.ew-toast.show{transform:translate(-50%,0);opacity:1}.ew-note{color:var(--ew-mute);font-size:12px;margin-top:12px}
@@ -367,11 +418,11 @@ export default function EarlyWarningsPage() {
 
             <div className="ew-card">
               <h3>What-if simulator</h3><p className="ew-lead">Live changes are scored by the real model.</p>
-              {detail.factors.slice(0, 3).map((factor) => {
-                const value = simulations[factor.key] ?? (factor.unit === '%' ? factor.currentValue : Math.min(100, factor.currentValue));
+              {detail.factors.slice(0, 3).filter((factor) => supportedRecoveryFactors.has(factor.key)).map((factor) => {
+                const value = simulations[factor.key] ?? 0;
                 return <div className="ew-sl" key={factor.key}>
-                  <span>{factor.label}</span>
-                  <input type="range" min="0" max="100" value={value} onChange={(event) => {
+                  <label htmlFor={`recovery-${factor.key}`}>{factor.label} recovers</label>
+                  <input id={`recovery-${factor.key}`} type="range" min="0" max="100" value={value} onChange={(event) => {
                     const next = { ...simulations, [factor.key]: Number(event.target.value) };
                     setSimulations(next);
                     runSimulation(next);
@@ -379,7 +430,18 @@ export default function EarlyWarningsPage() {
                   <b>{Math.round(value)}%</b>
                 </div>;
               })}
-              {simulatedRisk !== null && <div className="ew-sres"><b>{Math.round(simulatedRisk * 100)}%</b><div className="ew-bar"><i style={{ width: `${Math.round(simulatedRisk * 100)}%` }} /></div><span>{simulatedRisk >= .75 ? 'Danger' : simulatedRisk >= .4 ? 'Watch' : 'Normal'}</span></div>}
+              {simulationResult !== null && detail && (() => {
+                const score = Math.round(simulationResult.riskProbability * 100);
+                const color = score >= 75 ? 'var(--hi)' : score >= 40 ? 'var(--md)' : 'var(--lo)';
+                const tag = score >= 75 ? 'Danger' : score >= 40 ? 'Watch' : 'Normal';
+                return <div className="ew-sres" aria-live="polite" style={{ opacity: simulationLoading ? 0.55 : 1 }}>
+                  <span className="ew-simline">Predicted risk</span>
+                  <div className="ew-sres-row"><b style={{ color }}><PredictedRisk value={simulationResult.riskProbability} /></b><div className="ew-bar"><i style={{ width: `${score}%`, backgroundColor: color }} /></div><span className="ew-tag" style={{ '--row-c': color } as React.CSSProperties}>{tag}</span></div>
+                  <div className="ew-simline">Currently {Math.round(detail.riskProbability * 100)}%. This scenario changes it by {simulationResult.delta > 0 ? '+' : ''}{Math.round(simulationResult.delta)} pts.</div>
+                </div>;
+              })()}
+              {simulationLoading && <p className="ew-simline" role="status">Updating prediction…</p>}
+              {simulationError && <p className="ew-simerror" role="status">{simulationError} <button type="button" onClick={() => runSimulation(simulations)}>Retry</button></p>}
             </div>
 
             <div className="ew-card">

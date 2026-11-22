@@ -195,7 +195,7 @@ LEARNING_ASSESSMENT_TOTAL_MARKS = 100
 
 class EarlyWarningSimulationRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    overrides: dict[str, float] = Field(default_factory=dict)
+    recoveries: dict[str, float] = Field(default_factory=dict)
 
 
 class MeetingInterventionRequest(BaseModel):
@@ -6903,37 +6903,61 @@ def early_warning_simulate(
     SIMULATION_REQUESTS[key] = recent
 
     student = early_warning_authorized_student(db, user, student_id)
-    feature_overrides = {}
-    mapping = {
-        'attendancePct': 'attendance',
-        'assessmentAvg': 'assessment',
-        'missingSubmissions': 'missing_submissions',
-        'portalLoginsPerWeek': 'activity_per_week',
-        'internalMarksPct': 'assessment',
+    supported_targets = {
+        'attendance', 'assessment', 'missing_submissions', 'activity_per_week',
+        'attendance_change', 'assessment_change', 'momentum_score', 'current_gpa',
     }
-    for key_name, value in payload.overrides.items():
-        feature_name = mapping.get(key_name)
-        if feature_name is None:
-            raise HTTPException(status_code=422, detail=f'Unsupported what-if factor: {key_name}')
-        if not math.isfinite(float(value)):
-            raise HTTPException(status_code=422, detail=f'{key_name} must be finite.')
-        if feature_name in {'attendance', 'assessment'} and not 0 <= float(value) <= 100:
-            raise HTTPException(status_code=422, detail=f'{key_name} must be from 0 to 100.')
-        if feature_name in {'missing_submissions', 'activity_per_week'} and float(value) < 0:
-            raise HTTPException(status_code=422, detail=f'{key_name} must be zero or greater.')
-        feature_overrides[feature_name] = float(value)
-    if not feature_overrides:
-        raise HTTPException(status_code=422, detail='Provide at least one supported what-if factor.')
+    unsupported = sorted(set(payload.recoveries) - supported_targets)
+    if unsupported:
+        raise HTTPException(status_code=422, detail=f'Unsupported recovery factor(s): {", ".join(unsupported)}')
+    if not payload.recoveries:
+        raise HTTPException(status_code=422, detail='Provide at least one recovery fraction.')
+    for factor, value in payload.recoveries.items():
+        if not math.isfinite(float(value)) or not 0 <= float(value) <= 1:
+            raise HTTPException(status_code=422, detail=f'{factor} recovery must be between 0 and 1.')
 
-    simulated = simulate_student_risk(student, db, feature_overrides)
-    result = simulated['simulated_prediction']
-    probability = float(result['class_probabilities'].get('HIGH', result['risk_probability'] if result['risk_level'] == 'HIGH' else 0.0))
+    features = student_features(student, db)
+    candidate = dict(features)
+    activity_history = [
+        observation.value for observation in db.query(AcademicMomentum).filter(
+            AcademicMomentum.student_id == student.id,
+            AcademicMomentum.metric == 'activity',
+        ).order_by(AcademicMomentum.observed_at, AcademicMomentum.id).all()
+    ]
+    assessment_change = float(features['assessment_change'])
+    earlier_assessment = (
+        min(100.0, features['assessment'] / (1 + assessment_change / 100))
+        if assessment_change > -100
+        else features['assessment']
+    )
+    targets = {
+        'attendance': max(features['attendance'], 85.0),
+        'assessment': max(features['assessment'], earlier_assessment),
+        'missing_submissions': 0.0,
+        'activity_per_week': max(
+            features['activity_per_week'],
+            sum(activity_history[:-4]) / len(activity_history[:-4]) if len(activity_history) > 4 else features['activity_per_week'],
+        ),
+        'attendance_change': max(0.0, features['attendance_change']),
+        'assessment_change': max(0.0, features['assessment_change']),
+        'momentum_score': max(0.0, features['momentum_score']),
+        'current_gpa': max(features['current_gpa'], student.previous_gpa),
+    }
+    baseline_prediction = predict_with_active_model(features, db)
+    for factor, recovery in payload.recoveries.items():
+        start = float(features[factor])
+        target = float(targets[factor])
+        candidate[factor] = start + (target - start) * float(recovery)
+    simulated_prediction = predict_with_active_model(candidate, db)
+    probability = float(simulated_prediction['class_probabilities'].get('HIGH', 0.0))
+    baseline_probability = float(baseline_prediction['class_probabilities'].get('HIGH', 0.0))
     risk_class = 'At risk' if probability >= HIGH_PRIORITY_THRESHOLD else 'Watch' if probability >= MEDIUM_PRIORITY_THRESHOLD else 'Normal'
     audit(db, user, 'early_warning.simulated', 'student', student.id)
     db.commit()
     return {
         'riskProbability': round(probability, 6),
         'riskClass': risk_class,
+        'delta': round((probability - baseline_probability) * 100, 2),
     }
 
 
