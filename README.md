@@ -106,6 +106,19 @@ streamlit run streamlit_app.py
 
 Set `ACADEMIC_AI_API_URL` if FastAPI is not at `http://127.0.0.1:8000`. When a current HIGH-risk prediction exists, the app selects the existing student with the highest P(HIGH); otherwise it selects the existing record with the highest P(HIGH) and preserves its actual predicted class. Intervention drafts still require faculty review and approval in the faculty workspace.
 
+## Early Warnings
+
+The faculty `/teacher/early-warnings` page uses `GET /api/v1/early-warnings`, `GET /api/v1/early-warnings/{studentId}`, and the what-if/intervention endpoints backed by the existing production model and SQLAlchemy database. The list is paginated in groups of 50 and restricted to each teacher's assigned courses or sections. Priority thresholds are `High >= 0.75`, `Medium >= 0.40`, and `Low < 0.40`; fewer than three usable signals is rendered as insufficient data.
+
+Apply the intervention migration and weekly snapshot backfill with the normal migration and seed commands:
+
+```powershell
+.\.venv\Scripts\alembic.exe upgrade head
+.\.venv\Scripts\python.exe -m backend.app.services.seed_demo
+```
+
+The existing model training commands below create the production artifact. Schedule the existing `RiskSnapshot` prediction job or invoke the training/scoring workflow at the institution's agreed weekly cadence. Deploy the Next.js frontend to Vercel with `NEXT_PUBLIC_API_URL` set to the public backend URL, and deploy FastAPI with `DATABASE_URL`, `JWT_SECRET`, `CORS_ORIGINS`, `INSTITUTIONAL_TIMEZONE`, and provider credentials in the backend environment. Never commit `.env` values.
+
 ## Model Pipeline
 
 The preprocessor derives explicit features from database students and dated academic observations, excluding student IDs and risk-probability proxies from model inputs:

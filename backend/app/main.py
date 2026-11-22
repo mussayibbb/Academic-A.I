@@ -22,15 +22,15 @@ from ai.llm.provider import (
     RiskSummaryEvidence,
     build_provider,
 )
-from ai.risk.predict import DEFAULT_ARTIFACT, load_artifact, predict as predict_risk
+from ai.risk.predict import DEFAULT_ARTIFACT, load_artifact, predict as predict_risk, predict_many as predict_many_risks
 from ai.rag.index import retrieve, retrieve_scoped
 from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import and_, func, inspect, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.orm.attributes import flag_modified
 
 from backend.app.api.auth import router as auth_router
@@ -38,6 +38,13 @@ from backend.app.api.recovery_workflow import router as recovery_workflow_router
 from backend.app.config import BASE_DIR, get_settings
 from backend.app.core.security import CurrentAdmin, CurrentStudent, CurrentTeacher, CurrentUser, get_current_user
 from backend.app.database import get_db
+from backend.app.early_warning_config import (
+    HIGH_PRIORITY_THRESHOLD,
+    MEDIUM_PRIORITY_THRESHOLD,
+    MINIMUM_USABLE_SIGNALS,
+    normalise_positive_shap,
+    priority_for_probability,
+)
 from backend.app.models import (
     AcademicMomentum,
     AcademicDataImportBatch,
@@ -186,6 +193,39 @@ LEARNING_ASSESSMENT_QUESTION_MARKS = 5
 LEARNING_ASSESSMENT_TOTAL_MARKS = 100
 
 
+class EarlyWarningSimulationRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    overrides: dict[str, float] = Field(default_factory=dict)
+
+
+class MeetingInterventionRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    studentId: int
+    slotStart: datetime
+    durationMin: int = Field(ge=5, le=240)
+    note: str = Field(default='', max_length=2000)
+
+
+class TaskInterventionRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    studentId: int
+    taskType: str = Field(min_length=1, max_length=100)
+    dueAt: datetime
+    note: str = Field(default='', max_length=2000)
+
+
+class MentorAlertRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    studentId: int
+    message: str = Field(min_length=1, max_length=2000)
+
+
+class SubjectRecoveryRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    studentId: int
+    subjectId: int | None = None
+
+
 def _institutional_today() -> date:
     return datetime.now(ZoneInfo(settings.institutional_timezone)).date()
 
@@ -215,6 +255,34 @@ app.include_router(recovery_workflow_router, prefix=settings.api_v1_prefix)
 
 def audit(db: Session, user: User, action: str, resource_type: str, resource_id: int | None = None) -> None:
     db.add(AuditLog(actor_user_id=user.id, action=action, resource_type=resource_type, resource_id=str(resource_id) if resource_id else None))
+
+
+def early_warning_teacher_scope(db: Session, user: User) -> tuple[list[int], list[str]]:
+    teacher = db.query(Teacher).filter(Teacher.user_id == user.id).first()
+    if teacher is None:
+        return {
+            'summary': {'signals': 0, 'highPriority': 0, 'watchList': 0, 'recoveredThisMonth': 0, 'modelRefreshedAt': datetime.utcnow().isoformat()},
+            'items': [],
+            'nextPage': None,
+        }
+    courses = db.query(Course).filter(Course.teacher_id == teacher.id).all()
+    course_ids = [item.id for item in courses]
+    sections = sorted({item.section for item in courses if item.section})
+    return course_ids, sections
+
+
+def early_warning_authorized_student(db: Session, user: User, student_id: int) -> Student:
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if student is None:
+        raise HTTPException(status_code=404, detail='Student not found.')
+    course_ids, sections = early_warning_teacher_scope(db, user)
+    authorized = (
+        (student.course_id is not None and student.course_id in course_ids)
+        or (student.course_id is None and student.section in sections)
+    )
+    if not authorized:
+        raise HTTPException(status_code=403, detail='Student is outside the teacher’s assigned scope.')
+    return student
 
 
 def phase3_audit(
@@ -422,40 +490,91 @@ def coerce_datetime(value: Any) -> datetime | None:
     return None
 
 
-def student_features(student: Student, db: Session) -> dict[str, float]:
-    observations = db.query(AcademicMomentum).filter(AcademicMomentum.student_id == student.id).order_by(AcademicMomentum.observed_at, AcademicMomentum.id).all()
-    grouped: dict[str, list[float]] = {}
+def student_feature_batch(
+    students: list[Student],
+    db: Session,
+) -> tuple[dict[int, dict[str, float]], dict[int, dict[str, dict[str, Any]]]]:
+    if not students:
+        return {}, {}
+
+    student_ids = [student.id for student in students]
+    grouped: dict[int, dict[str, list[float]]] = {}
+    imported_attendance: dict[int, list[float]] = {}
+    imported_assessment: dict[int, list[float]] = {}
+    observations = db.query(AcademicMomentum).filter(
+        AcademicMomentum.student_id.in_(student_ids),
+    ).order_by(
+        AcademicMomentum.student_id,
+        AcademicMomentum.observed_at,
+        AcademicMomentum.id,
+    ).all()
     for observation in observations:
-        grouped.setdefault(observation.metric, []).append(observation.value)
-    attendance_trend = calculate_momentum(grouped.get('attendance', []))
-    assessment_trend = calculate_momentum(grouped.get('assessment', []))
-    activities = db.query(AcademicMomentum).filter(AcademicMomentum.student_id == student.id, AcademicMomentum.metric == 'activity').order_by(AcademicMomentum.observed_at, AcademicMomentum.id).all()
-    activity_average = sum(item.value for item in activities[-4:]) / max(1, len(activities[-4:]))
-    assigned = db.query(AssignmentStudent.id).filter(AssignmentStudent.student_id == student.id).count()
-    submitted = db.query(Submission.id).filter(Submission.student_id == student.id, Submission.status.in_(['submitted', 'late', 'graded'])).count()
-    slopes = [value for value in (attendance_trend['trend_slope'], assessment_trend['trend_slope']) if value is not None]
-    imported_attendance = [item.value for item in observations if item.metric == 'attendance' and item.import_batch_id is not None]
-    imported_assessment = [item.value for item in observations if item.metric == 'assessment' and item.import_batch_id is not None]
-    return {
-        'attendance': sum(imported_attendance) / len(imported_attendance) if imported_attendance else student.attendance,
-        'assessment': sum(imported_assessment) / len(imported_assessment) if imported_assessment else student.assessment,
-        'previous_gpa': student.previous_gpa,
-        'current_gpa': student.current_gpa,
-        'assignments_completed': student.assignments_completed,
-        'activity_per_week': activity_average,
-        'missing_submissions': float(max(0, assigned - submitted)),
-        'attendance_change': float(attendance_trend['percent_change'] or 0),
-        'assessment_change': float(assessment_trend['percent_change'] or 0),
-        'momentum_score': sum(slopes) / len(slopes) if slopes else 0.0,
-    }
+        metrics = grouped.setdefault(observation.student_id, {})
+        metrics.setdefault(observation.metric, []).append(observation.value)
+        if observation.import_batch_id is not None:
+            if observation.metric == 'attendance':
+                imported_attendance.setdefault(observation.student_id, []).append(observation.value)
+            elif observation.metric == 'assessment':
+                imported_assessment.setdefault(observation.student_id, []).append(observation.value)
+
+    assigned_counts = dict(db.query(
+        AssignmentStudent.student_id,
+        func.count(AssignmentStudent.id),
+    ).filter(
+        AssignmentStudent.student_id.in_(student_ids),
+    ).group_by(AssignmentStudent.student_id).all())
+    submitted_counts = dict(db.query(
+        Submission.student_id,
+        func.count(Submission.id),
+    ).filter(
+        Submission.student_id.in_(student_ids),
+        Submission.status.in_(['submitted', 'late', 'graded']),
+    ).group_by(Submission.student_id).all())
+
+    features_by_student: dict[int, dict[str, float]] = {}
+    momentum_by_student: dict[int, dict[str, dict[str, Any]]] = {}
+    for student in students:
+        metrics = grouped.get(student.id, {})
+        trends = {metric: calculate_momentum(values) for metric, values in metrics.items()}
+        attendance_trend = trends.get('attendance', calculate_momentum([]))
+        assessment_trend = trends.get('assessment', calculate_momentum([]))
+        activities = metrics.get('activity', [])
+        slopes = [
+            trend['trend_slope']
+            for trend in (attendance_trend, assessment_trend)
+            if trend['trend_slope'] is not None
+        ]
+        attendance = imported_attendance.get(student.id, [])
+        assessment = imported_assessment.get(student.id, [])
+        features_by_student[student.id] = {
+            'attendance': sum(attendance) / len(attendance) if attendance else student.attendance,
+            'assessment': sum(assessment) / len(assessment) if assessment else student.assessment,
+            'previous_gpa': student.previous_gpa,
+            'current_gpa': student.current_gpa,
+            'assignments_completed': student.assignments_completed,
+            'activity_per_week': sum(activities[-4:]) / max(1, len(activities[-4:])),
+            'missing_submissions': float(max(
+                0,
+                assigned_counts.get(student.id, 0) - submitted_counts.get(student.id, 0),
+            )),
+            'attendance_change': float(attendance_trend['percent_change'] or 0),
+            'assessment_change': float(assessment_trend['percent_change'] or 0),
+            'momentum_score': sum(slopes) / len(slopes) if slopes else 0.0,
+        }
+        momentum_by_student[student.id] = trends
+    return features_by_student, momentum_by_student
 
 
-def student_risk_view(student: Student, db: Session) -> tuple[dict[str, Any], dict[str, Any]]:
-    try:
-        features = student_features(student, db)
-        prediction = predict_with_active_model(features, db)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=503, detail='Risk model is not trained. Run the documented training command first.') from exc
+def student_features(student: Student, db: Session) -> dict[str, float]:
+    features, _ = student_feature_batch([student], db)
+    return features[student.id]
+
+
+def student_risk_data(
+    student: Student,
+    features: dict[str, float],
+    prediction: dict[str, Any],
+) -> dict[str, Any]:
     student_data = StudentOut.model_validate(student).model_dump()
     student_data.update({
         'attendance': features['attendance'],
@@ -466,7 +585,50 @@ def student_risk_view(student: Student, db: Session) -> tuple[dict[str, Any], di
         'risk_probability_semantics': prediction['risk_probability_semantics'],
         'class_probabilities': prediction['class_probabilities'],
     })
-    return student_data, prediction
+    return student_data
+
+
+def student_risk_views_from_features(
+    students: list[Student],
+    features_by_student: dict[int, dict[str, float]],
+    db: Session,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    if not students:
+        return []
+    try:
+        artifact_path = selected_model_artifact(db)
+        predictions = predict_many_risks(
+            [features_by_student[student.id] for student in students],
+            artifact_path,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail='Risk model is not trained. Run the documented training command first.') from exc
+    return [
+        (student_risk_data(student, features_by_student[student.id], prediction), prediction)
+        for student, prediction in zip(students, predictions)
+    ]
+
+
+def student_risk_views(
+    students: list[Student],
+    db: Session,
+) -> tuple[
+    list[tuple[dict[str, Any], dict[str, Any]]],
+    dict[int, dict[str, float]],
+    dict[int, dict[str, dict[str, Any]]],
+]:
+    features_by_student, momentum_by_student = student_feature_batch(students, db)
+    risk_views = student_risk_views_from_features(students, features_by_student, db)
+    return risk_views, features_by_student, momentum_by_student
+
+
+def student_risk_view(student: Student, db: Session) -> tuple[dict[str, Any], dict[str, Any]]:
+    try:
+        features = student_features(student, db)
+        prediction = predict_with_active_model(features, db)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail='Risk model is not trained. Run the documented training command first.') from exc
+    return student_risk_data(student, features, prediction), prediction
 
 
 def model_feature_schema() -> list[str]:
@@ -2591,7 +2753,8 @@ def current_profile(user: CurrentUser) -> dict[str, Any]:
 @app.get(f'{settings.api_v1_prefix}/dashboard/teacher')
 def teacher_dashboard(user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
     students = db.query(Student).order_by(Student.full_name).all()
-    current_students = [student_risk_view(student, db)[0] for student in students]
+    risk_views, _, _ = student_risk_views(students, db)
+    current_students = [student_data for student_data, _ in risk_views]
     assignments = db.query(Assignment).filter(Assignment.status == 'active').all()
     submissions = db.query(Submission).all()
     pending_reviews = sum(item.status in {'submitted', 'late'} and item.grade is None for item in submissions)
@@ -2657,17 +2820,17 @@ def list_students(
         query = query.filter(Student.section == section)
     if course:
         query = query.filter(Student.course.has(Course.code == course))
+    students = query.all()
+    risk_views, _, momentum_by_student = student_risk_views(students, db)
     response_items = []
-    for student in query.all():
-        values, _ = student_risk_view(student, db)
+    for values, _ in risk_views:
         if attendance_min is not None and values['attendance'] < attendance_min:
             continue
         if attendance_max is not None and values['attendance'] > attendance_max:
             continue
         if risk and values['risk_level'] != risk.upper():
             continue
-        observations = db.query(AcademicMomentum.value).filter(AcademicMomentum.student_id == student.id, AcademicMomentum.metric == 'assessment').order_by(AcademicMomentum.observed_at).all()
-        values['momentum_trend'] = calculate_momentum([row[0] for row in observations])['classification']
+        values['momentum_trend'] = momentum_by_student[values['id']].get('assessment', calculate_momentum([]))['classification']
         if momentum and values['momentum_trend'] != momentum.upper():
             continue
         response_items.append(values)
@@ -6368,7 +6531,8 @@ def phase3_governance_audit(
 @app.get(f'{settings.api_v1_prefix}/risk/monitoring')
 def risk_monitoring(user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
     students = db.query(Student).all()
-    current_predictions = [student_risk_view(student, db)[1] for student in students]
+    risk_views, _, momentum_by_student = student_risk_views(students, db)
+    current_predictions = [prediction for _, prediction in risk_views]
     counts = {level: sum(prediction['risk_level'] == level for prediction in current_predictions) for level in ('HIGH', 'MEDIUM', 'LOW')}
     history = db.query(RiskSnapshot).order_by(RiskSnapshot.recorded_at).all()
     transition_report = risk_transition_report(db)
@@ -6380,22 +6544,19 @@ def risk_monitoring(user: CurrentTeacher, db: Session = Depends(get_db)) -> dict
     } for item in transition_report['transitions']]
     momentum = {level: 0 for level in ('IMPROVING', 'STABLE', 'DECLINING', 'VOLATILE', 'INSUFFICIENT_DATA')}
     for student in students:
-        observations = db.query(AcademicMomentum.value).filter(AcademicMomentum.student_id == student.id, AcademicMomentum.metric == 'assessment').order_by(AcademicMomentum.observed_at).all()
-        level = calculate_momentum([row[0] for row in observations])['classification']
+        level = momentum_by_student[student.id].get('assessment', calculate_momentum([]))['classification']
         momentum[level] = momentum.get(level, 0) + 1
     return {'distribution': counts, 'momentum': momentum, 'transitions': transitions, 'transition_history_status': transition_report['history_status'], 'students_with_insufficient_transition_history': transition_report['students_with_insufficient_history'], 'history_note': 'Historical saved class labels; they may predate the current argmax policy. Current distribution is calculated from the current model.', 'history': [{'student_id': item.student_id, 'risk_level': item.risk_level, 'recorded_at': item.recorded_at.isoformat()} for item in history]}
 
 
 @app.get(f'{settings.api_v1_prefix}/risk/high-risk-demo')
 def high_risk_demo(user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
-    candidates = []
-    try:
-        for student in db.query(Student).order_by(Student.student_id).all():
-            features = student_features(student, db)
-            prediction = predict_with_active_model(features, db)
-            candidates.append((student, features, prediction))
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=503, detail='Risk model is not trained. Run the documented training command first.') from exc
+    students = db.query(Student).order_by(Student.student_id).all()
+    risk_views, features_by_student, _ = student_risk_views(students, db)
+    candidates = [
+        (student, features_by_student[student.id], prediction)
+        for student, (_, prediction) in zip(students, risk_views)
+    ]
     if not candidates:
         raise HTTPException(status_code=404, detail='No existing student records are available for the demonstration.')
     predicted_high = [item for item in candidates if item[2]['risk_level'] == 'HIGH']
@@ -6419,39 +6580,464 @@ def high_risk_demo(user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[
 
 
 @app.get(f'{settings.api_v1_prefix}/early-warnings')
-def early_warnings(user: CurrentTeacher, db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    warnings = []
-    for student in db.query(Student).all():
-        features = student_features(student, db)
-        prediction = predict_with_active_model(features, db)
-        context = {'student_id': student.id, 'name': student.full_name, 'department': student.department, 'course': student.course.code if student.course else None, 'detected_at': datetime.utcnow().isoformat(), 'risk_level': prediction['risk_level'], 'risk_probability': prediction['risk_probability']}
-        snapshots = db.query(RiskSnapshot).filter(RiskSnapshot.student_id == student.id).order_by(RiskSnapshot.recorded_at).all()
+def early_warnings(
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+    severity: str | None = Query(default=None),
+    department: str | None = Query(default=None),
+    course: str | None = Query(default=None),
+    days: int = Query(default=30, ge=1, le=365),
+    q: str | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    pageSize: int = Query(default=50, ge=1, le=50),
+) -> dict[str, Any]:
+    teacher = db.query(Teacher).filter(Teacher.user_id == user.id).first()
+    if teacher is None:
+        return {
+            'summary': {'signals': 0, 'highPriority': 0, 'watchList': 0, 'recoveredThisMonth': 0, 'modelRefreshedAt': datetime.utcnow().isoformat()},
+            'items': [],
+            'nextPage': None,
+        }
+
+    courses = db.query(Course).filter(Course.teacher_id == teacher.id).all()
+    course_ids = [item.id for item in courses]
+    sections = sorted({item.section for item in courses if item.section})
+    if not course_ids:
+        return {
+            'summary': {'signals': 0, 'highPriority': 0, 'watchList': 0, 'recoveredThisMonth': 0, 'modelRefreshedAt': datetime.utcnow().isoformat()},
+            'items': [],
+            'nextPage': None,
+        }
+
+    assigned_filter = or_(
+        Student.course_id.in_(course_ids),
+        and_(Student.course_id.is_(None), Student.section.in_(sections)) if sections else False,
+    )
+    students_query = db.query(Student).options(joinedload(Student.course)).filter(assigned_filter)
+    if department:
+        students_query = students_query.filter(Student.department == department)
+    if course:
+        students_query = students_query.filter(or_(Course.code == course, Course.name == course))
+        students_query = students_query.join(Course, Course.id == Student.course_id)
+    if q and q.strip():
+        needle = f'%{q.strip()}%'
+        students_query = students_query.filter(or_(Student.full_name.ilike(needle), Student.student_id.ilike(needle)))
+    all_students = students_query.order_by(Student.full_name, Student.id).all()
+
+    if not all_students:
+        return {
+            'summary': {'signals': 0, 'highPriority': 0, 'watchList': 0, 'recoveredThisMonth': 0, 'modelRefreshedAt': datetime.utcnow().isoformat()},
+            'items': [],
+            'nextPage': None,
+        }
+
+    risk_views, features_by_student, momentum_by_student = student_risk_views(all_students, db)
+    snapshots_by_student: dict[int, list[RiskSnapshot]] = {}
+    for snapshot in db.query(RiskSnapshot).filter(
+        RiskSnapshot.student_id.in_([student.id for student in all_students]),
+    ).order_by(RiskSnapshot.student_id, RiskSnapshot.recorded_at).all():
+        snapshots_by_student.setdefault(snapshot.student_id, []).append(snapshot)
+
+    items: list[dict[str, Any]] = []
+    signals_detected = 0
+    for student, (_, prediction) in zip(all_students, risk_views):
+        features = features_by_student[student.id]
+        probability = float(prediction['risk_probability'] if prediction['risk_level'] == 'HIGH' else prediction['class_probabilities'].get('HIGH', prediction['risk_probability']))
+        priority = priority_for_probability(probability)
+        risk_class = 'At risk' if priority == 'High' else 'Watch' if priority == 'Medium' else 'Normal'
+
+        usable_signals = sum([
+            student.attendance > 0,
+            student.assessment > 0,
+            student.previous_gpa > 0 or student.current_gpa > 0,
+            features['missing_submissions'] >= 0,
+            bool(momentum_by_student[student.id].get('attendance') or momentum_by_student[student.id].get('assessment')),
+        ])
+        if usable_signals < MINIMUM_USABLE_SIGNALS:
+            priority = 'Low'
+            risk_class = 'Normal'
+            probability = 0.0
+
+        factor_labels = {
+            'attendance': 'Attendance',
+            'assessment': 'Assessment scores',
+            'missing_submissions': 'Missing submissions',
+            'previous_gpa': 'Previous GPA',
+            'current_gpa': 'Internal marks',
+            'activity_per_week': 'Portal activity',
+            'attendance_change': 'Attendance decline',
+            'assessment_change': 'Assessment decline',
+        }
+        try:
+            explanation = explain_with_active_model(features, db, target_class='HIGH')
+            positive = [(name, value) for name, value in explanation['contributions'].items() if value > 0]
+            positive.sort(key=lambda item: item[1], reverse=True)
+            top_factor_name = positive[0][0] if positive else 'Not enough data yet'
+        except (FileNotFoundError, ValueError):
+            top_factor_name = 'Not enough data yet'
+        top_factor = factor_labels.get(top_factor_name, top_factor_name.replace('_', ' ').capitalize())
+
+        student_signals = 0
+        if features['attendance_change'] < -10:
+            student_signals += 1
+        if features['assessment_change'] < -10:
+            student_signals += 1
+        if features['missing_submissions'] > 0:
+            student_signals += 1
+        snapshots = snapshots_by_student.get(student.id, [])
         if prediction['risk_level'] == 'HIGH':
-            warnings.append({**context, 'severity': 'HIGH', 'signal': 'High risk', 'change': f'{prediction["risk_probability"]:.0%} probability of HIGH', 'reason': 'Current academic risk rating requires a faculty check-in.'})
+            student_signals += 1
         if len(snapshots) > 1:
             previous, current = snapshots[-2], snapshots[-1]
             order = {'LOW': 0, 'MEDIUM': 1, 'HIGH': 2}
             if order.get(current.risk_level, 0) > order.get(previous.risk_level, 0):
-                warnings.append({**context, 'severity': current.risk_level, 'signal': 'Risk increase', 'change': f'{previous.risk_level} to {current.risk_level}', 'reason': 'Consecutive saved risk snapshots show an increased level.'})
-            if previous.risk_level != 'HIGH' and current.risk_level == 'HIGH':
-                warnings.append({**context, 'severity': 'HIGH', 'signal': 'New high risk', 'change': f'{previous.risk_level} to HIGH', 'reason': 'A new saved snapshot entered the high-risk category.'})
-        if features['attendance_change'] < -10:
-            warnings.append({**context, 'severity': 'HIGH' if features['attendance_change'] < -20 else 'MEDIUM', 'signal': 'Attendance decline', 'change': f'{features["attendance_change"]:.1f}% recent change', 'reason': 'Dated attendance observations are declining.'})
-        if features['assessment_change'] < -10:
-            warnings.append({**context, 'severity': 'HIGH' if features['assessment_change'] < -20 else 'MEDIUM', 'signal': 'Assessment decline', 'change': f'{features["assessment_change"]:.1f}% recent change', 'reason': 'Dated assessment observations are declining.'})
-        for metric, signal_name in (('activity', 'Activity decline'), ('assignment_submission', 'Assignment decline')):
-            history = db.query(AcademicMomentum.value).filter(AcademicMomentum.student_id == student.id, AcademicMomentum.metric == metric).order_by(AcademicMomentum.observed_at).all()
-            trend = calculate_momentum([item[0] for item in history])
-            if trend['classification'] == 'DECLINING':
-                warnings.append({**context, 'severity': 'MEDIUM', 'signal': signal_name, 'change': f'{trend["percent_change"]:.1f}% recent change' if trend['percent_change'] is not None else 'Declining trend', 'reason': f'Dated {metric.replace("_", " ")} observations are declining.'})
-        if features['missing_submissions'] > 0:
-            warnings.append({**context, 'severity': 'MEDIUM', 'signal': 'Missing submissions', 'change': f'{int(features["missing_submissions"])} missing', 'reason': 'Assigned work has no recorded submission.'})
-    return warnings
+                student_signals += 1
+        signals_detected += student_signals
+
+        if severity:
+            wanted = severity.strip().upper()
+            wanted = {'AT RISK': 'HIGH', 'WATCH': 'MEDIUM', 'NORMAL': 'LOW'}.get(wanted, wanted)
+            if wanted not in {'HIGH', 'MEDIUM', 'LOW'}:
+                raise HTTPException(status_code=422, detail='severity must be High, Medium, or Low.')
+            if priority.upper() != wanted:
+                continue
+
+        items.append({
+            'studentId': student.id,
+            'name': student.full_name,
+            'department': student.department,
+            'riskProbability': round(probability, 6),
+            'riskClass': risk_class,
+            'priority': priority,
+            'topFactor': top_factor,
+            '_signalCount': student_signals,
+        })
+
+    high_priority = sum(item['priority'] == 'High' for item in items)
+    watch_list = sum(item['priority'] == 'Medium' for item in items)
+    month_cutoff = datetime.utcnow() - timedelta(days=30)
+    recovered = 0
+    for student_id in [item['studentId'] for item in items]:
+        snapshots = [
+            snapshot for snapshot in snapshots_by_student.get(student_id, [])
+            if snapshot.recorded_at >= month_cutoff
+        ]
+        if len(snapshots) >= 2:
+            order = {'LOW': 0, 'MEDIUM': 1, 'HIGH': 2}
+            if order.get(snapshots[-1].risk_level, 0) < order.get(snapshots[0].risk_level, 0):
+                recovered += 1
+
+    items.sort(key=lambda item: (
+        -item['riskProbability'],
+        -item['_signalCount'],
+        item['name'].casefold(),
+        item['studentId'],
+    ))
+    start = (page - 1) * pageSize
+    paged = [{key: value for key, value in item.items() if key != '_signalCount'} for item in items[start:start + pageSize]]
+    next_page = page + 1 if start + pageSize < len(items) else None
+    return {
+        'summary': {
+            'signals': signals_detected,
+            'highPriority': high_priority,
+            'watchList': watch_list,
+            'recoveredThisMonth': recovered,
+            'modelRefreshedAt': datetime.utcnow().isoformat(),
+        },
+        'items': paged,
+        'nextPage': next_page,
+    }
+
+
+@app.get(f'{settings.api_v1_prefix}/early-warnings/{{student_id}}')
+def early_warning_detail(student_id: int, user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
+    student = early_warning_authorized_student(db, user, student_id)
+    features = student_features(student, db)
+    prediction = predict_with_active_model(features, db)
+    class_probabilities = prediction['class_probabilities']
+    probability = float(class_probabilities.get('HIGH', prediction['risk_probability'] if prediction['risk_level'] == 'HIGH' else 0.0))
+    priority = priority_for_probability(probability)
+    risk_class = 'At risk' if priority == 'High' else 'Watch' if priority == 'Medium' else 'Normal'
+
+    usable_signals = sum([
+        student.attendance > 0,
+        student.assessment > 0,
+        student.previous_gpa > 0 or student.current_gpa > 0,
+        features['missing_submissions'] >= 0,
+        bool(db.query(AcademicMomentum.id).filter(AcademicMomentum.student_id == student.id).first()),
+    ])
+    insufficient = usable_signals < MINIMUM_USABLE_SIGNALS
+    if insufficient:
+        probability = 0.0
+        priority, risk_class = 'Low', 'Normal'
+
+    explanation = explain_with_active_model(features, db, target_class='HIGH')
+    normalised = normalise_positive_shap(list(explanation['contributions'].items()))
+    positive = sorted(normalised.items(), key=lambda item: item[1], reverse=True)
+
+    labels = {
+        'attendance': ('Attendance', '%'),
+        'assessment': ('Assessment scores', '%'),
+        'missing_submissions': ('Missing submissions', 'assignments'),
+        'previous_gpa': ('Previous GPA', 'GPA'),
+        'current_gpa': ('Internal marks', '%'),
+        'activity_per_week': ('Portal activity', 'logins/week'),
+        'attendance_change': ('Attendance decline', 'points'),
+        'assessment_change': ('Assessment decline', 'points'),
+        'momentum_score': ('Academic momentum', 'points'),
+        'assignments_completed': ('Assignments completed', '%'),
+    }
+    factors: list[dict[str, Any]] = []
+    for name, contribution in positive[:5]:
+        label, unit = labels.get(name, (name.replace('_', ' ').capitalize(), ''))
+        current_value = float(features.get(name, 0.0))
+        previous_value = float(features.get(f'{name}_change', current_value))
+        detail = f'{current_value:.1f}{unit if unit == "%" else ""} ' + (
+            f'({contribution:+.3f} points in P(HIGH))'
+        )
+        factors.append({
+            'key': name,
+            'label': label,
+            'detail': detail,
+            'currentValue': current_value,
+            'previousValue': previous_value,
+            'unit': unit,
+            'contributionShare': round(contribution, 6),
+        })
+
+    snapshots = db.query(RiskSnapshot).filter(
+        RiskSnapshot.student_id == student.id,
+    ).order_by(RiskSnapshot.recorded_at.asc()).all()
+    trend = [
+        {'weekStart': snapshot.recorded_at.date().isoformat(), 'risk': round(float(snapshot.probability), 6)}
+        for snapshot in snapshots[-8:]
+    ]
+    if trend:
+        week_change = round((trend[-1]['risk'] - trend[-2]['risk']) * 100, 1) if len(trend) > 1 else 0.0
+    else:
+        week_change = 0.0
+
+    no_action_features = dict(features)
+    no_action_features['attendance'] = max(0.0, features['attendance'] + features['attendance_change'] * 2)
+    no_action_features['assessment'] = max(0.0, features['assessment'] + features['assessment_change'] * 2)
+    no_action_features['missing_submissions'] = max(0.0, features['missing_submissions'])
+    no_action = predict_with_active_model(no_action_features, db)
+    no_action_probability = float(no_action['class_probabilities'].get('HIGH', no_action['risk_probability']))
+
+    plan_features = dict(features)
+    plan_features['attendance'] = max(features['attendance'], 85.0)
+    plan_features['missing_submissions'] = 0.0
+    plan_features['assessment'] = max(features['assessment'], student.assessment)
+    with_plan = predict_with_active_model(plan_features, db)
+    with_plan_probability = float(with_plan['class_probabilities'].get('HIGH', with_plan['risk_probability']))
+
+    max_class_probability = max(float(value) for value in class_probabilities.values()) if class_probabilities else 0.0
+    confidence = round(max(0.0, min(1.0, max_class_probability * (usable_signals / 10))), 6)
+
+    precautions_by_factor = {
+        'attendance': 'Agree on an attendance target of 85% and review it every week.',
+        'assessment': 'Offer a short catch-up quiz with written feedback within 48 hours.',
+        'missing_submissions': 'Set clear deadlines and allow one supervised resubmission.',
+        'current_gpa': 'Walk through the marks breakdown and plan the remaining components.',
+        'previous_gpa': 'Walk through the marks breakdown and plan the remaining components.',
+        'activity_per_week': 'Ask what is blocking portal use and re-enable deadline reminders.',
+    }
+    precautions = [
+        {
+            'factorKey': factor['key'],
+            'text': precautions_by_factor.get(factor['key'], f'Review {factor["label"].lower()} with the student and agree on a small check-in plan.'),
+        }
+        for factor in factors[:3]
+    ]
+
+    interventions = db.query(Intervention).filter(
+        Intervention.student_id == student.id,
+    ).order_by(Intervention.created_at.desc()).all()
+    actions = [{
+        'type': item.type or item.title,
+        'label': item.title,
+        'at': item.created_at.isoformat(),
+        'by': item.teacher_id,
+    } for item in interventions]
+
+    audit(db, user, 'early_warning.detail.viewed', 'student', student.id)
+    db.commit()
+    return {
+        'studentId': student.id,
+        'name': student.full_name,
+        'department': student.department,
+        'riskProbability': round(probability, 6),
+        'riskClass': risk_class,
+        'priority': priority,
+        'confidence': confidence,
+        'signalsUsed': usable_signals,
+        'weekChange': week_change,
+        'insufficientData': insufficient,
+        'trend': trend,
+        'forecast': {
+            'noAction': round(min(1.0, max(0.0, no_action_probability)), 6),
+            'withPlan': round(min(1.0, max(0.0, with_plan_probability)), 6),
+        },
+        'factors': factors,
+        'precautions': precautions,
+        'actions': actions,
+    }
+
+
+SIMULATION_REQUESTS: dict[tuple[int, int], list[datetime]] = {}
+
+
+@app.post(f'{settings.api_v1_prefix}/early-warnings/{{student_id}}/simulate')
+def early_warning_simulate(
+    student_id: int,
+    payload: EarlyWarningSimulationRequest,
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    now = datetime.utcnow()
+    key = (user.id, student_id)
+    recent = [stamp for stamp in SIMULATION_REQUESTS.get(key, []) if now - stamp < timedelta(minutes=1)]
+    if len(recent) >= 30:
+        raise HTTPException(status_code=429, detail='Simulation rate limit exceeded. Try again shortly.')
+    recent.append(now)
+    SIMULATION_REQUESTS[key] = recent
+
+    student = early_warning_authorized_student(db, user, student_id)
+    feature_overrides = {}
+    mapping = {
+        'attendancePct': 'attendance',
+        'assessmentAvg': 'assessment',
+        'missingSubmissions': 'missing_submissions',
+        'portalLoginsPerWeek': 'activity_per_week',
+        'internalMarksPct': 'assessment',
+    }
+    for key_name, value in payload.overrides.items():
+        feature_name = mapping.get(key_name)
+        if feature_name is None:
+            raise HTTPException(status_code=422, detail=f'Unsupported what-if factor: {key_name}')
+        if not math.isfinite(float(value)):
+            raise HTTPException(status_code=422, detail=f'{key_name} must be finite.')
+        if feature_name in {'attendance', 'assessment'} and not 0 <= float(value) <= 100:
+            raise HTTPException(status_code=422, detail=f'{key_name} must be from 0 to 100.')
+        if feature_name in {'missing_submissions', 'activity_per_week'} and float(value) < 0:
+            raise HTTPException(status_code=422, detail=f'{key_name} must be zero or greater.')
+        feature_overrides[feature_name] = float(value)
+    if not feature_overrides:
+        raise HTTPException(status_code=422, detail='Provide at least one supported what-if factor.')
+
+    simulated = simulate_student_risk(student, db, feature_overrides)
+    result = simulated['simulated_prediction']
+    probability = float(result['class_probabilities'].get('HIGH', result['risk_probability'] if result['risk_level'] == 'HIGH' else 0.0))
+    risk_class = 'At risk' if probability >= HIGH_PRIORITY_THRESHOLD else 'Watch' if probability >= MEDIUM_PRIORITY_THRESHOLD else 'Normal'
+    audit(db, user, 'early_warning.simulated', 'student', student.id)
+    db.commit()
+    return {
+        'riskProbability': round(probability, 6),
+        'riskClass': risk_class,
+    }
+
+
+def save_early_warning_intervention(
+    db: Session,
+    user: User,
+    student: Student,
+    *,
+    action_type: str,
+    title: str,
+    body: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    teacher = db.query(Teacher).filter(Teacher.user_id == user.id).first()
+    item = Intervention(
+        student_id=student.id,
+        teacher_id=teacher.id if teacher else None,
+        type=action_type,
+        payload=payload,
+        title=title,
+        body=body,
+        status='saved',
+        sent_at=datetime.utcnow(),
+    )
+    db.add(item)
+    db.flush()
+    if student.user_id:
+        db.add(Notification(
+            user_id=student.user_id,
+            kind='support',
+            title=title,
+            body=body,
+            metadata_json={'intervention_id': item.id, 'type': action_type, **payload},
+        ))
+    audit(db, user, f'early_warning.{action_type}', 'intervention', item.id)
+    db.commit()
+    db.refresh(item)
+    return {
+        'id': item.id,
+        'type': action_type,
+        'label': item.title,
+        'at': item.created_at.isoformat(),
+        'by': item.teacher_id,
+        'payload': payload,
+        'status': item.status,
+    }
+
+
+@app.post(f'{settings.api_v1_prefix}/interventions/meetings', status_code=201)
+def early_warning_meeting(payload: MeetingInterventionRequest, user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
+    student = early_warning_authorized_student(db, user, payload.studentId)
+    body = f'{payload.note.strip()} Meeting scheduled for {payload.slotStart.isoformat()} for {payload.durationMin} minutes.' if payload.note.strip() else f'Meeting scheduled for {payload.slotStart.isoformat()} for {payload.durationMin} minutes.'
+    return save_early_warning_intervention(
+        db, user, student,
+        action_type='meeting',
+        title='Host a meeting',
+        body=body,
+        payload={'slotStart': payload.slotStart.isoformat(), 'durationMin': payload.durationMin, 'note': payload.note},
+    )
+
+
+@app.post(f'{settings.api_v1_prefix}/interventions/tasks', status_code=201)
+def early_warning_task(payload: TaskInterventionRequest, user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
+    student = early_warning_authorized_student(db, user, payload.studentId)
+    body = f'{payload.taskType}. Due {payload.dueAt.isoformat()}.' + (f' {payload.note.strip()}' if payload.note.strip() else '')
+    return save_early_warning_intervention(
+        db, user, student,
+        action_type='task',
+        title='Assign a recovery task',
+        body=body,
+        payload={'taskType': payload.taskType, 'dueAt': payload.dueAt.isoformat(), 'note': payload.note},
+    )
+
+
+@app.post(f'{settings.api_v1_prefix}/interventions/mentor-alert', status_code=201)
+def early_warning_mentor_alert(payload: MentorAlertRequest, user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
+    student = early_warning_authorized_student(db, user, payload.studentId)
+    return save_early_warning_intervention(
+        db, user, student,
+        action_type='mentor_alert',
+        title='Alert class mentor',
+        body=payload.message,
+        payload={'message': payload.message},
+    )
+
+
+@app.post(f'{settings.api_v1_prefix}/subject-recovery/enrol', status_code=201)
+def early_warning_subject_recovery(payload: SubjectRecoveryRequest, user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
+    student = early_warning_authorized_student(db, user, payload.studentId)
+    body = 'Student added to subject recovery.' + (f' Subject ID: {payload.subjectId}.' if payload.subjectId else '')
+    return save_early_warning_intervention(
+        db, user, student,
+        action_type='subject_recovery',
+        title='Add to Subject recovery',
+        body=body,
+        payload={'subjectId': payload.subjectId},
+    )
 
 
 @app.get(f'{settings.api_v1_prefix}/risk/feature-importance')
 def risk_feature_importance(user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
-    rows = [student_features(student, db) for student in db.query(Student).limit(100).all()]
+    students = db.query(Student).limit(100).all()
+    features_by_student, _ = student_feature_batch(students, db)
+    rows = [features_by_student[student.id] for student in students]
     try:
         return global_importance(rows)
     except FileNotFoundError as exc:
@@ -6953,14 +7539,23 @@ def export_report(user: CurrentTeacher, db: Session = Depends(get_db), report_ty
     output = io.StringIO()
     writer = csv.writer(output)
     students = db.query(Student).order_by(Student.student_id).all()
-    current_predictions = {student.id: student_risk_view(student, db)[1] for student in students} if report_type in {'risk', 'class'} else {}
+    features_by_student: dict[int, dict[str, float]] = {}
+    momentum_by_student: dict[int, dict[str, dict[str, Any]]] = {}
+    current_predictions: dict[int, dict[str, Any]] = {}
+    if report_type in {'risk', 'class'}:
+        features_by_student, momentum_by_student = student_feature_batch(students, db)
+        risk_views = student_risk_views_from_features(students, features_by_student, db)
+        current_predictions = {
+            student.id: prediction
+            for student, (_, prediction) in zip(students, risk_views)
+        }
     if report_type == 'risk':
         writer.writerow(['student_id', 'name', 'department', 'risk_level', 'risk_class_probability', 'attendance', 'assessment', 'current_gpa', 'momentum_signal'])
         for student in students:
-            history = db.query(AcademicMomentum.value).filter(AcademicMomentum.student_id == student.id, AcademicMomentum.metric == 'assessment').order_by(AcademicMomentum.observed_at).all()
             prediction = current_predictions[student.id]
-            features = student_features(student, db)
-            writer.writerow([student.student_id, student.full_name, student.department, prediction['risk_level'], prediction['risk_probability'], features['attendance'], features['assessment'], student.current_gpa, calculate_momentum([row[0] for row in history])['classification']])
+            features = features_by_student[student.id]
+            momentum = momentum_by_student[student.id].get('assessment', calculate_momentum([]))
+            writer.writerow([student.student_id, student.full_name, student.department, prediction['risk_level'], prediction['risk_probability'], features['attendance'], features['assessment'], student.current_gpa, momentum['classification']])
     elif report_type == 'class':
         writer.writerow(['metric', 'count'])
         writer.writerow(['students', len(students)])

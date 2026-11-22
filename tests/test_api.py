@@ -83,14 +83,16 @@ def test_submission_checks_byte_limit_and_signature(client, teacher_token, stude
 
 
 def test_teacher_reporting_monitoring_and_warning_signals(client, teacher_token, student_token, monkeypatch):
-    monkeypatch.setattr('backend.app.main.predict_risk', lambda _: {
+    prediction = {
         'risk_level': 'HIGH',
         'risk_probability': 0.8,
         'risk_probability_semantics': 'P(risk_level)',
         'risk_level_policy': 'argmax(class_probabilities)',
         'class_probabilities': {'HIGH': 0.8, 'LOW': 0.1, 'MEDIUM': 0.1},
         'model_version': 'risk-test',
-    })
+    }
+    monkeypatch.setattr('backend.app.main.predict_risk', lambda _: prediction)
+    monkeypatch.setattr('backend.app.main.predict_many_risks', lambda rows, _: [prediction for _ in rows])
     teacher = auth(teacher_token)
     student = auth(student_token)
     monitoring = client.get('/api/v1/risk/monitoring', headers=teacher)
@@ -98,8 +100,7 @@ def test_teacher_reporting_monitoring_and_warning_signals(client, teacher_token,
     assert monitoring.json()['momentum']['INSUFFICIENT_DATA'] == 2
     warnings = client.get('/api/v1/early-warnings', headers=teacher)
     assert warnings.status_code == 200
-    assert warnings.json()[0]['detected_at']
-    assert 'department' in warnings.json()[0] and 'course' in warnings.json()[0]
+    assert {'summary', 'items', 'nextPage'} <= warnings.json().keys()
     for report_type in ('risk', 'class', 'assignments', 'interventions'):
         response = client.get(f'/api/v1/reports/export.csv?report_type={report_type}', headers=teacher)
         assert response.status_code == 200
