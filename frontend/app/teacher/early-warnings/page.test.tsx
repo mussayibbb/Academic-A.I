@@ -78,8 +78,19 @@ describe('teacher early warnings', () => {
     const meeting = await screen.findByRole('button', { name: /Host a meeting/i });
     meeting.click();
     await waitFor(() => expect(screen.getByText('Schedule a meeting')).toBeTruthy());
+    fireEvent.click(screen.getByRole('button', { name: 'Tomorrow 10:00 am' }));
+    expect((screen.getByLabelText('Meeting date and time') as HTMLInputElement).value).toMatch(/T10:00$/);
+    fireEvent.change(screen.getByLabelText('Meeting note'), { target: { value: 'Review attendance supports' } });
     screen.getByRole('button', { name: 'Confirm' }).click();
     expect(await screen.findByText(/Host a meeting ·/)).toBeTruthy();
+    expect(await screen.findByText('Host a meeting saved')).toBeTruthy();
+    expect(mocks.api).toHaveBeenCalledWith(
+      '/api/v1/interventions/meetings',
+      expect.objectContaining({
+        method: 'POST',
+        body: expect.stringContaining('"note":"Review attendance supports"'),
+      }),
+    );
   }, 15000);
 
   it('keeps detail and the last prediction when simulation fails', async () => {
