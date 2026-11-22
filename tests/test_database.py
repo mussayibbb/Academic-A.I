@@ -4,6 +4,7 @@ import pytest
 from backend.app.database import session
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
@@ -659,7 +660,7 @@ def test_intervention_outcome_migration_matches_orm_and_preserves_legacy_rows(mo
     with engine.connect() as connection:
         assert connection.execute(text(
             'SELECT version_num FROM alembic_version'
-        )).scalar_one() == 'k2l3m4n5o6'
+        )).scalar_one() == ScriptDirectory.from_config(configuration).get_current_head()
         assert connection.execute(text(
             'SELECT student_id, teacher_id, title, body, status FROM interventions WHERE id = :id'
         ), {'id': intervention_id}).one() == (

@@ -3,10 +3,12 @@ from datetime import datetime, timezone
 
 import pandas as pd
 import pytest
+from sqlalchemy import event
 
 from ai.risk.features import FEATURES
 from ai.risk.predict import predict
 from ai.risk.train import train
+from backend.app.models import Student
 
 
 def build_model(tmp_path):
@@ -27,6 +29,7 @@ def test_prediction_shap_and_intervention_review_flow(client, teacher_token, stu
     features, artifact = build_model(tmp_path)
     monkeypatch.setattr('backend.app.main.settings.llm_model_name', 'mock-development')
     monkeypatch.setattr('backend.app.main.predict_risk', lambda item: predict(item, artifact))
+    monkeypatch.setattr('backend.app.main.predict_many_risks', lambda rows, _: [predict(item, artifact) for item in rows])
     from ai.explainability.service import explain_student
     monkeypatch.setattr('backend.app.main.explain_student', lambda item, target_class=None: explain_student(item, artifact, target_class=target_class))
     teacher = {'Authorization': f'Bearer {teacher_token}'}
@@ -99,6 +102,7 @@ def test_current_risk_views_ignore_stale_seed_classifications(client, teacher_to
         'model_version': 'risk-test',
     }
     monkeypatch.setattr('backend.app.main.predict_risk', lambda _: fresh_prediction)
+    monkeypatch.setattr('backend.app.main.predict_many_risks', lambda rows, _: [fresh_prediction for _ in rows])
     headers = {'Authorization': f'Bearer {teacher_token}'}
     seeded_student_id = client.app.state.test_student_id
 
@@ -123,13 +127,46 @@ def test_current_risk_views_ignore_stale_seed_classifications(client, teacher_to
     assert 'Historical saved class labels' in monitoring['history_note']
     assert all('risk_probability' not in snapshot for snapshot in monitoring['history'])
 
-    monkeypatch.setattr('backend.app.main.student_features', lambda student, db: {name: 0.0 for name in FEATURES} | {'attendance_change': -25.0})
     warnings = client.get('/api/v1/early-warnings', headers=headers).json()
-    assert warnings
-    assert all(item['risk_level'] == 'MEDIUM' for item in warnings)
+    assert warnings['dataStatus'] == 'unvalidated-demo-model'
+    assert warnings['items'] == []
 
     report = client.get('/api/v1/reports/export.csv?report_type=risk', headers=headers).text
     assert 'T-001,Student One,,MEDIUM,0.7' in report
+
+
+def test_teacher_dashboard_batches_student_risk_queries(client, teacher_token):
+    with client.app.state.test_session_factory() as db:
+        db.add_all([
+            Student(
+                student_id=f'T-{index:03}',
+                full_name=f'Student {index:03}',
+                section='A',
+            )
+            for index in range(3, 35)
+        ])
+        db.commit()
+
+    database_engine = client.app.state.test_session_factory.kw['bind']
+    select_count = 0
+
+    def count_selects(conn, cursor, statement, parameters, context, executemany):
+        nonlocal select_count
+        if statement.lstrip().upper().startswith('SELECT'):
+            select_count += 1
+
+    event.listen(database_engine, 'before_cursor_execute', count_selects)
+    try:
+        response = client.get(
+            '/api/v1/dashboard/teacher',
+            headers={'Authorization': f'Bearer {teacher_token}'},
+        )
+    finally:
+        event.remove(database_engine, 'before_cursor_execute', count_selects)
+
+    assert response.status_code == 200, response.text
+    assert response.json()['summary']['students'] == 34
+    assert select_count <= 20
 
 
 def test_high_risk_demo_explains_the_same_canonical_class_and_is_read_only(client, teacher_token, monkeypatch):
@@ -142,6 +179,7 @@ def test_high_risk_demo_explains_the_same_canonical_class_and_is_read_only(clien
         'risk_level_policy': 'argmax(class_probabilities)',
     }
     monkeypatch.setattr('backend.app.main.predict_risk', lambda _: prediction)
+    monkeypatch.setattr('backend.app.main.predict_many_risks', lambda rows, _: [prediction for _ in rows])
     monkeypatch.setattr('backend.app.main.explain_student', lambda _, target_class=None: {
         'target': f'P({target_class})', 'target_class': target_class, 'model_version': 'risk-demo-test',
         'contributions': {'attendance': 0.2}, 'feature_values': {'attendance': 61.0},
@@ -172,6 +210,7 @@ def test_high_risk_demo_has_deterministic_fallback_without_relabeling(client, te
         'risk_level_policy': 'argmax(class_probabilities)',
     }
     monkeypatch.setattr('backend.app.main.predict_risk', lambda _: prediction)
+    monkeypatch.setattr('backend.app.main.predict_many_risks', lambda rows, _: [prediction for _ in rows])
     monkeypatch.setattr('backend.app.main.explain_student', lambda _, target_class=None: {'target': f'P({target_class})', 'target_class': target_class})
     response = client.get('/api/v1/risk/high-risk-demo', headers={'Authorization': f'Bearer {teacher_token}'})
     assert response.status_code == 200
