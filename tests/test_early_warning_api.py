@@ -202,3 +202,65 @@ def test_summary_counts_share_list_thresholds_and_recovery_uses_probability(clie
     assert response.json()['summary']['highPriority'] == 0
     assert response.json()['summary']['watchList'] == 1
     assert response.json()['summary']['recoveredThisMonth'] == 1
+
+
+def test_detail_merges_factors_and_returns_plain_language_precautions(client, teacher_token, monkeypatch):
+    student_id, _ = _teacher_scope()
+    features = {
+        'attendance': 71.0,
+        'assessment': 48.0,
+        'previous_gpa': 2.2,
+        'current_gpa': 1.8,
+        'assignments_completed': 4.0,
+        'activity_per_week': 2.0,
+        'missing_submissions': 2.0,
+        'attendance_change': -13.3,
+        'assessment_change': -14.2,
+        'momentum_score': -0.5,
+    }
+    prediction = {
+        'risk_level': 'HIGH',
+        'risk_probability': 0.8,
+        'class_probabilities': {'HIGH': 0.8, 'MEDIUM': 0.15, 'LOW': 0.05},
+        'model_version': 'test-model',
+    }
+    monkeypatch.setattr('backend.app.main.student_features', lambda *_args: features)
+    monkeypatch.setattr('backend.app.main.predict_with_active_model', lambda *_args: prediction)
+    monkeypatch.setattr('backend.app.main.explain_with_active_model', lambda *_args, **_kwargs: {
+        'contributions': {
+            'attendance': 0.2,
+            'attendance_change': 0.3,
+            'assessment': 0.2,
+            'assessment_change': 0.1,
+            'missing_submissions': 0.2,
+            'current_gpa': 0.0,
+        },
+    })
+
+    response = client.get(
+        f'/api/v1/early-warnings/{student_id}',
+        headers={'Authorization': f'Bearer {teacher_token}'},
+    )
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert [factor['key'] for factor in data['factors']] == [
+        'attendance', 'assessment', 'missing_submissions',
+    ]
+    assert data['factors'][0]['detail'] == 'Attendance 71.0%, down 13.3% across recent observations'
+    assert data['factors'][1]['detail'] == 'Assessment average 48.0%, down 14.2% across recent observations'
+    assert all('P(HIGH)' not in factor['detail'] and 'SHAP' not in factor['detail'] for factor in data['factors'])
+    assert data['precautions'] == [
+        {
+            'factorKey': 'attendance',
+            'text': 'Agree an 85% attendance target for three weeks and review progress every Friday.',
+        },
+        {
+            'factorKey': 'assessment',
+            'text': 'Set a short catch-up quiz on the weakest topic and provide written feedback within 48 hours.',
+        },
+        {
+            'factorKey': 'missing_submissions',
+            'text': 'Set a clear deadline for each missing item and offer one supervised resubmission.',
+        },
+    ]

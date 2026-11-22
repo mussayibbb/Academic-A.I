@@ -6661,13 +6661,13 @@ def early_warnings(
 
         factor_labels = {
             'attendance': 'Attendance',
-            'assessment': 'Assessment scores',
+            'assessment': 'Assessment average',
             'missing_submissions': 'Missing submissions',
             'previous_gpa': 'Previous GPA',
-            'current_gpa': 'Internal marks',
+            'current_gpa': 'Current GPA',
             'activity_per_week': 'Portal activity',
-            'attendance_change': 'Attendance decline',
-            'assessment_change': 'Assessment decline',
+            'attendance_change': 'Attendance',
+            'assessment_change': 'Assessment average',
         }
         try:
             explanation = explain_with_active_model(features, db, target_class='HIGH')
@@ -6783,24 +6783,40 @@ def early_warning_detail(student_id: int, user: CurrentTeacher, db: Session = De
 
     labels = {
         'attendance': ('Attendance', '%'),
-        'assessment': ('Assessment scores', '%'),
+        'assessment': ('Assessment average', '%'),
         'missing_submissions': ('Missing submissions', 'assignments'),
         'previous_gpa': ('Previous GPA', 'GPA'),
-        'current_gpa': ('Internal marks', '%'),
+        'current_gpa': ('Current GPA', 'GPA'),
         'activity_per_week': ('Portal activity', 'logins/week'),
-        'attendance_change': ('Attendance decline', 'points'),
-        'assessment_change': ('Assessment decline', 'points'),
         'momentum_score': ('Academic momentum', 'points'),
-        'assignments_completed': ('Assignments completed', '%'),
+        'assignments_completed': ('Assignments completed', 'assignments'),
     }
+    grouped_contributions: dict[str, float] = {}
+    for name, contribution in positive:
+        key = {'attendance_change': 'attendance', 'assessment_change': 'assessment'}.get(name, name)
+        grouped_contributions[key] = grouped_contributions.get(key, 0.0) + contribution
     factors: list[dict[str, Any]] = []
-    for name, contribution in positive[:5]:
+    for name, contribution in sorted(grouped_contributions.items(), key=lambda item: item[1], reverse=True)[:5]:
         label, unit = labels.get(name, (name.replace('_', ' ').capitalize(), ''))
         current_value = float(features.get(name, 0.0))
-        previous_value = float(features.get(f'{name}_change', current_value))
-        detail = f'{current_value:.1f}{unit if unit == "%" else ""} ' + (
-            f'({contribution:+.3f} points in P(HIGH))'
-        )
+        previous_value = current_value
+        if name in {'attendance', 'assessment'}:
+            change = float(features.get(f'{name}_change', 0.0))
+            direction = 'down' if change < 0 else 'up'
+            movement = f', {direction} {abs(change):.1f}% across recent observations' if change else ''
+            detail = f'{label} {current_value:.1f}%{movement}'
+        elif name == 'missing_submissions':
+            detail = f'{current_value:.0f} outstanding assignments'
+        elif name in {'previous_gpa', 'current_gpa'}:
+            detail = f'{label} {current_value:.2f} GPA'
+        elif name == 'activity_per_week':
+            detail = f'{current_value:.1f} logins per week'
+        elif name == 'momentum_score':
+            detail = f'Recent change score {current_value:+.1f}'
+        elif name == 'assignments_completed':
+            detail = f'{current_value:.0f} assignments completed'
+        else:
+            detail = f'{label} {current_value:.1f}'
         factors.append({
             'key': name,
             'label': label,
@@ -6835,12 +6851,14 @@ def early_warning_detail(student_id: int, user: CurrentTeacher, db: Session = De
     confidence = round(max(0.0, min(1.0, max_class_probability * (usable_signals / 5))), 6)
 
     precautions_by_factor = {
-        'attendance': 'Agree on an attendance target of 85% and review it every week.',
-        'assessment': 'Offer a short catch-up quiz with written feedback within 48 hours.',
-        'missing_submissions': 'Set clear deadlines and allow one supervised resubmission.',
-        'current_gpa': 'Walk through the marks breakdown and plan the remaining components.',
-        'previous_gpa': 'Walk through the marks breakdown and plan the remaining components.',
-        'activity_per_week': 'Ask what is blocking portal use and re-enable deadline reminders.',
+        'attendance': 'Agree an 85% attendance target for three weeks and review progress every Friday.',
+        'assessment': 'Set a short catch-up quiz on the weakest topic and provide written feedback within 48 hours.',
+        'missing_submissions': 'Set a clear deadline for each missing item and offer one supervised resubmission.',
+        'current_gpa': 'Walk through the marks breakdown and plan which components can still improve.',
+        'previous_gpa': 'Walk through the marks breakdown and plan which components can still improve.',
+        'activity_per_week': 'Ask what is blocking portal activity and re-enable deadline reminders.',
+        'momentum_score': 'Hold a weekly check-in focused on one small academic goal.',
+        'assignments_completed': 'Agree a clear deadline for each outstanding item and check completion together.',
     }
     precautions = [
         {

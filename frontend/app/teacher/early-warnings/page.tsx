@@ -411,11 +411,11 @@ export default function EarlyWarningsPage() {
             <EarlyWarningRiskTrajectory trend={detail.trend} forecast={detail.forecast} currentRisk={detail.riskProbability} animateIn={animateIn} />
 
             <div className="ew-card">
-              <h3>Why the model flagged this student</h3><p className="ew-lead">Positive SHAP factors, normalised across this student’s factors.</p>
+              <h3>Why the model flagged this student</h3><p className="ew-lead">The factors that contribute most to this student’s predicted risk.</p>
               {detail.factors.length ? detail.factors.map((factor, index) => <div className="ew-param" key={factor.key} style={{ animationDelay: `${index * 80}ms` }}>
                 <div><b>{factor.label}</b><small>{factor.detail}</small></div>
                 <div className="ew-bar"><i style={{ width: `${factor.contributionShare * 100}%` }} /></div>
-                <em>+{Math.round(factor.contributionShare * 100)}%</em>
+                <em>+{Math.round(factor.contributionShare * detail.riskProbability * 100)} pts</em>
               </div>) : <p className="ew-lead">Not enough data yet to explain individual factors.</p>}
             </div>
 
