@@ -6712,6 +6712,7 @@ def early_warnings(
             'priority': priority,
             'topFactor': top_factor,
             '_signalCount': student_signals,
+            '_rawDecisionScore': float(prediction.get('raw_high_decision_score', probability)),
         })
 
     high_priority = sum(item['priority'] == 'High' for item in items)
@@ -6730,12 +6731,13 @@ def early_warnings(
 
     items.sort(key=lambda item: (
         -item['riskProbability'],
+        -item['_rawDecisionScore'],
         -item['_signalCount'],
         item['name'].casefold(),
         item['studentId'],
     ))
     start = (page - 1) * pageSize
-    paged = [{key: value for key, value in item.items() if key != '_signalCount'} for item in items[start:start + pageSize]]
+    paged = [{key: value for key, value in item.items() if not key.startswith('_')} for item in items[start:start + pageSize]]
     next_page = page + 1 if start + pageSize < len(items) else None
     return {
         'summary': {
@@ -6827,7 +6829,7 @@ def early_warning_detail(student_id: int, user: CurrentTeacher, db: Session = De
     with_plan_probability = float(with_plan['class_probabilities'].get('HIGH', with_plan['risk_probability']))
 
     max_class_probability = max(float(value) for value in class_probabilities.values()) if class_probabilities else 0.0
-    confidence = round(max(0.0, min(1.0, max_class_probability * (usable_signals / 10))), 6)
+    confidence = round(max(0.0, min(1.0, max_class_probability * (usable_signals / 5))), 6)
 
     precautions_by_factor = {
         'attendance': 'Agree on an attendance target of 85% and review it every week.',

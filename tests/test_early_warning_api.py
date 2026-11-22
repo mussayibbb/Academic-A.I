@@ -87,3 +87,60 @@ def test_simulate_rejects_student_outside_teacher_scope(client, teacher_token, m
     )
 
     assert response.status_code == 403
+
+
+def test_early_warnings_uses_raw_decision_score_to_break_calibrated_probability_ties(
+    client, teacher_token, monkeypatch,
+):
+    first_id, _ = _teacher_scope()
+    with app.state.test_session_factory() as db:
+        teacher = db.query(Teacher).join(User).filter(User.email == 'teacher@example.com').one()
+        second = db.query(Student).filter(Student.student_id == 'T-002').one()
+        second.course_id = teacher.courses[0].id
+        db.commit()
+        second_id = second.id
+
+    features = {
+        first_id: {
+            'attendance': 60.0, 'assessment': 50.0, 'previous_gpa': 2.0, 'current_gpa': 1.8,
+            'assignments_completed': 2.0, 'activity_per_week': 1.0, 'missing_submissions': 2.0,
+            'attendance_change': -10.0, 'assessment_change': -5.0, 'momentum_score': -1.0,
+        },
+        second_id: {
+            'attendance': 60.0, 'assessment': 50.0, 'previous_gpa': 2.0, 'current_gpa': 1.8,
+            'assignments_completed': 2.0, 'activity_per_week': 1.0, 'missing_submissions': 2.0,
+            'attendance_change': -10.0, 'assessment_change': -5.0, 'momentum_score': -1.0,
+        },
+    }
+
+    def risk_views(students, _db):
+        prediction_by_id = {
+            first_id: {
+                'risk_level': 'HIGH', 'risk_probability': 0.8,
+                'class_probabilities': {'HIGH': 0.8, 'MEDIUM': 0.1, 'LOW': 0.1},
+                'raw_high_decision_score': 1.1,
+            },
+            second_id: {
+                'risk_level': 'HIGH', 'risk_probability': 0.8,
+                'class_probabilities': {'HIGH': 0.8, 'MEDIUM': 0.1, 'LOW': 0.1},
+                'raw_high_decision_score': 2.2,
+            },
+        }
+        return (
+            [(student, prediction_by_id[student.id]) for student in students],
+            features,
+            {student.id: {} for student in students},
+        )
+
+    monkeypatch.setattr('backend.app.main.student_risk_views', risk_views)
+    monkeypatch.setattr('backend.app.main.explain_with_active_model', lambda *_args, **_kwargs: {
+        'contributions': {'attendance': 1.0},
+    })
+
+    response = client.get(
+        '/api/v1/early-warnings',
+        headers={'Authorization': f'Bearer {teacher_token}'},
+    )
+
+    assert response.status_code == 200, response.text
+    assert [item['studentId'] for item in response.json()['items']] == [second_id, first_id]

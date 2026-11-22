@@ -24,28 +24,49 @@ def load_artifact(artifact_path: Path = DEFAULT_ARTIFACT) -> dict[str, Any]:
     return _load_cached_artifact(str(resolved_path), stat.st_mtime_ns, stat.st_size)
 
 
-def predict(features: dict[str, float], artifact_path: Path = DEFAULT_ARTIFACT) -> dict[str, Any]:
-    missing = sorted(set(FEATURES) - set(features))
-    if missing:
-        raise ValueError(f'Missing model features: {", ".join(missing)}')
+def predict_many(features_rows: list[dict[str, float]], artifact_path: Path = DEFAULT_ARTIFACT) -> list[dict[str, Any]]:
+    if not features_rows:
+        return []
+    for features in features_rows:
+        missing = sorted(set(FEATURES) - set(features))
+        if missing:
+            raise ValueError(f'Missing model features: {", ".join(missing)}')
     artifact = load_artifact(artifact_path)
     pipeline = artifact['pipeline']
     metadata = artifact['metadata']
-    frame = pd.DataFrame([{name: float(features[name]) for name in FEATURES}], columns=FEATURES)
-    probabilities = np.asarray(pipeline.predict_proba(frame)[0], dtype=float)
+    frame = pd.DataFrame(
+        [{name: float(features[name]) for name in FEATURES} for features in features_rows],
+        columns=FEATURES,
+    )
+    probabilities_by_row = np.asarray(pipeline.predict_proba(frame), dtype=float)
     label_encoder = artifact['label_encoder']
     class_ids = np.asarray(pipeline.classes_, dtype=int)
     classes = label_encoder.inverse_transform(class_ids)
-    class_probabilities = {str(label).upper(): float(probability) for label, probability in zip(classes, probabilities)}
-    predicted_index = int(np.argmax(probabilities))
-    level = str(classes[predicted_index]).upper()
-    risk_probability = class_probabilities[level]
-    return {
-        'risk_level': level,
-        'risk_probability': risk_probability,
-        'risk_probability_semantics': 'P(risk_level)',
-        'risk_level_policy': 'argmax(class_probabilities)',
-        'model_version': metadata['model_version'],
-        'prediction_timestamp': datetime.now(timezone.utc),
-        'class_probabilities': class_probabilities,
-    }
+    decision_scores = None
+    if hasattr(pipeline, 'decision_function'):
+        raw_scores = np.asarray(pipeline.decision_function(frame), dtype=float)
+        if raw_scores.ndim == 2:
+            high_indices = [index for index, label in enumerate(classes) if str(label).upper() == 'HIGH']
+            if high_indices:
+                decision_scores = raw_scores[:, high_indices[0]]
+    predictions: list[dict[str, Any]] = []
+    for row_index, probabilities in enumerate(probabilities_by_row):
+        class_probabilities = {str(label).upper(): float(probability) for label, probability in zip(classes, probabilities)}
+        level = str(classes[int(np.argmax(probabilities))]).upper()
+        prediction = {
+            'risk_level': level,
+            'risk_probability': class_probabilities[level],
+            'risk_probability_semantics': 'P(risk_level)',
+            'risk_level_policy': 'argmax(class_probabilities)',
+            'model_version': metadata['model_version'],
+            'prediction_timestamp': datetime.now(timezone.utc),
+            'class_probabilities': class_probabilities,
+        }
+        if decision_scores is not None:
+            prediction['raw_high_decision_score'] = float(decision_scores[row_index])
+        predictions.append(prediction)
+    return predictions
+
+
+def predict(features: dict[str, float], artifact_path: Path = DEFAULT_ARTIFACT) -> dict[str, Any]:
+    return predict_many([features], artifact_path)[0]
