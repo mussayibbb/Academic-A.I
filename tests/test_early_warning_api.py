@@ -1,5 +1,7 @@
+from datetime import datetime, timedelta
+
 from backend.app.main import SIMULATION_REQUESTS, app
-from backend.app.models import Course, Student, Teacher, User
+from backend.app.models import Course, RiskSnapshot, Student, Teacher, User
 
 
 def _teacher_scope():
@@ -144,3 +146,59 @@ def test_early_warnings_uses_raw_decision_score_to_break_calibrated_probability_
 
     assert response.status_code == 200, response.text
     assert [item['studentId'] for item in response.json()['items']] == [second_id, first_id]
+
+
+def test_summary_counts_share_list_thresholds_and_recovery_uses_probability(client, teacher_token, monkeypatch):
+    student_id, _ = _teacher_scope()
+    now = datetime.utcnow()
+    with app.state.test_session_factory() as db:
+        student = db.query(Student).filter(Student.id == student_id).one()
+        student.attendance = 60.0
+        student.assessment = 50.0
+        student.previous_gpa = 2.0
+        student.current_gpa = 1.8
+        db.add_all([
+            RiskSnapshot(
+                student_id=student_id,
+                model_version='early-warning:test-model',
+                risk_level='LOW',
+                probability=0.82,
+                recorded_at=now - timedelta(days=14),
+            ),
+            RiskSnapshot(
+                student_id=student_id,
+                model_version='early-warning:test-model',
+                risk_level='HIGH',
+                probability=0.4,
+                recorded_at=now - timedelta(days=7),
+            ),
+        ])
+        db.commit()
+
+    features = {
+        'attendance': 60.0, 'assessment': 50.0, 'previous_gpa': 2.0, 'current_gpa': 1.8,
+        'assignments_completed': 2.0, 'activity_per_week': 1.0, 'missing_submissions': 2.0,
+        'attendance_change': -10.0, 'assessment_change': -5.0, 'momentum_score': -1.0,
+    }
+    monkeypatch.setattr('backend.app.main.student_risk_views', lambda students, _db: (
+        [(student, {
+            'risk_level': 'MEDIUM',
+            'risk_probability': 0.6,
+            'class_probabilities': {'HIGH': 0.4, 'MEDIUM': 0.4, 'LOW': 0.2},
+        }) for student in students],
+        {student.id: features for student in students},
+        {student.id: {} for student in students},
+    ))
+    monkeypatch.setattr('backend.app.main.explain_with_active_model', lambda *_args, **_kwargs: {
+        'contributions': {'attendance': 1.0},
+    })
+
+    response = client.get(
+        '/api/v1/early-warnings',
+        headers={'Authorization': f'Bearer {teacher_token}'},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()['summary']['highPriority'] == 0
+    assert response.json()['summary']['watchList'] == 1
+    assert response.json()['summary']['recoveredThisMonth'] == 1

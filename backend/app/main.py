@@ -6723,10 +6723,13 @@ def early_warnings(
         snapshots = [
             snapshot for snapshot in snapshots_by_student.get(student_id, [])
             if snapshot.recorded_at >= month_cutoff
+            and (snapshot.model_version or '').startswith('early-warning:')
         ]
         if len(snapshots) >= 2:
-            order = {'LOW': 0, 'MEDIUM': 1, 'HIGH': 2}
-            if order.get(snapshots[-1].risk_level, 0) < order.get(snapshots[0].risk_level, 0):
+            order = {'Low': 0, 'Medium': 1, 'High': 2}
+            first_priority = priority_for_probability(float(snapshots[0].probability))
+            latest_priority = priority_for_probability(float(snapshots[-1].probability))
+            if order[latest_priority] < order[first_priority]:
                 recovered += 1
 
     items.sort(key=lambda item: (
