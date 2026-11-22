@@ -41,6 +41,8 @@ type WarningList = {
   summary: Summary;
   items: WarningItem[];
   nextPage: number | null;
+  dataStatus?: string;
+  message?: string;
 };
 
 type Factor = {
@@ -135,6 +137,7 @@ export default function EarlyWarningsPage() {
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState('');
+  const [dataNotice, setDataNotice] = useState('');
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [detail, setDetail] = useState<WarningDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -188,6 +191,7 @@ export default function EarlyWarningsPage() {
       const data = await api<WarningList>(`/api/v1/early-warnings?${params}`);
       if (requestId !== requestRef.current) return;
       setSummary(data.summary);
+      setDataNotice(data.dataStatus === 'unvalidated-demo-model' ? data.message ?? 'Validated risk data is unavailable.' : '');
       setItems((current) => replace ? data.items : [...current, ...data.items]);
       setNextPage(data.nextPage);
       if (data.items.length) setSelectedId((current) => current ?? data.items[0].studentId);
@@ -385,6 +389,7 @@ export default function EarlyWarningsPage() {
         <div className="ew-stat"><b><CountUp value={summary?.recoveredThisMonth ?? 0} /></b><span>Recovered this month</span></div>
       </section>
 
+      {dataNotice && <div className="ew-card" role="status"><strong>Validated risk estimates unavailable</strong><p className="ew-lead">{dataNotice}</p></div>}
       {error && <div className="ew-card"><strong>Could not load early warnings</strong><p className="ew-lead">{error}</p><button className="ew-chip" onClick={() => loadList(1, true)}>Retry</button></div>}
 
       <div className="ew-split">
@@ -409,7 +414,7 @@ export default function EarlyWarningsPage() {
                 <span className="ew-tag">{item.priority}</span>
               </button>;
             })}
-            {!loading && !items.length && <p className="ew-lead p-3">No students in this group.</p>}
+            {!loading && !items.length && <p className="ew-lead p-3">{dataNotice ? 'No validated student risk results are available.' : 'No students in this group.'}</p>}
             {loadingMore && <div className="skeleton h-14 rounded-xl" />}
           </div>
         </aside>

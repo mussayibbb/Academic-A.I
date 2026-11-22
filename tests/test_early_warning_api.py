@@ -21,6 +21,7 @@ def _teacher_scope():
 
 
 def _mock_model(monkeypatch):
+    monkeypatch.setattr('backend.app.main.early_warning_uses_demo_model', lambda _db: False)
     features = {
         'attendance': 60.0,
         'assessment': 50.0,
@@ -94,6 +95,7 @@ def test_simulate_rejects_student_outside_teacher_scope(client, teacher_token, m
 def test_early_warnings_uses_raw_decision_score_to_break_calibrated_probability_ties(
     client, teacher_token, monkeypatch,
 ):
+    monkeypatch.setattr('backend.app.main.early_warning_uses_demo_model', lambda _db: False)
     first_id, _ = _teacher_scope()
     with app.state.test_session_factory() as db:
         teacher = db.query(Teacher).join(User).filter(User.email == 'teacher@example.com').one()
@@ -149,6 +151,7 @@ def test_early_warnings_uses_raw_decision_score_to_break_calibrated_probability_
 
 
 def test_summary_counts_share_list_thresholds_and_recovery_uses_probability(client, teacher_token, monkeypatch):
+    monkeypatch.setattr('backend.app.main.early_warning_uses_demo_model', lambda _db: False)
     student_id, _ = _teacher_scope()
     now = datetime.utcnow()
     with app.state.test_session_factory() as db:
@@ -205,6 +208,7 @@ def test_summary_counts_share_list_thresholds_and_recovery_uses_probability(clie
 
 
 def test_detail_merges_factors_and_returns_plain_language_precautions(client, teacher_token, monkeypatch):
+    monkeypatch.setattr('backend.app.main.early_warning_uses_demo_model', lambda _db: False)
     student_id, _ = _teacher_scope()
     features = {
         'attendance': 71.0,
@@ -264,3 +268,18 @@ def test_detail_merges_factors_and_returns_plain_language_precautions(client, te
             'text': 'Set a clear deadline for each missing item and offer one supervised resubmission.',
         },
     ]
+
+
+def test_demo_model_returns_an_honest_empty_list_and_blocks_details(client, teacher_token):
+    student_id, _ = _teacher_scope()
+    headers = {'Authorization': f'Bearer {teacher_token}'}
+
+    warnings = client.get('/api/v1/early-warnings', headers=headers)
+    detail = client.get(f'/api/v1/early-warnings/{student_id}', headers=headers)
+
+    assert warnings.status_code == 200
+    assert warnings.json()['dataStatus'] == 'unvalidated-demo-model'
+    assert warnings.json()['items'] == []
+    assert warnings.json()['summary']['highPriority'] == 0
+    assert detail.status_code == 503
+    assert 'DEMO DATA' in detail.json()['detail']

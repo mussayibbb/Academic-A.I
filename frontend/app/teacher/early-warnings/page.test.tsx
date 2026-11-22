@@ -132,6 +132,26 @@ describe('teacher early warnings', () => {
     expect(screen.queryByText('Could not load student detail')).toBeNull();
   }, 15000);
 
+  it('shows an honest empty state for an unvalidated demo model', async () => {
+    mocks.api.mockImplementation(async (path: string) => {
+      if (path.startsWith('/api/v1/early-warnings?')) return {
+        summary: { signals: 0, highPriority: 0, watchList: 0, recoveredThisMonth: 0, modelRefreshedAt: '2026-11-22T12:00:00Z' },
+        items: [],
+        nextPage: null,
+        dataStatus: 'unvalidated-demo-model',
+        message: 'Validated Early Warnings are unavailable because the active risk model was trained on DEMO DATA.',
+      };
+      throw new Error(`Unexpected API call: ${path}`);
+    });
+
+    render(<EarlyWarningsPage />);
+
+    expect(await screen.findByText('Validated risk estimates unavailable')).toBeTruthy();
+    expect(screen.getByText(/trained on DEMO DATA/)).toBeTruthy();
+    expect(screen.getByText('No validated student risk results are available.')).toBeTruthy();
+    expect(mocks.api).not.toHaveBeenCalledWith('/api/v1/early-warnings/17');
+  });
+
   it('draws an eight-point history and both forecast paths', () => {
     const trend = Array.from({ length: 8 }, (_, index) => ({
       weekStart: `2026-0${index + 1}-01`,

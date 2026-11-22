@@ -693,6 +693,14 @@ def selected_model_artifact(db: Session) -> Path:
         raise HTTPException(status_code=503, detail=f'Active local model deployment is unsafe or unavailable: {exc}') from exc
 
 
+def early_warning_uses_demo_model(db: Session) -> bool:
+    try:
+        artifact = load_artifact(selected_model_artifact(db))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail='The active risk model artifact is unavailable.') from exc
+    return artifact.get('metadata', {}).get('demo_data') is True
+
+
 def predict_with_active_model(features: dict[str, float], db: Session) -> dict[str, Any]:
     artifact_path = selected_model_artifact(db)
     return predict_risk(features) if artifact_path.resolve() == DEFAULT_ARTIFACT.resolve() else predict_risk(features, artifact_path)
@@ -6592,6 +6600,21 @@ def early_warnings(
     page: int = Query(default=1, ge=1),
     pageSize: int = Query(default=50, ge=1, le=50),
 ) -> dict[str, Any]:
+    if early_warning_uses_demo_model(db):
+        return {
+            'summary': {
+                'signals': 0,
+                'highPriority': 0,
+                'watchList': 0,
+                'recoveredThisMonth': 0,
+                'modelRefreshedAt': datetime.utcnow().isoformat(),
+            },
+            'items': [],
+            'nextPage': None,
+            'dataStatus': 'unvalidated-demo-model',
+            'message': 'Validated Early Warnings are unavailable because the active risk model was trained on DEMO DATA.',
+        }
+
     teacher = db.query(Teacher).filter(Teacher.user_id == user.id).first()
     if teacher is None:
         return {
@@ -6758,6 +6781,8 @@ def early_warnings(
 @app.get(f'{settings.api_v1_prefix}/early-warnings/{{student_id}}')
 def early_warning_detail(student_id: int, user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
     student = early_warning_authorized_student(db, user, student_id)
+    if early_warning_uses_demo_model(db):
+        raise HTTPException(status_code=503, detail='Validated Early Warnings are unavailable because the active risk model was trained on DEMO DATA.')
     features = student_features(student, db)
     prediction = predict_with_active_model(features, db)
     class_probabilities = prediction['class_probabilities']
@@ -6921,6 +6946,8 @@ def early_warning_simulate(
     SIMULATION_REQUESTS[key] = recent
 
     student = early_warning_authorized_student(db, user, student_id)
+    if early_warning_uses_demo_model(db):
+        raise HTTPException(status_code=503, detail='Validated Early Warnings are unavailable because the active risk model was trained on DEMO DATA.')
     supported_targets = {
         'attendance', 'assessment', 'missing_submissions', 'activity_per_week',
         'attendance_change', 'assessment_change', 'momentum_score', 'current_gpa',
