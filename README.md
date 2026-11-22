@@ -110,14 +110,31 @@ Set `ACADEMIC_AI_API_URL` if FastAPI is not at `http://127.0.0.1:8000`. When a c
 
 The faculty `/teacher/early-warnings` page uses `GET /api/v1/early-warnings`, `GET /api/v1/early-warnings/{studentId}`, and the what-if/intervention endpoints backed by the existing production model and SQLAlchemy database. The list is paginated in groups of 50 and restricted to each teacher's assigned courses or sections. Priority thresholds are `High >= 0.75`, `Medium >= 0.40`, and `Low < 0.40`; fewer than three usable signals is rendered as insufficient data.
 
-Apply the intervention migration and weekly snapshot backfill with the normal migration and seed commands:
+Apply all database migrations before deploying the frontend or starting the weekly job:
 
 ```powershell
 .\.venv\Scripts\alembic.exe upgrade head
+```
+
+Seed only a local demo environment (never production):
+
+```powershell
 .\.venv\Scripts\python.exe -m backend.app.services.seed_demo
 ```
 
-The existing model training commands below create the production artifact. Schedule the existing `RiskSnapshot` prediction job or invoke the training/scoring workflow at the institution's agreed weekly cadence. Deploy the Next.js frontend to Vercel with `NEXT_PUBLIC_API_URL` set to the public backend URL, and deploy FastAPI with `DATABASE_URL`, `JWT_SECRET`, `CORS_ORIGINS`, `INSTITUTIONAL_TIMEZONE`, and provider credentials in the backend environment. Never commit `.env` values.
+After installing a non-demo model and loading real student data, run the weekly scorer once to verify deployment:
+
+```powershell
+.\.venv\Scripts\python.exe -m backend.app.services.score_early_warnings
+```
+
+The scorer reads each student's current point-in-time features, stores the model version and `P(HIGH)` as a weekly snapshot, and updates the current week's snapshot on repeat runs. It refuses to run with a model artifact marked `DEMO DATA`. Schedule it on the backend host, not Vercel. Example Linux cron entry for Mondays at 03:00 UTC:
+
+```cron
+0 3 * * 1 cd /app && /app/.venv/bin/python -m backend.app.services.score_early_warnings
+```
+
+Deploy the Next.js app to Vercel with `NEXT_PUBLIC_API_URL` set to the public FastAPI base URL. On the backend host configure `DATABASE_URL`, a unique `JWT_SECRET`, `CORS_ORIGINS` containing the Vercel origin, and `INSTITUTIONAL_TIMEZONE`; also configure any selected LLM provider credentials and ensure the active model artifact is available to the backend. Run `alembic upgrade head` as a release step before enabling the scheduler. Do not copy the demo seed database into production, and never commit `.env` values or provider secrets.
 
 ## Model Pipeline
 
