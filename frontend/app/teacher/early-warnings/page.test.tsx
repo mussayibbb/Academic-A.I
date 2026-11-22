@@ -6,6 +6,10 @@ import EarlyWarningsPage from './page';
 
 const mocks = vi.hoisted(() => ({ api: vi.fn() }));
 vi.mock('@/lib/api', () => ({ api: mocks.api }));
+vi.mock('next/font/google', () => ({
+  Bricolage_Grotesque: () => ({ variable: 'font-heading' }),
+  DM_Sans: () => ({ variable: 'font-body' }),
+}));
 
 describe('teacher early warnings', () => {
   beforeEach(() => {
