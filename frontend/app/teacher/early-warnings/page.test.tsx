@@ -49,7 +49,9 @@ describe('teacher early warnings', () => {
         actions: [],
       };
       if (path === '/api/v1/early-warnings/17/simulate' && init?.method === 'POST') {
-        return { riskProbability: 0.68, riskClass: 'Medium', delta: -14 };
+        const recoveries = JSON.parse(String(init.body)).recoveries;
+        const riskProbability = recoveries.attendance >= 1 ? 0.32 : 0.68;
+        return { riskProbability, riskClass: riskProbability < 0.4 ? 'Normal' : 'Watch', delta: -14 };
       }
       if (path === '/api/v1/interventions/meetings' && init?.method === 'POST') {
         return { type: 'meeting', label: 'Host a meeting', at: '2026-11-22T12:00:00Z', by: 3 };
@@ -69,9 +71,12 @@ describe('teacher early warnings', () => {
     expect(await screen.findByRole('heading', { name: 'Why the model flagged this student' })).toBeTruthy();
     expect(await screen.findByText('Predicted risk')).toBeTruthy();
     expect(screen.getByText('Predicted risk').parentElement?.textContent).toContain('82%');
-    expect(screen.getByLabelText('Attendance recovers')).toBeTruthy();
-    expect(screen.getByText('Currently 82%. This scenario changes it by 0 pts.')).toBeTruthy();
     const slider = screen.getByLabelText('Attendance recovers') as HTMLInputElement;
+    expect(slider.value).toBe('0');
+    const predictedBox = screen.getByText('Predicted risk').parentElement as HTMLElement;
+    expect(within(predictedBox).getByText('Danger')).toBeTruthy();
+    expect((within(predictedBox).getByText('82%') as HTMLElement).style.color).toBe('var(--hi)');
+    expect(screen.getByText('Currently 82%. This scenario changes it by 0 pts.')).toBeTruthy();
     fireEvent.change(slider, { target: { value: '50' } });
     await waitFor(() => expect(mocks.api).toHaveBeenCalledWith(
       '/api/v1/early-warnings/17/simulate',
@@ -79,6 +84,11 @@ describe('teacher early warnings', () => {
     ));
     expect(await screen.findByText('68%')).toBeTruthy();
     expect(within(slider.closest('.ew-card') as HTMLElement).getByText('Watch')).toBeTruthy();
+    expect((within(predictedBox).getByText('68%') as HTMLElement).style.color).toBe('var(--md)');
+    fireEvent.change(slider, { target: { value: '100' } });
+    expect(await screen.findByText('32%')).toBeTruthy();
+    expect(within(predictedBox).getByText('Normal')).toBeTruthy();
+    expect((within(predictedBox).getByText('32%') as HTMLElement).style.color).toBe('var(--lo)');
     const meeting = await screen.findByRole('button', { name: /Host a meeting/i });
     meeting.click();
     await waitFor(() => expect(screen.getByText('Schedule a meeting')).toBeTruthy());
