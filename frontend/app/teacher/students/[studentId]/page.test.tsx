@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import Student360Page from './page';
 
 const mocks = vi.hoisted(() => ({ api: vi.fn() }));
-vi.mock('@/lib/api', () => ({ api: mocks.api }));
+vi.mock('@/lib/api', () => ({ api: mocks.api, readCachedApiData: () => null }));
 vi.mock('next/navigation', () => ({ useParams: () => ({ studentId: '17' }) }));
 
 describe('teacher Student 360 subject recovery entry', () => {

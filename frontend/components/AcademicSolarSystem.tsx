@@ -363,6 +363,7 @@ export default function AcademicSolarSystem({
     });
 
     const clock = { previous: performance.now() };
+    let isInViewport = false;
     const resize = () => {
       const width = mount.clientWidth;
       const height = mount.clientHeight;
@@ -377,26 +378,44 @@ export default function AcademicSolarSystem({
     observer.observe(mount);
     resize();
 
-    if (reduceMotion) {
-      renderer.render(scene, camera);
-    } else {
-      renderer.setAnimationLoop(() => {
-        const now = performance.now();
-        const delta = Math.min((now - clock.previous) / 1000, .05);
-        clock.previous = now;
-        centralPlanet.rotation.y += delta * .22;
-        centralPlanet.rotation.x = Math.sin(now * .00014) * .025;
-        bodies.forEach(({ orbit, body, speed }) => {
-          orbit.rotation.y += delta * speed;
-          body.rotation.y += delta * (speed > 0 ? .72 : -.61);
-        });
-        stars.rotation.y += delta * .012;
-        renderer.render(scene, camera);
+    const animate = () => {
+      const now = performance.now();
+      const delta = Math.min((now - clock.previous) / 1000, .05);
+      clock.previous = now;
+      centralPlanet.rotation.y += delta * .22;
+      centralPlanet.rotation.x = Math.sin(now * .00014) * .025;
+      bodies.forEach(({ orbit, body, speed }) => {
+        orbit.rotation.y += delta * speed;
+        body.rotation.y += delta * (speed > 0 ? .72 : -.61);
       });
-    }
+      stars.rotation.y += delta * .012;
+      renderer.render(scene, camera);
+    };
+    const updateAnimation = () => {
+      if (reduceMotion || !isInViewport || document.hidden) {
+        renderer.setAnimationLoop(null);
+        return;
+      }
+      clock.previous = performance.now();
+      renderer.setAnimationLoop(animate);
+    };
+    const visibilityObserver = typeof IntersectionObserver === 'undefined'
+      ? null
+      : new IntersectionObserver(([entry]) => {
+        isInViewport = entry.isIntersecting;
+        if (reduceMotion && isInViewport) renderer.render(scene, camera);
+        updateAnimation();
+      }, { threshold: 0 });
+    isInViewport = visibilityObserver === null;
+    visibilityObserver?.observe(mount);
+    document.addEventListener('visibilitychange', updateAnimation);
+    if (reduceMotion) renderer.render(scene, camera);
+    updateAnimation();
 
     return () => {
       observer.disconnect();
+      visibilityObserver?.disconnect();
+      document.removeEventListener('visibilitychange', updateAnimation);
       renderer.setAnimationLoop(null);
       disposeScene(scene);
       renderer.dispose();

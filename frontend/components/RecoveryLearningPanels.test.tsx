@@ -5,7 +5,7 @@ import SubjectModuleRecoveryPanel from './SubjectModuleRecoveryPanel';
 import StudentLearningRecoveryPanel from './StudentLearningRecoveryPanel';
 
 const mocks = vi.hoisted(() => ({ api: vi.fn(), token: 'teacher-token' }));
-vi.mock('@/lib/api', () => ({ API_BASE: 'http://localhost:8000', api: mocks.api, readToken: () => mocks.token }));
+vi.mock('@/lib/api', () => ({ API_BASE: 'http://localhost:8000', api: mocks.api, readCachedApiData: () => null, readToken: () => mocks.token }));
 
 type MockResource = Record<string, unknown> & { id: number; provenance: Record<string, unknown> };
 let resourceRows: MockResource[];

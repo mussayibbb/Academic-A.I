@@ -28,6 +28,7 @@ def build_model(tmp_path):
 def test_prediction_shap_and_intervention_review_flow(client, teacher_token, student_token, tmp_path, monkeypatch):
     features, artifact = build_model(tmp_path)
     monkeypatch.setattr('backend.app.main.settings.llm_model_name', 'mock-development')
+    monkeypatch.setattr('backend.app.main.early_warning_uses_demo_model', lambda _db: False)
     monkeypatch.setattr('backend.app.main.predict_risk', lambda item: predict(item, artifact))
     monkeypatch.setattr('backend.app.main.predict_many_risks', lambda rows, _: [predict(item, artifact) for item in rows])
     from ai.explainability.service import explain_student
@@ -45,16 +46,25 @@ def test_prediction_shap_and_intervention_review_flow(client, teacher_token, stu
     assert prediction_data['risk_probability'] == prediction_data['class_probabilities'][prediction_data['risk_level']]
     assert sum(prediction_data['class_probabilities'].values()) == pytest.approx(1.0)
     assert all(0 <= value <= 1 for value in prediction_data['class_probabilities'].values())
-    current_student_payload = {name: 0.0 for name in FEATURES}
+    current_student = client.get(
+        f"/api/v1/students/{client.app.state.test_student_id}",
+        headers=teacher,
+    ).json()['student']
+    current_student_payload = {name: current_student.get(name, 0.0) for name in FEATURES}
     prediction = client.post('/api/v1/risk/predict', json={**current_student_payload, 'student_id': client.app.state.test_student_id}, headers=teacher)
     assert prediction.status_code == 200
     prediction_data = prediction.json()
     student_data = client.get(f"/api/v1/students/{client.app.state.test_student_id}", headers=teacher).json()['student']
     assert student_data['risk_level'] == prediction_data['risk_level']
     assert student_data['risk_probability'] == prediction_data['risk_probability']
-    dashboard_student = next(item for item in client.get('/api/v1/dashboard/teacher', headers=teacher).json()['students_needing_attention'] if item['id'] == client.app.state.test_student_id)
-    assert dashboard_student['risk_level'] == prediction_data['risk_level']
-    assert dashboard_student['risk_probability'] == prediction_data['risk_probability']
+    dashboard_students = client.get('/api/v1/dashboard/teacher', headers=teacher).json()['students_needing_attention']
+    dashboard_student = next((item for item in dashboard_students if item['id'] == client.app.state.test_student_id), None)
+    if prediction_data['risk_level'] in {'HIGH', 'MEDIUM'}:
+        assert dashboard_student is not None
+        assert dashboard_student['risk_level'] == prediction_data['risk_level']
+        assert dashboard_student['risk_probability'] == prediction_data['risk_probability']
+    else:
+        assert dashboard_student is None
     student_detail = client.get(f"/api/v1/students/{client.app.state.test_student_id}", headers=teacher).json()
     assert all('risk_probability' not in snapshot for snapshot in student_detail['risk_history'])
 
@@ -132,7 +142,7 @@ def test_current_risk_views_ignore_stale_seed_classifications(client, teacher_to
     assert warnings['items'] == []
 
     report = client.get('/api/v1/reports/export.csv?report_type=risk', headers=headers).text
-    assert 'T-001,Student One,,MEDIUM,0.7' in report
+    assert 'T-001,Student One,,DEMO DATA,unvalidated-demo-model,MEDIUM,0.7' in report
 
 
 def test_teacher_dashboard_batches_student_risk_queries(client, teacher_token):
@@ -185,6 +195,11 @@ def test_high_risk_demo_explains_the_same_canonical_class_and_is_read_only(clien
         'contributions': {'attendance': 0.2}, 'feature_values': {'attendance': 61.0},
         'waterfall': [{'feature': 'attendance', 'value': 61.0, 'contribution': 0.2}],
     })
+    monkeypatch.setattr('backend.app.main.explain_with_demo_preview', lambda _, target_class=None: {
+        'target': f'P({target_class})', 'target_class': target_class, 'model_version': 'risk-demo-test',
+        'contributions': {'attendance': 0.2}, 'feature_values': {'attendance': 61.0},
+        'waterfall': [{'feature': 'attendance', 'value': 61.0, 'contribution': 0.2}],
+    })
     headers = {'Authorization': f'Bearer {teacher_token}'}
     before = client.get('/api/v1/students/1', headers=headers).json()['student']
     response = client.get('/api/v1/risk/high-risk-demo', headers=headers)
@@ -212,6 +227,7 @@ def test_high_risk_demo_has_deterministic_fallback_without_relabeling(client, te
     monkeypatch.setattr('backend.app.main.predict_risk', lambda _: prediction)
     monkeypatch.setattr('backend.app.main.predict_many_risks', lambda rows, _: [prediction for _ in rows])
     monkeypatch.setattr('backend.app.main.explain_student', lambda _, target_class=None: {'target': f'P({target_class})', 'target_class': target_class})
+    monkeypatch.setattr('backend.app.main.explain_with_demo_preview', lambda _, target_class=None: {'target': f'P({target_class})', 'target_class': target_class})
     response = client.get('/api/v1/risk/high-risk-demo', headers={'Authorization': f'Bearer {teacher_token}'})
     assert response.status_code == 200
     data = response.json()
@@ -236,6 +252,8 @@ def test_read_only_student_explanation_uses_canonical_shap_target(client, teache
     }
     monkeypatch.setattr('backend.app.main.predict_risk', lambda _: prediction)
     monkeypatch.setattr('backend.app.main.explain_student', lambda _, target_class=None: {'target': f'P({target_class})', 'target_class': target_class})
+    monkeypatch.setattr('backend.app.main.predict_with_demo_preview', lambda _features: prediction)
+    monkeypatch.setattr('backend.app.main.explain_with_demo_preview', lambda _, target_class=None: {'target': f'P({target_class})', 'target_class': target_class})
     teacher = {'Authorization': f'Bearer {teacher_token}'}
     student = {'Authorization': f'Bearer {student_token}'}
     before = client.get('/api/v1/students/1', headers=teacher).json()['student']
@@ -264,6 +282,7 @@ def test_shap_includes_ai_selected_verified_evidence_without_repeating_model_cal
         'attendance_change': 0.001,
         'assessment_change': 0.001,
         'momentum_score': 0.001,
+        'assignment_submission_rate': 0.0,
     }
     prediction = {
         'risk_level': 'HIGH',
@@ -277,7 +296,7 @@ def test_shap_includes_ai_selected_verified_evidence_without_repeating_model_cal
     explanation = {
         'target': 'P(HIGH)',
         'target_class': 'HIGH',
-        'base_value': 0.684,
+        'base_value': 0.706,
         'contributions': contributions,
         'feature_values': features,
         'model_version': 'risk-summary-test',
@@ -300,7 +319,7 @@ def test_shap_includes_ai_selected_verified_evidence_without_repeating_model_cal
 
     class SelectionProvider:
         provider_name = 'test-language-model'
-        response = json.dumps({'signals': ['attendance', 'assessment']})
+        response = json.dumps({'signals': ['attendance', 'assignments_completed']})
         error = None
 
         def generate_risk_summary(self, context):
@@ -313,6 +332,7 @@ def test_shap_includes_ai_selected_verified_evidence_without_repeating_model_cal
 
     provider = SelectionProvider()
     monkeypatch.setattr('backend.app.main.student_features', lambda student, db: features)
+    monkeypatch.setattr('backend.app.main.early_warning_uses_demo_model', lambda _db: False)
     monkeypatch.setattr('backend.app.main.predict_with_active_model', predict_once)
     monkeypatch.setattr('backend.app.main.explain_with_active_model', explain_once)
     monkeypatch.setattr('backend.app.main.build_provider', lambda _: provider)
@@ -326,12 +346,12 @@ def test_shap_includes_ai_selected_verified_evidence_without_repeating_model_cal
     data = response.json()
     assert calls == {'prediction': 1, 'explanation': 1, 'provider': 1}
     assert data['explanation']['target'] == 'P(HIGH)'
-    assert data['explanation']['base_value'] + sum(data['explanation']['contributions'].values()) == pytest.approx(0.82)
+    assert data['explanation']['base_value'] + sum(data['explanation']['contributions'][name] for name in FEATURES) == pytest.approx(0.82)
     assert data['risk_summary']['status'] == 'ready'
     assert data['risk_summary']['provider'] == 'test-language-model'
     assert data['risk_summary']['selected_signals'] == [
         {'feature': 'attendance', 'value': 1.0, 'contribution': 0.12},
-        {'feature': 'assessment', 'value': 2.0, 'contribution': 0.03},
+        {'feature': 'assignments_completed', 'value': 2.0, 'contribution': -0.008},
     ]
 
     provider.response = '{"signals":["invented_feature"]}'

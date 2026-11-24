@@ -9,7 +9,7 @@ import {
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { api } from '@/lib/api';
+import { api, clearApiCache } from '@/lib/api';
 
 type Profile = { name: string; email: string; role: string };
 type Notice = { id: number; title: string; body: string; read: boolean };
@@ -56,13 +56,17 @@ export default function PortalShell({ children, role }: { children: React.ReactN
   const closeMobileMenuRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
+    let active = true;
     const token = window.localStorage.getItem('token');
     if (!token) {
       router.replace('/login');
-      return;
+      return () => {
+        active = false;
+      };
     }
     Promise.all([api<Profile>('/api/v1/me'), api<Notice[]>('/api/v1/notifications')])
       .then(([current, items]) => {
+        if (!active) return;
         if (current.role !== role) {
           router.replace(current.role === 'TEACHER' ? '/teacher/dashboard' : '/student/dashboard');
           return;
@@ -71,10 +75,15 @@ export default function PortalShell({ children, role }: { children: React.ReactN
         setNotices(items);
       })
       .catch((requestError: Error) => {
+        if (!active) return;
         setError(requestError.message);
+        clearApiCache();
         window.localStorage.removeItem('token');
         router.replace('/login');
       });
+    return () => {
+      active = false;
+    };
   }, [role, router]);
 
   useEffect(() => {
@@ -130,6 +139,7 @@ export default function PortalShell({ children, role }: { children: React.ReactN
   const currentTitle = links.find((item) => pathname === item.href || pathname.startsWith(`${item.href}/`))?.label
     ?? (role === 'TEACHER' ? 'Faculty workspace' : 'Student workspace');
   const logout = () => {
+    clearApiCache();
     window.localStorage.removeItem('token');
     router.replace('/login');
   };
@@ -148,6 +158,9 @@ export default function PortalShell({ children, role }: { children: React.ReactN
           <Link
             key={href}
             href={href}
+            prefetch={false}
+            onMouseEnter={() => router.prefetch(href)}
+            onFocus={() => router.prefetch(href)}
             onClick={() => mobile && setMenuOpen(false)}
             title={collapsed && !mobile ? label : undefined}
             aria-current={active ? 'page' : undefined}
@@ -215,7 +228,7 @@ export default function PortalShell({ children, role }: { children: React.ReactN
                 <kbd className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 rounded border border-white/10 px-1.5 py-1 text-[9px] text-slate-600">⌘ K</kbd>
                 <AnimatePresence>
                   {searchOpen && <motion.div id="workspace-search-results" role="listbox" initial={reduceMotion ? false : { opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 5 }} transition={{ duration: reduceMotion ? 0 : .16, ease: 'easeOut' }} className="surface absolute left-0 right-0 top-12 z-50 overflow-hidden rounded-xl p-1.5 shadow-2xl">
-                    {searchResults.length ? searchResults.map(({ label, href, icon: Icon }) => <button key={href} type="button" role="option" aria-selected={pathname === href} onMouseDown={(event) => event.preventDefault()} onClick={() => openRoute(href)} className="flex min-h-10 w-full items-center gap-3 rounded-lg px-3 text-left text-xs text-slate-300 hover:bg-white/[.06] hover:text-white"><Icon size={15} className="text-rose-300" />{label}<span className="ml-auto text-[9px] text-slate-600">Open</span></button>) : <p className="px-3 py-4 text-xs text-slate-500">No matching workspace pages.</p>}
+                    {searchResults.length ? searchResults.map(({ label, href, icon: Icon }) => <button key={href} type="button" role="option" aria-selected={pathname === href} onMouseEnter={() => router.prefetch(href)} onFocus={() => router.prefetch(href)} onMouseDown={(event) => event.preventDefault()} onClick={() => openRoute(href)} className="flex min-h-10 w-full items-center gap-3 rounded-lg px-3 text-left text-xs text-slate-300 hover:bg-white/[.06] hover:text-white"><Icon size={15} className="text-rose-300" />{label}<span className="ml-auto text-[9px] text-slate-600">Open</span></button>) : <p className="px-3 py-4 text-xs text-slate-500">No matching workspace pages.</p>}
                   </motion.div>}
                 </AnimatePresence>
 

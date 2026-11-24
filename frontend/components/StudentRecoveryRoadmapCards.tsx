@@ -4,7 +4,7 @@ import { ArrowRight, CalendarClock, CheckCircle2, CircleDashed } from 'lucide-re
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import { Empty, ErrorNotice } from '@/components/ui';
-import { api } from '@/lib/api';
+import { api, readCachedApiData } from '@/lib/api';
 
 type FocusSubject = {
   id: number;
@@ -50,8 +50,8 @@ function formatDate(value: string): string {
 }
 
 export default function StudentRecoveryRoadmapCards() {
-  const [focus, setFocus] = useState<FocusResponse | null>(null);
-  const [tasks, setTasks] = useState<RecoveryTask[] | null>(null);
+  const [focus, setFocus] = useState<FocusResponse | null>(() => readCachedApiData<FocusResponse>('/api/v1/students/me/subject-focus?first_internal_only=true'));
+  const [tasks, setTasks] = useState<RecoveryTask[] | null>(() => readCachedApiData<RecoveryTask[]>('/api/v1/students/me/recovery-tasks'));
   const [focusError, setFocusError] = useState('');
   const [tasksError, setTasksError] = useState('');
 

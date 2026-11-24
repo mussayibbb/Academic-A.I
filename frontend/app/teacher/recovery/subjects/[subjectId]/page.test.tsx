@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import TeacherSubjectRosterPage from './page';
 
 const mocks = vi.hoisted(() => ({ api: vi.fn() }));
-vi.mock('@/lib/api', () => ({ api: mocks.api }));
+vi.mock('@/lib/api', () => ({ api: mocks.api, readCachedApiData: () => null }));
 vi.mock('@/components/SubjectModuleRecoveryPanel', () => ({
   default: ({ studentId, initialSubjectId }: { studentId?: number; initialSubjectId?: number }) => (
     <section aria-label="Subject recovery modules" data-student-id={studentId} data-subject-id={initialSubjectId} />

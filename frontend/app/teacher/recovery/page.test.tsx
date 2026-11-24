@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import TeacherRecoveryPage from './page';
 
 const mocks = vi.hoisted(() => ({ api: vi.fn() }));
-vi.mock('@/lib/api', () => ({ api: mocks.api }));
+vi.mock('@/lib/api', () => ({ api: mocks.api, readCachedApiData: () => null }));
 
 const recoveryOverview = {
   stats: {

@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import InterventionsPage from './page';
 
 const mocks = vi.hoisted(() => ({ api: vi.fn() }));
-vi.mock('@/lib/api', () => ({ api: mocks.api }));
+vi.mock('@/lib/api', () => ({ api: mocks.api, readCachedApiData: () => null }));
 
 let beforeGenerate: ((studentId: number) => Promise<void>) | null = null;
 

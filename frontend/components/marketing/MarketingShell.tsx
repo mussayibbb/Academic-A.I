@@ -4,7 +4,7 @@ import { Fraunces } from 'next/font/google';
 import { Instrument_Sans } from 'next/font/google';
 import { useRouter } from 'next/navigation';
 import { useEffect, useRef } from 'react';
-import { api } from '@/lib/api';
+import { api, clearApiCache } from '@/lib/api';
 import ConstellationCanvas from './ConstellationCanvas';
 import styles from './marketing.module.css';
 
@@ -43,7 +43,10 @@ export default function MarketingShell({
         }
       })
       .catch(() => {
-        if (active) window.localStorage.removeItem('token');
+        if (active) {
+          clearApiCache();
+          window.localStorage.removeItem('token');
+        }
       });
 
     return () => {

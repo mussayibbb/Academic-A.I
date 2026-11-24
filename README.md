@@ -77,6 +77,10 @@ The **Internal Marks** register stores subject-scoped EVS, CN, TOC, RM, and SE r
 
 The future-only observation export and readiness report are available at `GET /api/v1/ml/academic-data/export.csv` and `GET /api/v1/ml/academic-data/readiness`, and the CLI exporter is `python -m ai.risk.academic_dataset`. They never train a model. Readiness requires complete, time-aligned marks plus independent outcomes, three periods, at least 100 aligned observations, 20 distinct students in each risk class, clean values/identities, and an approved global aggregation strategy. Current data is not ready.
 
+## Student Management
+
+The faculty **Students** directory supports filtered and paginated browsing, record creation/editing/deletion, and CSV import/export. New manual records are labeled `MANUALLY ADDED`; CSV imports must be explicitly classified as `DEMO DATA` or `INSTITUTIONAL IMPORT`. Institutional imports require a source description and a verification attestation, and re-importing the same file is idempotent. Existing records without reliable provenance remain `LEGACY / UNVERIFIED`; editing a record cannot change its origin. When the active model is demo-trained, only sufficiently supported `DEMO DATA` records are scored. Other records show an unavailable risk status rather than a synthetic-model score.
+
 Phase 3 adds teacher-only real-data validation, coverage, deterministic dataset fingerprints, safe candidate CSV export, temporal candidate-training utilities, candidate evaluation/SHAP contracts, and blocked promotion/rollback controls. See [docs/phase3.md](docs/phase3.md). Candidate training is separate from the production model; current measured data does not pass readiness, so no real-data candidate is trained.
 
 ## Subject Recovery
@@ -145,11 +149,15 @@ The preprocessor derives explicit features from database students and dated acad
 .\.venv\Scripts\python.exe -m ai.risk.train
 ```
 
-The processed dataset target is `data/processed/DSstudents_processed.csv`. Training evaluates Logistic Regression and Random Forest with a stratified holdout split, and XGBoost if it is installed. The best weighted-F1 candidate is saved to `models/risk/risk_model.joblib`; its class-label map, feature list, training metadata, holdout metrics, and confusion matrix are saved with the model and in `models/risk/risk_model.metrics.json`.
+The CSV-only demo pipeline uses `data/processed/DSstudents_processed.csv`. It is an explicitly marked synthetic DEMO / TEST dataset and is not an institutional outcome source.
 
-This legacy training command writes directly to the production artifact path. Do not use it for Phase 3 candidate work. Phase 3 candidates use the isolated candidate pipeline and require real-data readiness plus explicit governance; see [docs/phase3.md](docs/phase3.md).
+The active model contract excludes FA1, FA2, internal/examination marks, GPA/CGPA, academic assessment scores, and mark-derived trends. It uses only attendance, assignments completed, missing submissions, assignment submission rate, weekly activity, and attendance change. Student IDs and target/risk columns are not model inputs.
 
-The bundled seed data is intentionally separable synthetic data. Its perfect holdout metrics are a pipeline smoke-test result only, not a meaningful estimate of real student risk prediction quality.
+Because the CSV has no genuine historical risk outcome, this implementation derives a clearly marked rule-generated three-class target: a composite attendance/submission/LMS risk score, with lower and upper tertiles defining LOW and HIGH and the middle third defining MEDIUM. This is rule-generated preview data, not historical outcome learning.
+
+Training uses a reproducible stratified holdout split and compares Logistic Regression with Random Forest. XGBoost is included only when already installed. The default training command writes a versioned candidate to `models/candidates/risk_model_candidate.joblib` plus a candidate metrics JSON; it does not replace `models/risk/risk_model.joblib`.
+
+The candidate artifact contains the preprocessing pipeline, ordered feature contract, three-class label encoder, metrics, dataset checksum and row count, training timestamp, target-label provenance, and DEMO-data indicator. Replacing the active artifact requires the existing registry, checksum validation and independent teacher approval workflow.
 
 ## Explanations and Momentum
 

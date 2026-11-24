@@ -44,14 +44,24 @@ describe('teacher early warnings', () => {
         insufficientData: false,
         trend: [{ weekStart: '2026-11-16', risk: 0.82 }],
         forecast: { noAction: 0.9, withPlan: 0.35 },
-        factors: [{ key: 'attendance', label: 'Attendance', detail: '71% now', currentValue: 71, previousValue: 84, unit: '%', contributionShare: 1 }],
+        factors: [
+          { key: 'attendance', label: 'Attendance', detail: '71% now', currentValue: 71, previousValue: 84, unit: '%', contributionShare: 0.6 },
+          { key: 'activity_per_week', label: 'Portal activity', detail: '2 logins per week', currentValue: 2, previousValue: 1, unit: 'logins/week', contributionShare: 0.4 },
+        ],
         precautions: [{ factorKey: 'attendance', text: 'Agree on an attendance target of 85%.' }],
         actions: [],
       };
       if (path === '/api/v1/early-warnings/17/simulate' && init?.method === 'POST') {
         const recoveries = JSON.parse(String(init.body)).recoveries;
-        const riskProbability = recoveries.attendance >= 1 ? 0.32 : 0.68;
-        return { riskProbability, riskClass: riskProbability < 0.4 ? 'Normal' : 'Watch', delta: -14 };
+        const riskProbability = recoveries.attendance === 0.01
+          ? 0.819
+          : recoveries.activity_per_week >= 0.5
+            ? 0.25
+            : recoveries.attendance >= 1
+              ? 0.32
+              : 0.68;
+        const riskClass = riskProbability >= 0.75 ? 'At risk' : riskProbability >= 0.4 ? 'Watch' : 'Normal';
+        return { riskProbability, riskClass, delta: Number(((0.82 - riskProbability) * 100).toFixed(2)) };
       }
       if (path === '/api/v1/interventions/meetings' && init?.method === 'POST') {
         return { type: 'meeting', label: 'Host a meeting', at: '2026-11-22T12:00:00Z', by: 3 };
@@ -80,15 +90,31 @@ describe('teacher early warnings', () => {
     fireEvent.change(slider, { target: { value: '50' } });
     await waitFor(() => expect(mocks.api).toHaveBeenCalledWith(
       '/api/v1/early-warnings/17/simulate',
-      expect.objectContaining({ method: 'POST', body: JSON.stringify({ recoveries: { attendance: 0.5 } }) }),
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ recoveries: { attendance: 0.5, activity_per_week: 0 } }) }),
     ));
     expect(await screen.findByText('68%')).toBeTruthy();
     expect(within(slider.closest('.ew-card') as HTMLElement).getByText('Watch')).toBeTruthy();
     expect((within(predictedBox).getByText('68%') as HTMLElement).style.color).toBe('var(--md)');
+    expect(screen.getByText('Currently 82%. This scenario changes it by +14 pts.')).toBeTruthy();
     fireEvent.change(slider, { target: { value: '100' } });
     expect(await screen.findByText('32%')).toBeTruthy();
     expect(within(predictedBox).getByText('Normal')).toBeTruthy();
     expect((within(predictedBox).getByText('32%') as HTMLElement).style.color).toBe('var(--lo)');
+    const portalSlider = screen.getByLabelText('Portal activity recovers') as HTMLInputElement;
+    fireEvent.change(portalSlider, { target: { value: '50' } });
+    await waitFor(() => expect(mocks.api).toHaveBeenCalledWith(
+      '/api/v1/early-warnings/17/simulate',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ recoveries: { attendance: 1, activity_per_week: 0.5 } }) }),
+    ));
+    expect(await screen.findByText('25%')).toBeTruthy();
+    expect(screen.getByText('Currently 82%. This scenario changes it by +57 pts.')).toBeTruthy();
+    fireEvent.change(slider, { target: { value: '1' } });
+    await waitFor(() => expect(mocks.api).toHaveBeenCalledWith(
+      '/api/v1/early-warnings/17/simulate',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ recoveries: { attendance: 0.01, activity_per_week: 0.5 } }) }),
+    ));
+    expect(await screen.findByText('81.9%')).toBeTruthy();
+    expect(screen.getByText('Currently 82%. This scenario changes it by +0.1 pts.')).toBeTruthy();
     const meeting = await screen.findByRole('button', { name: /Host a meeting/i });
     meeting.click();
     await waitFor(() => expect(screen.getByText('Schedule a meeting')).toBeTruthy());
@@ -146,7 +172,7 @@ describe('teacher early warnings', () => {
 
     render(<EarlyWarningsPage />);
 
-    expect(await screen.findByText('Validated risk estimates unavailable')).toBeTruthy();
+    expect(await screen.findByText('DEMO / RULE-GENERATED PREVIEW')).toBeTruthy();
     expect(screen.getByText(/trained on DEMO DATA/)).toBeTruthy();
     expect(screen.getByText('No validated student risk results are available.')).toBeTruthy();
     expect(mocks.api).not.toHaveBeenCalledWith('/api/v1/early-warnings/17');

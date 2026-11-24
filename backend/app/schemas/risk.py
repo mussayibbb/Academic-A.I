@@ -11,15 +11,16 @@ class RiskFeatureInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     attendance: float = Field(ge=0, le=100)
-    assessment: float = Field(ge=0, le=100)
-    previous_gpa: float = Field(ge=0, le=4)
-    current_gpa: float = Field(ge=0, le=4)
     assignments_completed: float = Field(ge=0)
     activity_per_week: float = Field(ge=0)
     missing_submissions: float = Field(ge=0)
-    attendance_change: float
-    assessment_change: float
-    momentum_score: float
+    assignment_submission_rate: float = Field(ge=0, le=1)
+    assessment: float | None = Field(default=None, ge=0, le=100)
+    previous_gpa: float | None = Field(default=None, ge=0, le=4)
+    current_gpa: float | None = Field(default=None, ge=0, le=4)
+    attendance_change: float | None = None
+    assessment_change: float | None = None
+    momentum_score: float | None = None
     student_id: StrictInt | None = None
 
     def feature_dict(self) -> dict[str, float]:

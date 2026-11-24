@@ -2,12 +2,17 @@
 
 import { motion } from 'framer-motion';
 import { ArrowRight, BookOpen, CalendarDays, CircleCheck, GraduationCap } from 'lucide-react';
+import dynamic from 'next/dynamic';
 import Link from 'next/link';
 import { useEffect, useMemo, useState } from 'react';
-import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { Empty, ErrorNotice, Metric, PageHeading, PanelTitle } from '@/components/ui';
 import StudentRecoveryRoadmapCards from '@/components/StudentRecoveryRoadmapCards';
-import { api } from '@/lib/api';
+import { api, readCachedApiData } from '@/lib/api';
+
+const StudentProgressChart = dynamic(() => import('@/components/charts/StudentProgressChart'), {
+  ssr: false,
+  loading: () => <div className="skeleton h-full w-full rounded-lg" aria-hidden="true" />,
+});
 
 type Student = { full_name: string; previous_gpa: number; current_gpa: number; attendance: number; assessment: number; assignments_completed: number };
 type Assignment = { id: number; title: string; course?: string | null; subject: string; due_date?: string | null };
@@ -16,8 +21,8 @@ type Dashboard = { student: Student; assignments: Assignment[]; recent_submissio
 type MetricSeries = Record<string, { classification: string; observations: { value: number; observed_at: string }[] }>;
 
 export default function StudentDashboard() {
-  const [data, setData] = useState<Dashboard | null>(null);
-  const [series, setSeries] = useState<MetricSeries>({});
+  const [data, setData] = useState<Dashboard | null>(() => readCachedApiData<Dashboard>('/api/v1/dashboard/student'));
+  const [series, setSeries] = useState<MetricSeries>(() => readCachedApiData<{ metrics: MetricSeries }>('/api/v1/students/me/momentum')?.metrics ?? {});
   const [error, setError] = useState('');
   useEffect(() => {
     Promise.all([api<Dashboard>('/api/v1/dashboard/student'), api<{ metrics: MetricSeries }>('/api/v1/students/me/momentum')])
@@ -41,7 +46,7 @@ export default function StudentDashboard() {
     <StudentRecoveryRoadmapCards />
     <div className="grid gap-3 sm:grid-cols-3"><Metric label="Current GPA" value={student.current_gpa.toFixed(2)} detail={`${student.current_gpa >= student.previous_gpa ? 'Up' : 'Down'} from ${student.previous_gpa.toFixed(2)} previously`} color="cyan" /><Metric label="Attendance" value={`${student.attendance.toFixed(0)}%`} detail="Your recorded attendance" color="mint" /><Metric label="Assessment progress" value={`${student.assessment.toFixed(0)}%`} detail={`${student.assignments_completed} assignments completed`} color="amber" /></div>
     <div className="grid gap-4 xl:grid-cols-[1.35fr_.8fr]">
-      <section className="surface rounded-xl p-5"><PanelTitle title="Your progress trend" /><p className="-mt-2 mb-3 text-xs text-slate-500">Dated attendance and assessment observations</p>{chartData.length ? <div className="h-64"><ResponsiveContainer width="100%" height="100%"><LineChart data={chartData} margin={{ left: -20, right: 8, top: 8, bottom: 0 }}><CartesianGrid stroke="rgba(255,255,255,.08)" vertical={false} /><XAxis dataKey="date" tick={{ fill: '#9299a2', fontSize: 10 }} axisLine={false} tickLine={false} /><YAxis domain={[0, 100]} tick={{ fill: '#9299a2', fontSize: 10 }} axisLine={false} tickLine={false} /><Tooltip contentStyle={{ background: '#25282d', border: '1px solid #454a52', borderRadius: 8, color: '#f7f8fa', fontSize: 11 }} /><Line type="monotone" dataKey="attendance" stroke="#e11d32" strokeWidth={2} dot={{ r: 2, fill: '#e11d32' }} /><Line type="monotone" dataKey="assessment" stroke="#e6e8eb" strokeWidth={2} dot={{ r: 2, fill: '#e6e8eb' }} /></LineChart></ResponsiveContainer><div className="mt-2 flex gap-4 text-[10px] text-slate-400"><span><i className="mr-1.5 inline-block size-1.5 rounded-full bg-rose-500" />Attendance</span><span><i className="mr-1.5 inline-block size-1.5 rounded-full bg-slate-200" />Assessment</span></div></div> : <Empty title="Your trend is taking shape" detail="More dated observations will appear as your term progresses." />}</section>
+      <section className="surface rounded-xl p-5"><PanelTitle title="Your progress trend" /><p className="-mt-2 mb-3 text-xs text-slate-500">Dated attendance and assessment observations</p>{chartData.length ? <div className="h-64"><StudentProgressChart data={chartData} /><div className="mt-2 flex gap-4 text-[10px] text-slate-400"><span><i className="mr-1.5 inline-block size-1.5 rounded-full bg-rose-500" />Attendance</span><span><i className="mr-1.5 inline-block size-1.5 rounded-full bg-slate-200" />Assessment</span></div></div> : <Empty title="Your trend is taking shape" detail="More dated observations will appear as your term progresses." />}</section>
       <section className="surface rounded-xl p-5"><PanelTitle title="What's coming up" href="/student/assignments" />{upcoming.length ? <div className="space-y-2">{upcoming.map((item) => <Link key={item.id} href="/student/assignments" className="flex items-start gap-3 rounded-lg border border-white/6 p-3 hover:border-cyan-200/20"><span className="grid size-8 shrink-0 place-items-center rounded-md bg-amber-100/10 text-amber-100"><CalendarDays size={15} /></span><span className="min-w-0"><span className="block truncate text-xs font-medium">{item.title}</span><span className="mt-1 block text-[10px] text-slate-500">Due {new Date(item.due_date!).toLocaleDateString()}</span></span></Link>)}</div> : <Empty title="No deadlines listed" detail="Published assignments will show up here." />}</section>
     </div>
     <div className="grid gap-4 lg:grid-cols-2">

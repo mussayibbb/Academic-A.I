@@ -1,31 +1,35 @@
 'use client';
 
 import { Activity, ArrowRight, Info } from 'lucide-react';
+import dynamic from 'next/dynamic';
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
-import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { Empty, ErrorNotice, Metric, PageHeading, RiskBadge } from '@/components/ui';
-import { api } from '@/lib/api';
+import { api, readCachedApiData } from '@/lib/api';
+
+const TeacherFeatureImportanceChart = dynamic(() => import('@/components/charts/TeacherFeatureImportanceChart'), {
+  ssr: false,
+  loading: () => <div className="skeleton h-full w-full rounded-lg" aria-hidden="true" />,
+});
 
 type Dashboard = { summary: { students: number; high_risk: number; medium_risk: number; low_risk: number } };
 type Importance = { features: { name: string; importance: number }[] };
 type Monitor = { transitions: { name: string; from: string; to: string; recorded_at: string }[] };
 
 export default function TeacherAnalyticsPage() {
-  const [dashboard, setDashboard] = useState<Dashboard | null>(null);
-  const [importance, setImportance] = useState<Importance | null>(null);
-  const [monitor, setMonitor] = useState<Monitor | null>(null);
+  const [dashboard, setDashboard] = useState<Dashboard | null>(() => readCachedApiData<Dashboard>('/api/v1/dashboard/teacher'));
+  const [importance, setImportance] = useState<Importance | null>(() => readCachedApiData<Importance>('/api/v1/risk/feature-importance'));
+  const [monitor, setMonitor] = useState<Monitor | null>(() => readCachedApiData<Monitor>('/api/v1/risk/monitoring'));
   const [error, setError] = useState('');
 
   useEffect(() => {
     Promise.all([
       api<Dashboard>('/api/v1/dashboard/teacher'),
-      api<Importance>('/api/v1/risk/feature-importance'),
       api<Monitor>('/api/v1/risk/monitoring'),
-    ]).then(([summary, factors, risk]) => {
+    ]).then(async ([summary, risk]) => {
       setDashboard(summary);
-      setImportance(factors);
       setMonitor(risk);
+      setImportance(await api<Importance>('/api/v1/risk/feature-importance'));
     }).catch((requestError: Error) => setError(requestError.message));
   }, []);
 
@@ -49,15 +53,7 @@ export default function TeacherAnalyticsPage() {
           <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-rose-300/15 bg-rose-300/[.05] text-rose-200"><Activity size={16} /></span>
         </div>
         {importance.features.length ? <div role="img" aria-label="Bar chart of global model feature contribution" className="mt-5 h-[340px]">
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={importance.features} layout="vertical" margin={{ left: 12, right: 20, top: 4, bottom: 4 }}>
-              <CartesianGrid stroke="rgba(255,255,255,.08)" horizontal={false} />
-              <XAxis type="number" tick={{ fill: '#9299a2', fontSize: 10 }} axisLine={false} tickLine={false} />
-              <YAxis type="category" dataKey="name" width={132} tickFormatter={(value: string) => value.replaceAll('_', ' ')} tick={{ fill: '#d1d4d8', fontSize: 10 }} axisLine={false} tickLine={false} />
-              <Tooltip contentStyle={{ background: '#25282d', border: '1px solid #454a52', borderRadius: 8, color: '#f7f8fa', fontSize: 11 }} />
-              <Bar dataKey="importance" fill="#e11d32" radius={[0, 4, 4, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
+          <TeacherFeatureImportanceChart data={importance.features} />
         </div> : <div className="py-8"><Empty title="Feature contributions unavailable" detail="No model feature contribution values were returned." /></div>}
         <div className="mt-3 flex gap-2 rounded-lg border border-white/[.08] bg-white/[.025] p-3 text-[10px] leading-5 text-slate-400"><Info size={13} className="mt-0.5 shrink-0 text-rose-200" />Feature contributions describe this trained demonstration model. They are not causal findings or validated institutional thresholds.</div>
       </section>

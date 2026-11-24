@@ -13,11 +13,16 @@ class StudentOut(BaseModel):
     email: str | None = None
     program: str | None = None
     year: str | None = None
+    semester: str | None = None
     section: str | None = None
     department: str | None = None
+    course_id: int | None = None
+    data_origin: str = 'LEGACY / UNVERIFIED'
     risk_level: str = 'LOW'
     risk_probability: float = Field(default=0.0, description='Probability of the predicted risk_level class.')
     risk_probability_semantics: str = 'P(risk_level)'
+    risk_status: str = 'available'
+    risk_status_message: str | None = None
     class_probabilities: dict[str, float] = Field(default_factory=dict)
     previous_gpa: float = 0.0
     current_gpa: float = 0.0

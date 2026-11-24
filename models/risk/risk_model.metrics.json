@@ -1,7 +1,7 @@
 {
-  "model_version": "risk-20260929T181441Z",
+  "model_version": "risk-20261122T140646Z",
   "selected_model": "logistic_regression",
-  "trained_at": "2026-09-29T18:14:41.796316+00:00",
+  "trained_at": "2026-11-22T14:06:46.236155+00:00",
   "training_rows": 248,
   "evaluation_rows": 62,
   "features": [

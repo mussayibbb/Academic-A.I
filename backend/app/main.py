@@ -97,6 +97,7 @@ from backend.app.models import (
 )
 from backend.app.schemas import AssignmentCreate, AssignmentOut, AssignmentStatusUpdate, GradeRequest, RubricCreate, StudentOut, StudentSelfOut, SubmissionOut
 from backend.app.schemas.academic import Fa1MaximumEvidenceReview, SubjectAcademicRecordUpdate
+from backend.app.schemas.students import StudentCreate, StudentCsvImportResult, StudentRecordOut, StudentStatsOut, StudentUpdate
 from backend.app.schemas.interventions import InterventionEditRequest, InterventionGenerateRequest
 from backend.app.schemas.learning import (
     AssessmentAttemptSubmit,
@@ -110,6 +111,13 @@ from backend.app.schemas.learning import (
     TopicAssignmentOut,
 )
 from backend.app.services.learning_assessments import validate_assessment_response, validate_short_answer_evaluation, validate_topic_map_response
+from backend.app.services.student_records import (
+    ALLOWED_ORIGINS as STUDENT_IMPORT_ORIGINS,
+    MAX_FILE_BYTES as STUDENT_IMPORT_MAX_FILE_BYTES,
+    StudentRecordConflict,
+    StudentRecordImportError,
+    import_student_records,
+)
 from backend.app.schemas.recovery import (
     RecoveryActivity,
     RecoveryPlanDecisionRequest,
@@ -242,6 +250,7 @@ def _attempt_maximum_marks(attempt: AssessmentAttempt) -> float:
         and question['marks'] > 0
     )
 CANDIDATE_ARTIFACT_DIRECTORY = BASE_DIR / 'models' / 'candidates'
+DEMO_PREVIEW_ARTIFACT = CANDIDATE_ARTIFACT_DIRECTORY / 'risk_model_candidate.joblib'
 app = FastAPI(title=settings.app_name, version='2.0.0')
 app.add_middleware(
     CORSMiddleware,
@@ -254,8 +263,21 @@ app.include_router(auth_router, prefix=settings.api_v1_prefix)
 app.include_router(recovery_workflow_router, prefix=settings.api_v1_prefix)
 
 
-def audit(db: Session, user: User, action: str, resource_type: str, resource_id: int | None = None) -> None:
-    db.add(AuditLog(actor_user_id=user.id, action=action, resource_type=resource_type, resource_id=str(resource_id) if resource_id else None))
+def audit(
+    db: Session,
+    user: User,
+    action: str,
+    resource_type: str,
+    resource_id: int | None = None,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    db.add(AuditLog(
+        actor_user_id=user.id,
+        action=action,
+        resource_type=resource_type,
+        resource_id=str(resource_id) if resource_id else None,
+        detail=detail or {},
+    ))
 
 
 def early_warning_teacher_scope(db: Session, user: User) -> tuple[list[int], list[str]]:
@@ -501,7 +523,6 @@ def student_feature_batch(
     student_ids = [student.id for student in students]
     grouped: dict[int, dict[str, list[float]]] = {}
     imported_attendance: dict[int, list[float]] = {}
-    imported_assessment: dict[int, list[float]] = {}
     observations = db.query(AcademicMomentum).filter(
         AcademicMomentum.student_id.in_(student_ids),
     ).order_by(
@@ -515,8 +536,24 @@ def student_feature_batch(
         if observation.import_batch_id is not None:
             if observation.metric == 'attendance':
                 imported_attendance.setdefault(observation.student_id, []).append(observation.value)
-            elif observation.metric == 'assessment':
-                imported_assessment.setdefault(observation.student_id, []).append(observation.value)
+
+    manual_attendance: dict[int, float] = {}
+    manual_attendance_rows = db.query(
+        AcademicMomentum.student_id,
+        AcademicMomentum.value,
+    ).join(
+        AcademicDataImportBatch,
+        AcademicDataImportBatch.id == AcademicMomentum.import_batch_id,
+    ).filter(
+        AcademicMomentum.student_id.in_(student_ids),
+        AcademicMomentum.metric == 'attendance',
+        AcademicDataImportBatch.dataset_type == 'student_record_update',
+    ).order_by(
+        AcademicMomentum.observed_at.desc(),
+        AcademicMomentum.id.desc(),
+    ).all()
+    for student_id, value in manual_attendance_rows:
+        manual_attendance.setdefault(student_id, value)
 
     assigned_counts = dict(db.query(
         AssignmentStudent.student_id,
@@ -538,29 +575,20 @@ def student_feature_batch(
         metrics = grouped.get(student.id, {})
         trends = {metric: calculate_momentum(values) for metric, values in metrics.items()}
         attendance_trend = trends.get('attendance', calculate_momentum([]))
-        assessment_trend = trends.get('assessment', calculate_momentum([]))
         activities = metrics.get('activity', [])
-        slopes = [
-            trend['trend_slope']
-            for trend in (attendance_trend, assessment_trend)
-            if trend['trend_slope'] is not None
-        ]
         attendance = imported_attendance.get(student.id, [])
-        assessment = imported_assessment.get(student.id, [])
+        assigned = assigned_counts.get(student.id, 0)
+        submitted = submitted_counts.get(student.id, 0)
         features_by_student[student.id] = {
-            'attendance': sum(attendance) / len(attendance) if attendance else student.attendance,
-            'assessment': sum(assessment) / len(assessment) if assessment else student.assessment,
-            'previous_gpa': student.previous_gpa,
-            'current_gpa': student.current_gpa,
+            'attendance': manual_attendance.get(
+                student.id,
+                sum(attendance) / len(attendance) if attendance else student.attendance,
+            ),
             'assignments_completed': student.assignments_completed,
             'activity_per_week': sum(activities[-4:]) / max(1, len(activities[-4:])),
-            'missing_submissions': float(max(
-                0,
-                assigned_counts.get(student.id, 0) - submitted_counts.get(student.id, 0),
-            )),
+            'missing_submissions': float(max(0, assigned - submitted)),
             'attendance_change': float(attendance_trend['percent_change'] or 0),
-            'assessment_change': float(assessment_trend['percent_change'] or 0),
-            'momentum_score': sum(slopes) / len(slopes) if slopes else 0.0,
+            'assignment_submission_rate': float(submitted / max(assigned, 1)),
         }
         momentum_by_student[student.id] = trends
     return features_by_student, momentum_by_student
@@ -575,18 +603,99 @@ def student_risk_data(
     student: Student,
     features: dict[str, float],
     prediction: dict[str, Any],
+    *,
+    risk_status: str = 'available',
+    risk_status_message: str | None = None,
 ) -> dict[str, Any]:
     student_data = StudentOut.model_validate(student).model_dump()
     student_data.update({
         'attendance': features['attendance'],
-        'assessment': features['assessment'],
         'assignments_completed': features['assignments_completed'],
+        'missing_submissions': features['missing_submissions'],
+        'assignment_submission_rate': features['assignment_submission_rate'],
+        'activity_per_week': features['activity_per_week'],
         'risk_level': prediction['risk_level'],
         'risk_probability': prediction['risk_probability'],
         'risk_probability_semantics': prediction['risk_probability_semantics'],
         'class_probabilities': prediction['class_probabilities'],
+        'risk_status': risk_status,
+        'risk_status_message': risk_status_message,
     })
     return student_data
+
+
+def student_model_signal_counts(students: list[Student], db: Session) -> dict[int, int]:
+    if not students:
+        return {}
+    student_ids = [student.id for student in students]
+    momentum_counts: dict[int, dict[str, int]] = {}
+    for student_id, metric, count in db.query(
+        AcademicMomentum.student_id,
+        AcademicMomentum.metric,
+        func.count(AcademicMomentum.id),
+    ).filter(
+        AcademicMomentum.student_id.in_(student_ids),
+        AcademicMomentum.metric.in_(['attendance', 'activity']),
+    ).group_by(
+        AcademicMomentum.student_id,
+        AcademicMomentum.metric,
+    ).all():
+        momentum_counts.setdefault(student_id, {})[metric] = count
+    attendance_counts = dict(db.query(
+        Attendance.student_id,
+        func.count(Attendance.id),
+    ).filter(Attendance.student_id.in_(student_ids)).group_by(Attendance.student_id).all())
+    assignment_counts = dict(db.query(
+        AssignmentStudent.student_id,
+        func.count(AssignmentStudent.id),
+    ).filter(AssignmentStudent.student_id.in_(student_ids)).group_by(AssignmentStudent.student_id).all())
+    submission_counts = dict(db.query(
+        Submission.student_id,
+        func.count(Submission.id),
+    ).filter(Submission.student_id.in_(student_ids)).group_by(Submission.student_id).all())
+
+    counts: dict[int, int] = {}
+    for student in students:
+        momentum = momentum_counts.get(student.id, {})
+        has_attendance = (
+            student.attendance > 0
+            or momentum.get('attendance', 0) > 0
+            or attendance_counts.get(student.id, 0) > 0
+        )
+        has_assignments = (
+            student.assignments_completed > 0
+            or assignment_counts.get(student.id, 0) > 0
+        )
+        has_activity = momentum.get('activity', 0) > 0
+        has_attendance_history = momentum.get('attendance', 0) >= 2
+        has_submissions = submission_counts.get(student.id, 0) > 0
+        counts[student.id] = sum((
+            has_attendance,
+            has_assignments,
+            has_assignments,
+            has_activity,
+            has_attendance_history,
+            has_submissions,
+        ))
+    return counts
+
+
+def student_risk_availability(
+    student: Student,
+    db: Session,
+    *,
+    demo_model: bool | None = None,
+    usable_signals: int | None = None,
+) -> tuple[str, str | None]:
+    if demo_model is None:
+        demo_model = early_warning_uses_demo_model(db)
+    if demo_model and student.data_origin != 'DEMO DATA':
+        return 'unavailable', 'The active model is trained on DEMO DATA and cannot assess this non-demo or unverified record.'
+    if usable_signals is None:
+        usable_signals = student_model_signal_counts([student], db)[student.id]
+    if usable_signals < MINIMUM_USABLE_SIGNALS:
+        return 'insufficient-data', 'There are not enough model-supported signals to produce a risk prediction.'
+    return ('unvalidated-demo-model', 'Unvalidated preview from a model trained on DEMO DATA.') if demo_model else ('available', None)
 
 
 def student_risk_views_from_features(
@@ -596,18 +705,70 @@ def student_risk_views_from_features(
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     if not students:
         return []
+    demo_model = early_warning_uses_demo_model(db)
+    signal_counts = student_model_signal_counts(students, db)
+    scorable_students = [
+        student for student in students
+        if signal_counts[student.id] >= MINIMUM_USABLE_SIGNALS
+        and (not demo_model or student.data_origin == 'DEMO DATA')
+    ]
+    predictions_by_student: dict[int, dict[str, Any]] = {}
     try:
-        artifact_path = selected_model_artifact(db)
-        predictions = predict_many_risks(
-            [features_by_student[student.id] for student in students],
-            artifact_path,
-        )
+        if scorable_students:
+            artifact_path = demo_preview_artifact_path() if demo_model else selected_model_artifact(db)
+            predictions = predict_many_risks(
+                [features_by_student[student.id] for student in scorable_students],
+                artifact_path,
+            )
+            if len(predictions) != len(scorable_students):
+                raise HTTPException(status_code=503, detail='The active risk model did not return one prediction per scorable student.')
+            predictions_by_student = {
+                student.id: prediction
+                for student, prediction in zip(scorable_students, predictions)
+            }
     except FileNotFoundError as exc:
         raise HTTPException(status_code=503, detail='Risk model is not trained. Run the documented training command first.') from exc
-    return [
-        (student_risk_data(student, features_by_student[student.id], prediction), prediction)
-        for student, prediction in zip(students, predictions)
-    ]
+
+    risk_views: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for student in students:
+        prediction = predictions_by_student.get(student.id)
+        if prediction is None:
+            status, reason = student_risk_availability(
+                student,
+                db,
+                demo_model=demo_model,
+                usable_signals=signal_counts[student.id],
+            )
+            unavailable = {
+                'risk_level': 'UNAVAILABLE',
+                'risk_probability': 0.0,
+                'risk_probability_semantics': 'unavailable',
+                'class_probabilities': {},
+                'model_version': None,
+            }
+            unavailable['risk_probability_semantics'] = status
+            risk_views.append((
+                student_risk_data(
+                    student,
+                    features_by_student[student.id],
+                    unavailable,
+                    risk_status=status,
+                    risk_status_message=reason,
+                ),
+                unavailable,
+            ))
+            continue
+        risk_views.append((
+            student_risk_data(
+                student,
+                features_by_student[student.id],
+                prediction,
+                risk_status='unvalidated-demo-model' if demo_model else 'available',
+                risk_status_message='Unvalidated preview from a model trained on DEMO DATA.' if demo_model else None,
+            ),
+            prediction,
+        ))
+    return risk_views
 
 
 def student_risk_views(
@@ -624,12 +785,8 @@ def student_risk_views(
 
 
 def student_risk_view(student: Student, db: Session) -> tuple[dict[str, Any], dict[str, Any]]:
-    try:
-        features = student_features(student, db)
-        prediction = predict_with_active_model(features, db)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=503, detail='Risk model is not trained. Run the documented training command first.') from exc
-    return student_risk_data(student, features, prediction), prediction
+    risk_views, _, _ = student_risk_views([student], db)
+    return risk_views[0]
 
 
 def model_feature_schema() -> list[str]:
@@ -642,7 +799,7 @@ def model_feature_schema() -> list[str]:
     if not isinstance(features, list):
         features = getattr(artifact.get('pipeline'), 'feature_names_in_', None)
         features = features.tolist() if features is not None else None
-    if not isinstance(features, list) or set(features) != set(FEATURES):
+    if not isinstance(features, list):
         raise HTTPException(status_code=503, detail='The production model feature contract does not match the supported prediction contract.')
     return [str(name) for name in features]
 
@@ -701,9 +858,45 @@ def early_warning_uses_demo_model(db: Session) -> bool:
     return artifact.get('metadata', {}).get('demo_data') is True
 
 
+def demo_preview_artifact_path() -> Path:
+    if not DEMO_PREVIEW_ARTIFACT.is_file():
+        raise HTTPException(status_code=503, detail='The DEMO / RULE-GENERATED preview candidate artifact is unavailable.')
+    artifact = load_artifact(DEMO_PREVIEW_ARTIFACT)
+    metadata = artifact.get('metadata', {})
+    contract = artifact.get('feature_contract')
+    if contract is not None and list(contract) != FEATURES:
+        raise HTTPException(status_code=503, detail='The DEMO preview candidate feature contract is incompatible with the live marks-free contract.')
+    if metadata.get('target_label_provenance') != 'transparent_rule_generated_demo_label':
+        raise HTTPException(status_code=503, detail='The DEMO preview candidate does not identify rule-generated training provenance.')
+    if metadata.get('demo_data') is not True:
+        raise HTTPException(status_code=503, detail='The preview candidate is not explicitly marked as DEMO / TEST DATA.')
+    return DEMO_PREVIEW_ARTIFACT
+
+
+def predict_with_demo_preview(features: dict[str, float]) -> dict[str, Any]:
+    return predict_risk(features, demo_preview_artifact_path())
+
+
+def explain_with_demo_preview(features: dict[str, float], *, target_class: str | None = None) -> dict[str, Any]:
+    return explain_student(features, demo_preview_artifact_path(), target_class=target_class)
+
+
 def predict_with_active_model(features: dict[str, float], db: Session) -> dict[str, Any]:
     artifact_path = selected_model_artifact(db)
     return predict_risk(features) if artifact_path.resolve() == DEFAULT_ARTIFACT.resolve() else predict_risk(features, artifact_path)
+
+
+def high_class_probability(prediction: dict[str, Any]) -> float:
+    class_probabilities = prediction.get('class_probabilities')
+    if not isinstance(class_probabilities, dict) or 'HIGH' not in class_probabilities:
+        raise HTTPException(status_code=503, detail='Active risk model did not return the HIGH-class probability.')
+    try:
+        probability = float(class_probabilities['HIGH'])
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail='Active risk model returned an invalid HIGH-class probability.') from exc
+    if not math.isfinite(probability) or not 0 <= probability <= 1:
+        raise HTTPException(status_code=503, detail='Active risk model returned an invalid HIGH-class probability.')
+    return probability
 
 
 def explain_with_active_model(features: dict[str, float], db: Session, *, target_class: str | None = None) -> dict[str, Any]:
@@ -720,12 +913,11 @@ def validate_simulation_scenario(scenario: dict[str, float]) -> dict[str, float]
         raise HTTPException(status_code=422, detail='Provide at least one supported model feature in the scenario payload.')
     bounds = {
         'attendance': (0.0, 100.0),
-        'assessment': (0.0, 100.0),
-        'previous_gpa': (0.0, 4.0),
-        'current_gpa': (0.0, 4.0),
         'assignments_completed': (0.0, None),
         'activity_per_week': (0.0, None),
         'missing_submissions': (0.0, None),
+        'attendance_change': (None, None),
+        'assignment_submission_rate': (0.0, 1.0),
     }
     validated: dict[str, float] = {}
     for feature, raw_value in scenario.items():
@@ -876,10 +1068,16 @@ def compute_data_quality_report(db: Session) -> dict[str, Any]:
     }
 
 
-def risk_transition_report(db: Session) -> dict[str, Any]:
-    students = db.query(Student).order_by(Student.id).all()
+def risk_transition_report(db: Session, student_ids: set[int] | None = None) -> dict[str, Any]:
+    student_query = db.query(Student).order_by(Student.id)
+    if student_ids is not None:
+        student_query = student_query.filter(Student.id.in_(student_ids))
+    students = student_query.all()
     histories: dict[int, list[RiskPrediction]] = {student.id: [] for student in students}
-    for prediction in db.query(RiskPrediction).order_by(RiskPrediction.student_id, RiskPrediction.prediction_timestamp, RiskPrediction.id).all():
+    prediction_query = db.query(RiskPrediction)
+    if student_ids is not None:
+        prediction_query = prediction_query.filter(RiskPrediction.student_id.in_(student_ids))
+    for prediction in prediction_query.order_by(RiskPrediction.student_id, RiskPrediction.prediction_timestamp, RiskPrediction.id).all():
         histories.setdefault(prediction.student_id, []).append(prediction)
     insufficient = [student.id for student in students if len(histories.get(student.id, [])) < 2]
     transitions = []
@@ -960,6 +1158,7 @@ def list_academic_imports(user: CurrentTeacher, db: Session = Depends(get_db)) -
         'imported_rows': batch.imported_rows,
         'rejected_rows': batch.rejected_rows,
         'duplicate_rows': batch.duplicate_rows,
+        'source_provenance': batch.source_provenance or {},
         'created_at': batch.created_at.isoformat(),
     } for batch in batches]
 
@@ -2500,7 +2699,12 @@ def academic_register(
     for student in page:
         row = build_register_row(student, records.get(student.id, {}), period)
         current, _ = student_risk_view(student, db)
-        row.update({'risk_level': current['risk_level'], 'risk_probability': current['risk_probability']})
+        row.update({
+            'risk_level': current['risk_level'],
+            'risk_probability': current['risk_probability'],
+            'risk_status': current['risk_status'],
+            'risk_status_message': current['risk_status_message'],
+        })
         items.append(row)
     return {
         'subjects': [{'code': subject.code, 'name': subject.name} for subject in subjects],
@@ -2639,7 +2843,12 @@ def update_academic_record(
     records = subject_records_by_student(db, [student.id], period).get(student.id, {})
     register_row = build_register_row(student, records, period)
     current_student, _ = student_risk_view(student, db)
-    register_row.update({'risk_level': current_student['risk_level'], 'risk_probability': current_student['risk_probability']})
+    register_row.update({
+        'risk_level': current_student['risk_level'],
+        'risk_probability': current_student['risk_probability'],
+        'risk_status': current_student['risk_status'],
+        'risk_status_message': current_student['risk_status_message'],
+    })
     return {
         'student_id': student.student_id,
         'subject_code': subject.code,
@@ -2764,6 +2973,21 @@ def teacher_dashboard(user: CurrentTeacher, db: Session = Depends(get_db)) -> di
     students = db.query(Student).order_by(Student.full_name).all()
     risk_views, _, _ = student_risk_views(students, db)
     current_students = [student_data for student_data, _ in risk_views]
+    scorable_students = [
+        item for item in current_students
+        if item['risk_status'] in {'available', 'unvalidated-demo-model'}
+    ]
+    demo_model = early_warning_uses_demo_model(db)
+    risk_status = 'unvalidated-demo-model' if demo_model else (
+        'partial' if len(scorable_students) < len(students) else 'available'
+    )
+    risk_status_message = (
+        'Risk distribution is an unvalidated demo preview and includes only records explicitly marked DEMO DATA.'
+        if demo_model else (
+            f'{len(students) - len(scorable_students)} record(s) are excluded because they lack sufficient risk-model data.'
+            if len(scorable_students) < len(students) else None
+        )
+    )
     assignments = db.query(Assignment).filter(Assignment.status == 'active').all()
     submissions = db.query(Submission).all()
     pending_reviews = sum(item.status in {'submitted', 'late'} and item.grade is None for item in submissions)
@@ -2780,8 +3004,11 @@ def teacher_dashboard(user: CurrentTeacher, db: Session = Depends(get_db)) -> di
             'high_risk': sum(item['risk_level'] == 'HIGH' for item in current_students),
             'medium_risk': sum(item['risk_level'] == 'MEDIUM' for item in current_students),
             'low_risk': sum(item['risk_level'] == 'LOW' for item in current_students),
+            'risk_scored_students': len(scorable_students),
         },
-        'students_needing_attention': [item for item in current_students if item['risk_level'] in {'HIGH', 'MEDIUM'}][:12],
+        'risk_status': risk_status,
+        'risk_status_message': risk_status_message,
+        'students_needing_attention': [item for item in scorable_students if item['risk_level'] in {'HIGH', 'MEDIUM'}][:12],
         'assignments': [AssignmentOut.model_validate(item).model_dump() for item in assignments[:6]],
         'upcoming_deadlines': [AssignmentOut.model_validate(item).model_dump() for item in assignments if item.due_date and item.due_date >= now][:8],
     }
@@ -2810,6 +3037,8 @@ def list_students(
     search: str | None = None,
     risk: str | None = None,
     department: str | None = None,
+    program: str | None = None,
+    semester: str | None = None,
     section: str | None = None,
     course: str | None = None,
     momentum: str | None = None,
@@ -2817,14 +3046,20 @@ def list_students(
     attendance_max: float | None = None,
     sort: str = 'full_name',
     direction: str = 'asc',
-    offset: int = 0,
-    limit: int = 50,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
 ) -> dict[str, Any]:
     query = db.query(Student)
     if search:
-        query = query.filter(Student.full_name.ilike(f'%{search}%') | Student.student_id.ilike(f'%{search}%'))
+        search_value = search.strip()
+        if search_value:
+            query = query.filter(Student.full_name.ilike(f'%{search_value}%') | Student.student_id.ilike(f'%{search_value}%'))
     if department:
         query = query.filter(Student.department == department)
+    if program:
+        query = query.filter(Student.program == program)
+    if semester:
+        query = query.filter(Student.semester == semester)
     if section:
         query = query.filter(Student.section == section)
     if course:
@@ -2843,12 +3078,450 @@ def list_students(
         if momentum and values['momentum_trend'] != momentum.upper():
             continue
         response_items.append(values)
-    sortable = {'full_name', 'risk_level', 'risk_probability', 'attendance', 'current_gpa'}
+    sortable = {
+        'full_name',
+        'student_id',
+        'department',
+        'semester',
+        'risk_level',
+        'risk_probability',
+        'attendance',
+        'current_gpa',
+        'assignments_completed',
+    }
     sort_key = sort if sort in sortable else 'full_name'
-    response_items.sort(key=lambda item: item[sort_key], reverse=direction.lower() == 'desc')
+    response_items.sort(
+        key=lambda item: (item.get(sort_key) is None, item.get(sort_key)),
+        reverse=direction.lower() == 'desc',
+    )
     total = len(response_items)
-    items = response_items[max(offset, 0):max(offset, 0) + min(max(limit, 1), 100)]
+    items = response_items[offset:offset + limit]
     return {'items': items, 'total': total}
+
+
+def _management_student(student_identifier: str, db: Session) -> Student:
+    query = db.query(Student)
+    if student_identifier.isdigit():
+        query = query.filter(Student.id == int(student_identifier))
+    else:
+        query = query.filter(Student.student_id == student_identifier)
+    student = query.first()
+    if student is None:
+        raise HTTPException(status_code=404, detail='Student not found.')
+    return student
+
+
+def _validate_student_course(course_id: int | None, db: Session) -> None:
+    if course_id is not None and db.query(Course.id).filter(Course.id == course_id).first() is None:
+        raise HTTPException(status_code=422, detail='The selected course does not exist.')
+
+
+def _validate_student_unique_fields(
+    student_id: str | None,
+    email: str | None,
+    db: Session,
+    *,
+    exclude_student_id: int | None = None,
+) -> None:
+    student_id_query = db.query(Student.id).filter(func.lower(Student.student_id) == student_id.lower()) if student_id else None
+    email_query = db.query(Student.id).filter(func.lower(Student.email) == email.lower()) if email else None
+    if exclude_student_id is not None:
+        if student_id_query is not None:
+            student_id_query = student_id_query.filter(Student.id != exclude_student_id)
+        if email_query is not None:
+            email_query = email_query.filter(Student.id != exclude_student_id)
+    if student_id_query is not None and student_id_query.first():
+        raise HTTPException(status_code=409, detail='That student ID is already in use.')
+    if email_query is not None and email_query.first():
+        raise HTTPException(status_code=409, detail='That email address is already in use.')
+
+
+def _student_model_signal_count(student: Student, db: Session) -> int:
+    return student_model_signal_counts([student], db)[student.id]
+
+
+def _reassess_student_after_change(student: Student, user: User, db: Session) -> dict[str, Any]:
+    signal_count = _student_model_signal_count(student, db)
+    if signal_count < MINIMUM_USABLE_SIGNALS:
+        return {
+            'status': 'insufficient-data',
+            'usable_signals': signal_count,
+            'required_signals': MINIMUM_USABLE_SIGNALS,
+            'message': 'Academic data was saved, but there are not enough model-supported signals to reassess risk.',
+        }
+
+    try:
+        demo_model = early_warning_uses_demo_model(db)
+        if demo_model:
+            if student.data_origin != 'DEMO DATA':
+                return {
+                    'status': 'unavailable',
+                    'usable_signals': signal_count,
+                    'required_signals': MINIMUM_USABLE_SIGNALS,
+                    'message': 'The active model is trained on DEMO DATA and cannot assess this non-demo student record.',
+                }
+            prediction = predict_with_demo_preview(student_features(student, db))
+            return {
+                'status': 'unvalidated-demo-model',
+                'usable_signals': signal_count,
+                'required_signals': MINIMUM_USABLE_SIGNALS,
+                'message': 'The result is an unvalidated demo preview and was not saved as a validated risk prediction.',
+                'prediction': prediction,
+            }
+        features = student_features(student, db)
+        prediction = predict_with_active_model(features, db)
+    except FileNotFoundError:
+        return {
+            'status': 'unavailable',
+            'usable_signals': signal_count,
+            'required_signals': MINIMUM_USABLE_SIGNALS,
+            'message': 'Academic data was saved, but the active risk model is unavailable.',
+        }
+    except HTTPException as exc:
+        if exc.status_code != 503:
+            raise
+        return {
+            'status': 'unavailable',
+            'usable_signals': signal_count,
+            'required_signals': MINIMUM_USABLE_SIGNALS,
+            'message': str(exc.detail),
+        }
+
+    student.risk_level = prediction['risk_level']
+    student.risk_probability = prediction['risk_probability']
+    db.add(RiskPrediction(
+        student_id=student.id,
+        risk_level=prediction['risk_level'],
+        probability=prediction['risk_probability'],
+        model_version=prediction['model_version'],
+        prediction_timestamp=prediction['prediction_timestamp'],
+        input_features=features,
+    ))
+    db.add(RiskSnapshot(
+        student_id=student.id,
+        model_version=prediction['model_version'],
+        risk_level=prediction['risk_level'],
+        probability=prediction['risk_probability'],
+        recorded_at=prediction['prediction_timestamp'].replace(tzinfo=None),
+    ))
+    audit(db, user, 'student.risk_reassessed', 'student', student.id, {
+        'risk_level': prediction['risk_level'],
+        'model_version': prediction['model_version'],
+    })
+    db.commit()
+    return {
+        'status': 'available',
+        'usable_signals': signal_count,
+        'required_signals': MINIMUM_USABLE_SIGNALS,
+        'prediction': prediction,
+    }
+
+
+def _record_management_attendance(student: Student, user: User, db: Session) -> None:
+    observed_at = datetime.utcnow()
+    fingerprint = hashlib.sha256(
+        f'{student.id}:{observed_at.isoformat()}:{student.attendance}'.encode('utf-8')
+    ).hexdigest()
+    batch = AcademicDataImportBatch(
+        dataset_type='student_record_update',
+        source_filename='teacher-student-edit',
+        file_checksum=fingerprint,
+        imported_by_user_id=user.id,
+        imported_rows=1,
+        rejected_rows=0,
+        duplicate_rows=0,
+        validation_errors=[],
+    )
+    db.add(batch)
+    db.flush()
+    row_checksum = hashlib.sha256(f'{fingerprint}:attendance'.encode('utf-8')).hexdigest()
+    db.add(AcademicDataImportRow(
+        batch_id=batch.id,
+        dataset_type='student_record_update',
+        row_checksum=row_checksum,
+        row_number=1,
+        status='imported',
+        student_id=student.id,
+        errors=[],
+    ))
+    db.add(AcademicMomentum(
+        student_id=student.id,
+        import_batch_id=batch.id,
+        metric='attendance',
+        value=student.attendance,
+        observed_at=observed_at,
+    ))
+
+
+@app.get(f'{settings.api_v1_prefix}/students/options')
+def student_directory_options(user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
+    def distinct_values(column: Any) -> list[str]:
+        values = db.query(column).filter(column.is_not(None), column != '').distinct().all()
+        return sorted(value for (value,) in values if value)
+
+    courses = db.query(Course).order_by(Course.code).all()
+    return {
+        'departments': distinct_values(Student.department),
+        'programs': distinct_values(Student.program),
+        'semesters': distinct_values(Student.semester),
+        'sections': distinct_values(Student.section),
+        'courses': [{'id': item.id, 'code': item.code, 'name': item.name} for item in courses],
+    }
+
+
+@app.get(f'{settings.api_v1_prefix}/students/stats', response_model=StudentStatsOut)
+def student_management_stats(user: CurrentTeacher, db: Session = Depends(get_db)) -> StudentStatsOut:
+    students = db.query(Student).all()
+    origins: dict[str, int] = {}
+    for student in students:
+        origins[student.data_origin] = origins.get(student.data_origin, 0) + 1
+
+    high_risk: int | None = None
+    medium_risk: int | None = None
+    low_risk: int | None = None
+    attention: int | None = None
+    prediction_status = 'available'
+    prediction_message: str | None = None
+    try:
+        risk_views, _, _ = student_risk_views(students, db) if students else ([], {}, {})
+        high_risk = sum(prediction['risk_level'] == 'HIGH' for _, prediction in risk_views)
+        medium_risk = sum(prediction['risk_level'] == 'MEDIUM' for _, prediction in risk_views)
+        low_risk = sum(prediction['risk_level'] == 'LOW' for _, prediction in risk_views)
+        attention = high_risk + medium_risk
+        incomplete_count = sum(
+            values['risk_status'] in {'unavailable', 'insufficient-data'}
+            for values, _ in risk_views
+        )
+        demo_model = early_warning_uses_demo_model(db)
+        if demo_model:
+            prediction_status = 'unvalidated-demo-model'
+            prediction_message = (
+                'Unvalidated DEMO DATA previews are counted only for demo-origin records; other records are not scored.'
+            )
+        elif incomplete_count:
+            prediction_status = 'partial' if incomplete_count < len(students) else 'unavailable'
+            prediction_message = f'{incomplete_count} record(s) lack sufficient model-supported signals and are excluded from risk counts.'
+    except HTTPException as exc:
+        if exc.status_code != 503:
+            raise
+        prediction_status = 'unavailable'
+        prediction_message = str(exc.detail)
+
+    now = datetime.utcnow()
+    return StudentStatsOut(
+        total=len(students),
+        high_risk=high_risk,
+        medium_risk=medium_risk,
+        low_risk=low_risk,
+        average_attendance=round(sum(student.attendance for student in students) / len(students), 2) if students else None,
+        average_gpa=round(sum(student.current_gpa for student in students) / len(students), 2) if students else None,
+        attention=attention,
+        recently_added=sum(
+            student.created_at is not None and student.created_at >= now - timedelta(days=30)
+            for student in students
+        ),
+        by_origin=origins,
+        prediction_status=prediction_status,
+        prediction_message=prediction_message,
+    )
+
+
+@app.post(f'{settings.api_v1_prefix}/students', status_code=201)
+def create_student_record(
+    payload: StudentCreate,
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    values = payload.model_dump()
+    _validate_student_unique_fields(values['student_id'], values['email'], db)
+    _validate_student_course(values['course_id'], db)
+    student = Student(**values, data_origin='MANUALLY ADDED')
+    db.add(student)
+    try:
+        db.flush()
+        audit(db, user, 'student.created', 'student', student.id, {
+            'data_origin': student.data_origin,
+            'fields': sorted(values),
+        })
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail='A student with that ID or email already exists.') from exc
+    db.refresh(student)
+    reassessment = _reassess_student_after_change(student, user, db)
+    return {
+        'student': StudentRecordOut.model_validate(student).model_dump(),
+        'risk_reassessment': reassessment,
+    }
+
+
+@app.put(f'{settings.api_v1_prefix}/students/{{student_id}}')
+def update_student_record(
+    student_id: str,
+    payload: StudentUpdate,
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    student = _management_student(student_id, db)
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=422, detail='Provide at least one student field to update.')
+    _validate_student_unique_fields(
+        updates.get('student_id'),
+        updates.get('email'),
+        db,
+        exclude_student_id=student.id,
+    )
+    if 'course_id' in updates:
+        _validate_student_course(updates['course_id'], db)
+
+    attendance_changed = 'attendance' in updates and updates['attendance'] != student.attendance
+    for field, value in updates.items():
+        setattr(student, field, value)
+    if attendance_changed:
+        _record_management_attendance(student, user, db)
+    audit(db, user, 'student.updated', 'student', student.id, {
+        'fields': sorted(updates),
+        'data_origin': student.data_origin,
+    })
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail='A student with that ID or email already exists.') from exc
+    db.refresh(student)
+    reassessment = _reassess_student_after_change(student, user, db)
+    return {
+        'student': StudentRecordOut.model_validate(student).model_dump(),
+        'risk_reassessment': reassessment,
+    }
+
+
+@app.delete(f'{settings.api_v1_prefix}/students/{{student_id}}')
+def delete_student_record(
+    student_id: str,
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+) -> dict[str, bool]:
+    student = _management_student(student_id, db)
+    audit(db, user, 'student.deleted', 'student', student.id, {
+        'student_id': student.student_id,
+        'data_origin': student.data_origin,
+    })
+    db.delete(student)
+    db.commit()
+    return {'deleted': True}
+
+
+@app.post(f'{settings.api_v1_prefix}/students/import', response_model=StudentCsvImportResult)
+async def import_student_records_csv(
+    user: CurrentTeacher,
+    file: UploadFile = File(...),
+    data_origin: str = Form(...),
+    source_description: str = Form(default=''),
+    source_verified: bool = Form(default=False),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if data_origin not in STUDENT_IMPORT_ORIGINS:
+        raise HTTPException(status_code=422, detail='Choose either DEMO DATA or INSTITUTIONAL IMPORT.')
+    content = await file.read(STUDENT_IMPORT_MAX_FILE_BYTES + 1)
+    await file.close()
+    try:
+        result = import_student_records(
+            db,
+            user_id=user.id,
+            file_name=file.filename or 'student-records.csv',
+            content=content,
+            data_origin=data_origin,
+            source_description=source_description,
+            source_verified=source_verified,
+        )
+    except StudentRecordImportError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StudentRecordConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    audit(db, user, 'student.csv_imported', 'student_import_batch', result['batch_id'], {
+        'source_provenance': result['source_provenance'],
+        'imported': result['imported'],
+        'rejected': result['rejected'],
+        'duplicates': result['duplicates'],
+        'duplicate_import': result['duplicate_import'],
+    })
+    db.commit()
+    return result
+
+
+@app.get(f'{settings.api_v1_prefix}/students/export.csv')
+def export_student_records_csv(
+    user: CurrentTeacher,
+    db: Session = Depends(get_db),
+    search: str | None = None,
+    department: str | None = None,
+    program: str | None = None,
+    semester: str | None = None,
+    section: str | None = None,
+    course: str | None = None,
+) -> StreamingResponse:
+    query = db.query(Student)
+    if search and search.strip():
+        search_value = search.strip()
+        query = query.filter(Student.full_name.ilike(f'%{search_value}%') | Student.student_id.ilike(f'%{search_value}%'))
+    if department:
+        query = query.filter(Student.department == department)
+    if program:
+        query = query.filter(Student.program == program)
+    if semester:
+        query = query.filter(Student.semester == semester)
+    if section:
+        query = query.filter(Student.section == section)
+    if course:
+        query = query.filter(Student.course.has(Course.code == course))
+
+    students = query.order_by(Student.full_name).all()
+    output = io.StringIO(newline='')
+    writer = csv.writer(output)
+    writer.writerow([
+        'student_id',
+        'full_name',
+        'email',
+        'program',
+        'year',
+        'semester',
+        'section',
+        'department',
+        'course_code',
+        'previous_gpa',
+        'current_gpa',
+        'attendance',
+        'assessment',
+        'assignments_completed',
+        'data_origin',
+    ])
+    for student in students:
+        writer.writerow([
+            student.student_id,
+            student.full_name,
+            student.email or '',
+            student.program or '',
+            student.year or '',
+            student.semester or '',
+            student.section or '',
+            student.department or '',
+            student.course.code if student.course else '',
+            student.previous_gpa,
+            student.current_gpa,
+            student.attendance,
+            student.assessment,
+            student.assignments_completed,
+            student.data_origin,
+        ])
+    audit(db, user, 'student.csv_exported', 'student', detail={'rows': len(students)})
+    db.commit()
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type='text/csv; charset=utf-8',
+        headers={'Content-Disposition': 'attachment; filename="student-records.csv"'},
+    )
 
 
 @app.get(f'{settings.api_v1_prefix}/students/me')
@@ -5224,15 +5897,14 @@ def current_student_risk(student_id: int, user: CurrentTeacher, db: Session = De
     student = db.query(Student).filter(Student.id == student_id).first()
     if student is None:
         raise HTTPException(status_code=404, detail='Student not found')
+    student_data, prediction = student_risk_view(student, db)
     features = student_features(student, db)
-    try:
-        prediction = predict_with_active_model(features, db)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=503, detail='The production risk model is unavailable.') from exc
     return {
-        'student': {'id': student.id, 'student_id': student.student_id, 'full_name': student.full_name},
+        'student': student_data,
         'features': features,
         'prediction': prediction,
+        'risk_status': student_data['risk_status'],
+        'risk_status_message': student_data['risk_status_message'],
     }
 
 
@@ -5258,10 +5930,17 @@ def student_explanation(student_id: int, user: CurrentTeacher, db: Session = Dep
     student = db.query(Student).filter(Student.id == student_id).first()
     if student is None:
         raise HTTPException(status_code=404, detail='Student not found')
+    risk_status, status_message = student_risk_availability(student, db)
+    if risk_status in {'unavailable', 'insufficient-data'}:
+        raise HTTPException(status_code=503 if risk_status == 'unavailable' else 409, detail=status_message)
     features = student_features(student, db)
     try:
-        prediction = predict_with_active_model(features, db)
-        explanation = explain_with_active_model(features, db, target_class=prediction['risk_level'])
+        demo_model = risk_status == 'unvalidated-demo-model'
+        prediction = predict_with_demo_preview(features) if demo_model else predict_with_active_model(features, db)
+        explanation = (
+            explain_with_demo_preview(features, target_class=prediction['risk_level'])
+            if demo_model else explain_with_active_model(features, db, target_class=prediction['risk_level'])
+        )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=503, detail='Risk model or SHAP background is unavailable.') from exc
     return {
@@ -5269,6 +5948,8 @@ def student_explanation(student_id: int, user: CurrentTeacher, db: Session = Dep
         'prediction': prediction,
         'features': features,
         'explanation': explanation,
+        'risk_status': risk_status,
+        'risk_status_message': status_message,
     }
 
 
@@ -5385,45 +6066,70 @@ def student_shap(student_id: int, user: CurrentTeacher, db: Session = Depends(ge
     student = db.query(Student).filter(Student.id == student_id).first()
     if student is None:
         raise HTTPException(status_code=404, detail='Student not found')
+    risk_status, status_message = student_risk_availability(student, db)
+    if risk_status in {'unavailable', 'insufficient-data'}:
+        raise HTTPException(status_code=503 if risk_status == 'unavailable' else 409, detail=status_message)
+    demo_model = risk_status == 'unvalidated-demo-model'
     features = student_features(student, db)
     try:
-        prediction = predict_with_active_model(features, db)
-        explanation = explain_with_active_model(features, db, target_class=prediction['risk_level'])
+        prediction = predict_with_demo_preview(features) if demo_model else predict_with_active_model(features, db)
+        explanation = (
+            explain_with_demo_preview(features, target_class=prediction['risk_level'])
+            if demo_model else explain_with_active_model(features, db, target_class=prediction['risk_level'])
+        )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=503, detail='Risk model is not trained. Run the documented training command first.') from exc
-    record = RiskPrediction(student_id=student.id, risk_level=prediction['risk_level'], probability=prediction['risk_probability'], model_version=prediction['model_version'], prediction_timestamp=prediction['prediction_timestamp'], input_features=features)
-    db.add(record)
-    db.flush()
-    from backend.app.models import ShapExplanation
+    if not demo_model:
+        record = RiskPrediction(student_id=student.id, risk_level=prediction['risk_level'], probability=prediction['risk_probability'], model_version=prediction['model_version'], prediction_timestamp=prediction['prediction_timestamp'], input_features=features)
+        db.add(record)
+        db.flush()
+        from backend.app.models import ShapExplanation
 
-    db.add(ShapExplanation(prediction_id=record.id, values=explanation['contributions'], base_value=explanation['base_value'], model_version=explanation['model_version']))
-    student.risk_level = prediction['risk_level']
-    student.risk_probability = prediction['risk_probability']
-    db.add(RiskSnapshot(student_id=student.id, risk_level=prediction['risk_level'], probability=prediction['risk_probability'], recorded_at=prediction['prediction_timestamp'].replace(tzinfo=None)))
-    db.commit()
+        db.add(ShapExplanation(prediction_id=record.id, values=explanation['contributions'], base_value=explanation['base_value'], model_version=explanation['model_version']))
+        student.risk_level = prediction['risk_level']
+        student.risk_probability = prediction['risk_probability']
+        db.add(RiskSnapshot(student_id=student.id, risk_level=prediction['risk_level'], probability=prediction['risk_probability'], recorded_at=prediction['prediction_timestamp'].replace(tzinfo=None)))
+        db.commit()
     return {
         'prediction': prediction,
         'explanation': explanation,
         'risk_summary': _build_risk_summary(prediction, explanation),
         'question': 'Why is this student at risk?',
+        'risk_status': risk_status,
+        'risk_status_message': status_message,
     }
 
 
 @app.post(f'{settings.api_v1_prefix}/risk/predict')
 def risk_prediction(payload: RiskFeatureInput, user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
-    try:
-        result = predict_with_active_model(payload.feature_dict(), db)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=503, detail='Risk model is not trained. Run the documented training command first.') from exc
+    demo_model = early_warning_uses_demo_model(db)
+    student = None
+    risk_status = 'unvalidated-demo-model' if demo_model else 'available'
     if payload.student_id is not None:
         student = db.query(Student).filter(Student.id == payload.student_id).first()
         if student is None:
             raise HTTPException(status_code=404, detail='Student not found')
+        risk_status, status_message = student_risk_availability(student, db, demo_model=demo_model)
+        if risk_status in {'unavailable', 'insufficient-data'}:
+            raise HTTPException(status_code=503 if risk_status == 'unavailable' else 409, detail=status_message)
+    try:
+        result = (
+            predict_with_demo_preview(payload.feature_dict())
+            if demo_model else predict_with_active_model(payload.feature_dict(), db)
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail='Risk model is not trained. Run the documented training command first.') from exc
+    if student is not None and not demo_model:
         student.risk_level = result['risk_level']
         student.risk_probability = result['risk_probability']
         db.add(RiskPrediction(student_id=student.id, risk_level=result['risk_level'], probability=result['risk_probability'], model_version=result['model_version'], prediction_timestamp=result['prediction_timestamp'], input_features=payload.feature_dict()))
         db.add(RiskSnapshot(student_id=student.id, risk_level=result['risk_level'], probability=result['risk_probability'], recorded_at=result['prediction_timestamp'].replace(tzinfo=None)))
         db.commit()
+    result['risk_status'] = risk_status
+    result['risk_status_message'] = (
+        'Unvalidated DEMO DATA preview; the result was not saved to student risk history.'
+        if demo_model else None
+    )
     return result
 
 
@@ -6541,10 +7247,17 @@ def phase3_governance_audit(
 def risk_monitoring(user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
     students = db.query(Student).all()
     risk_views, _, momentum_by_student = student_risk_views(students, db)
-    current_predictions = [prediction for _, prediction in risk_views]
+    demo_model = early_warning_uses_demo_model(db)
+    scorable_students = [
+        student for student, (values, _) in zip(students, risk_views)
+        if values['risk_status'] in {'available', 'unvalidated-demo-model'}
+    ]
+    scorable_ids = {student.id for student in scorable_students}
+    current_predictions = [prediction for _, prediction in risk_views if prediction['risk_level'] in {'HIGH', 'MEDIUM', 'LOW'}]
     counts = {level: sum(prediction['risk_level'] == level for prediction in current_predictions) for level in ('HIGH', 'MEDIUM', 'LOW')}
-    history = db.query(RiskSnapshot).order_by(RiskSnapshot.recorded_at).all()
-    transition_report = risk_transition_report(db)
+    history_query = db.query(RiskSnapshot).filter(RiskSnapshot.student_id.in_(scorable_ids))
+    history = history_query.order_by(RiskSnapshot.recorded_at).all()
+    transition_report = risk_transition_report(db, scorable_ids)
     transitions = [{
         **item,
         'name': item['student_name'],
@@ -6552,22 +7265,43 @@ def risk_monitoring(user: CurrentTeacher, db: Session = Depends(get_db)) -> dict
         'to': item['new_risk'],
     } for item in transition_report['transitions']]
     momentum = {level: 0 for level in ('IMPROVING', 'STABLE', 'DECLINING', 'VOLATILE', 'INSUFFICIENT_DATA')}
-    for student in students:
+    for student in scorable_students:
         level = momentum_by_student[student.id].get('assessment', calculate_momentum([]))['classification']
         momentum[level] = momentum.get(level, 0) + 1
-    return {'distribution': counts, 'momentum': momentum, 'transitions': transitions, 'transition_history_status': transition_report['history_status'], 'students_with_insufficient_transition_history': transition_report['students_with_insufficient_history'], 'history_note': 'Historical saved class labels; they may predate the current argmax policy. Current distribution is calculated from the current model.', 'history': [{'student_id': item.student_id, 'risk_level': item.risk_level, 'recorded_at': item.recorded_at.isoformat()} for item in history]}
+    origin_by_student = {student.id: student.data_origin for student in students}
+    return {
+        'distribution': counts,
+        'momentum': momentum,
+        'transitions': transitions,
+        'transition_history_status': transition_report['history_status'],
+        'students_with_insufficient_transition_history': transition_report['students_with_insufficient_history'],
+        'risk_status': 'unvalidated-demo-model' if demo_model else 'available',
+        'history_note': (
+            'Unvalidated demo history is restricted to DEMO DATA records. Historical saved class labels may predate the current argmax policy.'
+            if demo_model else
+            'Historical saved class labels; they may predate the current argmax policy. Current distribution is calculated from the current model.'
+        ),
+        'history': [{
+            'student_id': item.student_id,
+            'data_origin': origin_by_student.get(item.student_id, 'LEGACY / UNVERIFIED'),
+            'risk_level': item.risk_level,
+            'recorded_at': item.recorded_at.isoformat(),
+        } for item in history],
+    }
 
 
 @app.get(f'{settings.api_v1_prefix}/risk/high-risk-demo')
 def high_risk_demo(user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
     students = db.query(Student).order_by(Student.student_id).all()
     risk_views, features_by_student, _ = student_risk_views(students, db)
+    demo_model = early_warning_uses_demo_model(db)
     candidates = [
         (student, features_by_student[student.id], prediction)
-        for student, (_, prediction) in zip(students, risk_views)
+        for student, (values, prediction) in zip(students, risk_views)
+        if values['risk_status'] in {'available', 'unvalidated-demo-model'}
     ]
     if not candidates:
-        raise HTTPException(status_code=404, detail='No existing student records are available for the demonstration.')
+        raise HTTPException(status_code=404, detail='No model-eligible student records are available for this demonstration.')
     predicted_high = [item for item in candidates if item[2]['risk_level'] == 'HIGH']
     selection_pool = predicted_high or candidates
     student, features, prediction = min(
@@ -6575,11 +7309,20 @@ def high_risk_demo(user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[
         key=lambda item: (-item[2]['class_probabilities'].get('HIGH', 0.0), item[0].student_id.casefold()),
     )
     try:
-        explanation = explain_with_active_model(features, db, target_class=prediction['risk_level'])
+        explanation = (
+            explain_with_demo_preview(features, target_class=prediction['risk_level'])
+            if demo_model else explain_with_active_model(features, db, target_class=prediction['risk_level'])
+        )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=503, detail='SHAP model background is unavailable.') from exc
     return {
-        'student': {'id': student.id, 'student_id': student.student_id, 'full_name': student.full_name},
+        'student': {
+            'id': student.id,
+            'student_id': student.student_id,
+            'full_name': student.full_name,
+            'data_origin': student.data_origin,
+            'risk_status': 'unvalidated-demo-model' if demo_model else 'available',
+        },
         'prediction': prediction,
         'features': features,
         'explanation': explanation,
@@ -6600,7 +7343,17 @@ def early_warnings(
     page: int = Query(default=1, ge=1),
     pageSize: int = Query(default=50, ge=1, le=50),
 ) -> dict[str, Any]:
-    if early_warning_uses_demo_model(db):
+    demo_model = early_warning_uses_demo_model(db)
+    data_status = 'unvalidated-demo-model' if demo_model else 'validated-model'
+    message = (
+        'DEMO DATA / RULE-GENERATED PREVIEW: predictions use the unvalidated synthetic CSV candidate model. '
+        'Labels were generated by transparent rules, not historical outcomes, and must not be used as institutional decisions.'
+        if demo_model else None
+    )
+    excluded_non_demo_count = 0
+    insufficient_data_count = 0
+
+    def empty_response() -> dict[str, Any]:
         return {
             'summary': {
                 'signals': 0,
@@ -6610,29 +7363,29 @@ def early_warnings(
                 'modelRefreshedAt': datetime.utcnow().isoformat(),
             },
             'items': [],
+            'total': 0,
             'nextPage': None,
-            'dataStatus': 'unvalidated-demo-model',
-            'message': 'Validated Early Warnings are unavailable because the active risk model was trained on DEMO DATA.',
+            'dataStatus': data_status,
+            'message': message,
+            'excludedNonDemoCount': excluded_non_demo_count,
+            'insufficientDataCount': insufficient_data_count,
         }
+
+    wanted_class = None
+    if severity:
+        wanted_class = severity.strip().upper()
+        wanted_class = {'AT RISK': 'HIGH', 'WATCH': 'MEDIUM', 'NORMAL': 'LOW'}.get(wanted_class, wanted_class)
+        if wanted_class not in {'HIGH', 'MEDIUM', 'LOW'}:
+            raise HTTPException(status_code=422, detail='severity must be High, Medium, or Low.')
 
     teacher = db.query(Teacher).filter(Teacher.user_id == user.id).first()
     if teacher is None:
-        return {
-            'summary': {'signals': 0, 'highPriority': 0, 'watchList': 0, 'recoveredThisMonth': 0, 'modelRefreshedAt': datetime.utcnow().isoformat()},
-            'items': [],
-            'nextPage': None,
-        }
-
+        return empty_response()
     courses = db.query(Course).filter(Course.teacher_id == teacher.id).all()
     course_ids = [item.id for item in courses]
     sections = sorted({item.section for item in courses if item.section})
     if not course_ids:
-        return {
-            'summary': {'signals': 0, 'highPriority': 0, 'watchList': 0, 'recoveredThisMonth': 0, 'modelRefreshedAt': datetime.utcnow().isoformat()},
-            'items': [],
-            'nextPage': None,
-        }
-
+        return empty_response()
     assigned_filter = or_(
         Student.course_id.in_(course_ids),
         and_(Student.course_id.is_(None), Student.section.in_(sections)) if sections else False,
@@ -6648,14 +7401,37 @@ def early_warnings(
         students_query = students_query.filter(or_(Student.full_name.ilike(needle), Student.student_id.ilike(needle)))
     all_students = students_query.order_by(Student.full_name, Student.id).all()
 
+    if demo_model:
+        eligible_students = [student for student in all_students if student.data_origin == 'DEMO DATA']
+        excluded_non_demo_count = len(all_students) - len(eligible_students)
+        all_students = eligible_students
+        if excluded_non_demo_count:
+            message = (
+                f'{message} {excluded_non_demo_count} non-demo or unverified record(s) were excluded from risk scoring.'
+            )
+
     if not all_students:
-        return {
-            'summary': {'signals': 0, 'highPriority': 0, 'watchList': 0, 'recoveredThisMonth': 0, 'modelRefreshedAt': datetime.utcnow().isoformat()},
-            'items': [],
-            'nextPage': None,
-        }
+        return empty_response()
 
     risk_views, features_by_student, momentum_by_student = student_risk_views(all_students, db)
+    if len(risk_views) != len(all_students):
+        raise HTTPException(status_code=503, detail='The active risk model did not return a prediction for every authorized student.')
+    qualified_rows = [
+        (student, risk_view)
+        for student, risk_view in zip(all_students, risk_views)
+        if risk_view_is_scorable(risk_view)
+    ]
+    insufficient_data_count = len(all_students) - len(qualified_rows)
+    if insufficient_data_count:
+        message = (
+            f'{message} {insufficient_data_count} record(s) with insufficient model-supported signals were excluded.'
+            if message else
+            f'{insufficient_data_count} record(s) with insufficient model-supported signals were excluded.'
+        )
+    all_students = [student for student, _ in qualified_rows]
+    risk_views = [risk_view for _, risk_view in qualified_rows]
+    if not all_students:
+        return empty_response()
     snapshots_by_student: dict[int, list[RiskSnapshot]] = {}
     for snapshot in db.query(RiskSnapshot).filter(
         RiskSnapshot.student_id.in_([student.id for student in all_students]),
@@ -6663,38 +7439,35 @@ def early_warnings(
         snapshots_by_student.setdefault(snapshot.student_id, []).append(snapshot)
 
     items: list[dict[str, Any]] = []
-    signals_detected = 0
     for student, (_, prediction) in zip(all_students, risk_views):
         features = features_by_student[student.id]
-        probability = float(prediction['risk_probability'] if prediction['risk_level'] == 'HIGH' else prediction['class_probabilities'].get('HIGH', prediction['risk_probability']))
+        predicted_class = str(prediction.get('risk_level', '')).upper()
+        if predicted_class not in {'HIGH', 'MEDIUM', 'LOW'}:
+            raise HTTPException(status_code=503, detail='Active risk model returned an unsupported predicted class.')
+        probability = high_class_probability(prediction)
         priority = priority_for_probability(probability)
         risk_class = 'At risk' if priority == 'High' else 'Watch' if priority == 'Medium' else 'Normal'
-
-        usable_signals = sum([
-            student.attendance > 0,
-            student.assessment > 0,
-            student.previous_gpa > 0 or student.current_gpa > 0,
-            features['missing_submissions'] >= 0,
-            bool(momentum_by_student[student.id].get('attendance') or momentum_by_student[student.id].get('assessment')),
-        ])
-        if usable_signals < MINIMUM_USABLE_SIGNALS:
-            priority = 'Low'
-            risk_class = 'Normal'
-            probability = 0.0
+        class_rank = {'High': 2, 'Medium': 1, 'Low': 0}[priority]
 
         factor_labels = {
             'attendance': 'Attendance',
-            'assessment': 'Assessment average',
             'missing_submissions': 'Missing submissions',
-            'previous_gpa': 'Previous GPA',
-            'current_gpa': 'Current GPA',
             'activity_per_week': 'Portal activity',
             'attendance_change': 'Attendance',
-            'assessment_change': 'Assessment average',
+            'assignment_submission_rate': 'Assignment submission rate',
+            'assignments_completed': 'Assignments completed',
         }
         try:
-            explanation = explain_with_active_model(features, db, target_class='HIGH')
-            positive = [(name, value) for name, value in explanation['contributions'].items() if value > 0]
+            explanation = (
+                explain_with_demo_preview(features, target_class='HIGH')
+                if demo_model
+                else explain_with_active_model(features, db, target_class='HIGH')
+            )
+            positive = [
+                (name, value)
+                for name, value in explanation['contributions'].items()
+                if name in FEATURES and value > 0
+            ]
             positive.sort(key=lambda item: item[1], reverse=True)
             top_factor_name = positive[0][0] if positive else 'Not enough data yet'
         except (FileNotFoundError, ValueError):
@@ -6704,9 +7477,11 @@ def early_warnings(
         student_signals = 0
         if features['attendance_change'] < -10:
             student_signals += 1
-        if features['assessment_change'] < -10:
-            student_signals += 1
         if features['missing_submissions'] > 0:
+            student_signals += 1
+        if features.get('assignment_submission_rate', 0.0) < 0.75:
+            student_signals += 1
+        if features['activity_per_week'] < 12:
             student_signals += 1
         snapshots = snapshots_by_student.get(student.id, [])
         if prediction['risk_level'] == 'HIGH':
@@ -6716,30 +7491,25 @@ def early_warnings(
             order = {'LOW': 0, 'MEDIUM': 1, 'HIGH': 2}
             if order.get(current.risk_level, 0) > order.get(previous.risk_level, 0):
                 student_signals += 1
-        signals_detected += student_signals
-
-        if severity:
-            wanted = severity.strip().upper()
-            wanted = {'AT RISK': 'HIGH', 'WATCH': 'MEDIUM', 'NORMAL': 'LOW'}.get(wanted, wanted)
-            if wanted not in {'HIGH', 'MEDIUM', 'LOW'}:
-                raise HTTPException(status_code=422, detail='severity must be High, Medium, or Low.')
-            if priority.upper() != wanted:
-                continue
 
         items.append({
             'studentId': student.id,
             'name': student.full_name,
             'department': student.department,
+            'dataOrigin': student.data_origin,
+            'riskStatus': 'unvalidated-demo-model' if demo_model else 'available',
             'riskProbability': round(probability, 6),
             'riskClass': risk_class,
             'priority': priority,
             'topFactor': top_factor,
+            '_classRank': class_rank,
             '_signalCount': student_signals,
             '_rawDecisionScore': float(prediction.get('raw_high_decision_score', probability)),
         })
 
     high_priority = sum(item['priority'] == 'High' for item in items)
     watch_list = sum(item['priority'] == 'Medium' for item in items)
+    low_priority = sum(item['priority'] == 'Low' for item in items)
     month_cutoff = datetime.utcnow() - timedelta(days=30)
     recovered = 0
     for student_id in [item['studentId'] for item in items]:
@@ -6756,90 +7526,100 @@ def early_warnings(
                 recovered += 1
 
     items.sort(key=lambda item: (
+        -item['_classRank'],
         -item['riskProbability'],
         -item['_rawDecisionScore'],
         -item['_signalCount'],
         item['name'].casefold(),
         item['studentId'],
     ))
+    if wanted_class:
+        wanted_priority = {'HIGH': 'High', 'MEDIUM': 'Medium', 'LOW': 'Low'}[wanted_class]
+        items = [item for item in items if item['priority'] == wanted_priority]
+    high_priority = sum(item['priority'] == 'High' for item in items)
+    watch_list = sum(item['priority'] == 'Medium' for item in items)
+    low_priority = sum(item['priority'] == 'Low' for item in items)
+    total = len(items)
     start = (page - 1) * pageSize
     paged = [{key: value for key, value in item.items() if not key.startswith('_')} for item in items[start:start + pageSize]]
-    next_page = page + 1 if start + pageSize < len(items) else None
+    next_page = page + 1 if start + pageSize < total else None
     return {
         'summary': {
-            'signals': signals_detected,
+            'signals': total,
             'highPriority': high_priority,
             'watchList': watch_list,
+            'lowPriority': low_priority,
             'recoveredThisMonth': recovered,
             'modelRefreshedAt': datetime.utcnow().isoformat(),
         },
         'items': paged,
+        'total': total,
         'nextPage': next_page,
+        'dataStatus': data_status,
+        'message': message,
+        'excludedNonDemoCount': excluded_non_demo_count,
+        'insufficientDataCount': insufficient_data_count,
     }
 
 
 @app.get(f'{settings.api_v1_prefix}/early-warnings/{{student_id}}')
 def early_warning_detail(student_id: int, user: CurrentTeacher, db: Session = Depends(get_db)) -> dict[str, Any]:
     student = early_warning_authorized_student(db, user, student_id)
-    if early_warning_uses_demo_model(db):
-        raise HTTPException(status_code=503, detail='Validated Early Warnings are unavailable because the active risk model was trained on DEMO DATA.')
+    demo_model = early_warning_uses_demo_model(db)
+    if demo_model and student.data_origin != 'DEMO DATA':
+        raise HTTPException(status_code=503, detail='The active model is trained on DEMO DATA and cannot assess this non-demo or unverified record.')
+    usable_signals = student_model_signal_counts([student], db)[student.id]
+    if usable_signals < MINIMUM_USABLE_SIGNALS:
+        raise HTTPException(status_code=409, detail='There are not enough model-supported signals to produce an Early Warning prediction.')
     features = student_features(student, db)
-    prediction = predict_with_active_model(features, db)
+    prediction = predict_with_demo_preview(features) if demo_model else predict_with_active_model(features, db)
     class_probabilities = prediction['class_probabilities']
-    probability = float(class_probabilities.get('HIGH', prediction['risk_probability'] if prediction['risk_level'] == 'HIGH' else 0.0))
+    probability = high_class_probability(prediction)
     priority = priority_for_probability(probability)
     risk_class = 'At risk' if priority == 'High' else 'Watch' if priority == 'Medium' else 'Normal'
 
-    usable_signals = sum([
-        student.attendance > 0,
-        student.assessment > 0,
-        student.previous_gpa > 0 or student.current_gpa > 0,
-        features['missing_submissions'] >= 0,
-        bool(db.query(AcademicMomentum.id).filter(AcademicMomentum.student_id == student.id).first()),
+    explanation = (
+        explain_with_demo_preview(features, target_class='HIGH')
+        if demo_model
+        else explain_with_active_model(features, db, target_class='HIGH')
+    )
+    normalised = normalise_positive_shap([
+        (name, value)
+        for name, value in explanation['contributions'].items()
+        if name in FEATURES
     ])
-    insufficient = usable_signals < MINIMUM_USABLE_SIGNALS
-    if insufficient:
-        probability = 0.0
-        priority, risk_class = 'Low', 'Normal'
-
-    explanation = explain_with_active_model(features, db, target_class='HIGH')
-    normalised = normalise_positive_shap(list(explanation['contributions'].items()))
     positive = sorted(normalised.items(), key=lambda item: item[1], reverse=True)
 
     labels = {
         'attendance': ('Attendance', '%'),
-        'assessment': ('Assessment average', '%'),
         'missing_submissions': ('Missing submissions', 'assignments'),
-        'previous_gpa': ('Previous GPA', 'GPA'),
-        'current_gpa': ('Current GPA', 'GPA'),
         'activity_per_week': ('Portal activity', 'logins/week'),
-        'momentum_score': ('Academic momentum', 'points'),
         'assignments_completed': ('Assignments completed', 'assignments'),
+        'assignment_submission_rate': ('Assignment submission rate', '%'),
+        'attendance_change': ('Attendance change', '%'),
     }
     grouped_contributions: dict[str, float] = {}
     for name, contribution in positive:
-        key = {'attendance_change': 'attendance', 'assessment_change': 'assessment'}.get(name, name)
+        key = 'attendance' if name == 'attendance_change' else name
         grouped_contributions[key] = grouped_contributions.get(key, 0.0) + contribution
     factors: list[dict[str, Any]] = []
     for name, contribution in sorted(grouped_contributions.items(), key=lambda item: item[1], reverse=True)[:5]:
         label, unit = labels.get(name, (name.replace('_', ' ').capitalize(), ''))
         current_value = float(features.get(name, 0.0))
         previous_value = current_value
-        if name in {'attendance', 'assessment'}:
+        if name == 'attendance':
             change = float(features.get(f'{name}_change', 0.0))
             direction = 'down' if change < 0 else 'up'
             movement = f', {direction} {abs(change):.1f}% across recent observations' if change else ''
             detail = f'{label} {current_value:.1f}%{movement}'
         elif name == 'missing_submissions':
             detail = f'{current_value:.0f} outstanding assignments'
-        elif name in {'previous_gpa', 'current_gpa'}:
-            detail = f'{label} {current_value:.2f} GPA'
         elif name == 'activity_per_week':
             detail = f'{current_value:.1f} logins per week'
-        elif name == 'momentum_score':
-            detail = f'Recent change score {current_value:+.1f}'
         elif name == 'assignments_completed':
             detail = f'{current_value:.0f} assignments completed'
+        elif name == 'assignment_submission_rate':
+            detail = f'{current_value * 100:.0f}% of assignments submitted'
         else:
             detail = f'{label} {current_value:.1f}'
         factors.append({
@@ -6860,30 +7640,28 @@ def early_warning_detail(student_id: int, user: CurrentTeacher, db: Session = De
 
     no_action_features = dict(features)
     no_action_features['attendance'] = max(0.0, features['attendance'] + features['attendance_change'] * 2)
-    no_action_features['assessment'] = max(0.0, features['assessment'] + features['assessment_change'] * 2)
     no_action_features['missing_submissions'] = max(0.0, features['missing_submissions'])
-    no_action = predict_with_active_model(no_action_features, db)
-    no_action_probability = float(no_action['class_probabilities'].get('HIGH', no_action['risk_probability']))
+    no_action = predict_with_demo_preview(no_action_features) if demo_model else predict_with_active_model(no_action_features, db)
+    no_action_probability = high_class_probability(no_action)
 
     plan_features = dict(features)
     plan_features['attendance'] = max(features['attendance'], 85.0)
     plan_features['missing_submissions'] = 0.0
-    plan_features['assessment'] = max(features['assessment'], student.assessment)
-    with_plan = predict_with_active_model(plan_features, db)
-    with_plan_probability = float(with_plan['class_probabilities'].get('HIGH', with_plan['risk_probability']))
+    plan_features['assignment_submission_rate'] = 1.0
+    plan_features['activity_per_week'] = max(features.get('activity_per_week', 12.0), 12.0)
+    plan_features['attendance_change'] = max(0.0, features['attendance_change'])
+    with_plan = predict_with_demo_preview(plan_features) if demo_model else predict_with_active_model(plan_features, db)
+    with_plan_probability = high_class_probability(with_plan)
 
     max_class_probability = max(float(value) for value in class_probabilities.values()) if class_probabilities else 0.0
     confidence = round(max(0.0, min(1.0, max_class_probability * (usable_signals / 5))), 6)
 
     precautions_by_factor = {
         'attendance': 'Agree an 85% attendance target for three weeks and review progress every Friday.',
-        'assessment': 'Set a short catch-up quiz on the weakest topic and provide written feedback within 48 hours.',
         'missing_submissions': 'Set a clear deadline for each missing item and offer one supervised resubmission.',
-        'current_gpa': 'Walk through the marks breakdown and plan which components can still improve.',
-        'previous_gpa': 'Walk through the marks breakdown and plan which components can still improve.',
         'activity_per_week': 'Ask what is blocking portal activity and re-enable deadline reminders.',
-        'momentum_score': 'Hold a weekly check-in focused on one small academic goal.',
         'assignments_completed': 'Agree a clear deadline for each outstanding item and check completion together.',
+        'assignment_submission_rate': 'Set weekly submission checkpoints and improve the assignment completion rate.',
     }
     precautions = [
         {
@@ -6909,13 +7687,15 @@ def early_warning_detail(student_id: int, user: CurrentTeacher, db: Session = De
         'studentId': student.id,
         'name': student.full_name,
         'department': student.department,
+        'dataOrigin': student.data_origin,
+        'riskStatus': 'unvalidated-demo-model' if demo_model else 'available',
         'riskProbability': round(probability, 6),
         'riskClass': risk_class,
         'priority': priority,
         'confidence': confidence,
         'signalsUsed': usable_signals,
         'weekChange': week_change,
-        'insufficientData': insufficient,
+        'insufficientData': False,
         'trend': trend,
         'forecast': {
             'noAction': round(min(1.0, max(0.0, no_action_probability)), 6),
@@ -6924,10 +7704,22 @@ def early_warning_detail(student_id: int, user: CurrentTeacher, db: Session = De
         'factors': factors,
         'precautions': precautions,
         'actions': actions,
+        'dataStatus': 'unvalidated-demo-model' if demo_model else 'validated-model',
+        'message': (
+            'DEMO / RULE-GENERATED PREVIEW: candidate prediction and explanation use synthetic training data.'
+            if demo_model else None
+        ),
     }
 
 
 SIMULATION_REQUESTS: dict[tuple[int, int], list[datetime]] = {}
+
+
+def risk_view_is_scorable(risk_view: tuple[Any, dict[str, Any]]) -> bool:
+    values, prediction = risk_view
+    if isinstance(values, dict):
+        return values.get('risk_status') in {'available', 'unvalidated-demo-model'}
+    return str(prediction.get('risk_level', '')).upper() in {'HIGH', 'MEDIUM', 'LOW'}
 
 
 @app.post(f'{settings.api_v1_prefix}/early-warnings/{{student_id}}/simulate')
@@ -6946,11 +7738,14 @@ def early_warning_simulate(
     SIMULATION_REQUESTS[key] = recent
 
     student = early_warning_authorized_student(db, user, student_id)
-    if early_warning_uses_demo_model(db):
-        raise HTTPException(status_code=503, detail='Validated Early Warnings are unavailable because the active risk model was trained on DEMO DATA.')
+    demo_model = early_warning_uses_demo_model(db)
+    if demo_model and student.data_origin != 'DEMO DATA':
+        raise HTTPException(status_code=503, detail='The active model is trained on DEMO DATA and cannot simulate this non-demo or unverified record.')
+    if student_model_signal_counts([student], db)[student.id] < MINIMUM_USABLE_SIGNALS:
+        raise HTTPException(status_code=409, detail='There are not enough model-supported signals to simulate this student.')
     supported_targets = {
-        'attendance', 'assessment', 'missing_submissions', 'activity_per_week',
-        'attendance_change', 'assessment_change', 'momentum_score', 'current_gpa',
+        'attendance', 'missing_submissions', 'activity_per_week',
+        'attendance_change', 'assignment_submission_rate', 'assignments_completed',
     }
     unsupported = sorted(set(payload.recoveries) - supported_targets)
     if unsupported:
@@ -6969,40 +7764,48 @@ def early_warning_simulate(
             AcademicMomentum.metric == 'activity',
         ).order_by(AcademicMomentum.observed_at, AcademicMomentum.id).all()
     ]
-    assessment_change = float(features['assessment_change'])
-    earlier_assessment = (
-        min(100.0, features['assessment'] / (1 + assessment_change / 100))
-        if assessment_change > -100
-        else features['assessment']
-    )
     targets = {
         'attendance': max(features['attendance'], 85.0),
-        'assessment': max(features['assessment'], earlier_assessment),
         'missing_submissions': 0.0,
         'activity_per_week': max(
             features['activity_per_week'],
             sum(activity_history[:-4]) / len(activity_history[:-4]) if len(activity_history) > 4 else features['activity_per_week'],
         ),
         'attendance_change': max(0.0, features['attendance_change']),
-        'assessment_change': max(0.0, features['assessment_change']),
-        'momentum_score': max(0.0, features['momentum_score']),
-        'current_gpa': max(features['current_gpa'], student.previous_gpa),
+        'assignment_submission_rate': 1.0,
+        'assignments_completed': max(
+            features['assignments_completed'],
+            max(features['assignments_completed'], 0.0) + features['missing_submissions'],
+        ),
     }
-    baseline_prediction = predict_with_active_model(features, db)
+    baseline_prediction = predict_with_demo_preview(features) if demo_model else predict_with_active_model(features, db)
     for factor, recovery in payload.recoveries.items():
         start = float(features[factor])
         target = float(targets[factor])
         candidate[factor] = start + (target - start) * float(recovery)
-    simulated_prediction = predict_with_active_model(candidate, db)
-    probability = float(simulated_prediction['class_probabilities'].get('HIGH', 0.0))
-    baseline_probability = float(baseline_prediction['class_probabilities'].get('HIGH', 0.0))
+    simulated_prediction = predict_with_demo_preview(candidate) if demo_model else predict_with_active_model(candidate, db)
+    probability = high_class_probability(simulated_prediction)
+    baseline_probability = high_class_probability(baseline_prediction)
     risk_class = 'At risk' if probability >= HIGH_PRIORITY_THRESHOLD else 'Watch' if probability >= MEDIUM_PRIORITY_THRESHOLD else 'Normal'
     audit(db, user, 'early_warning.simulated', 'student', student.id)
     db.commit()
     return {
         'riskProbability': round(probability, 6),
         'riskClass': risk_class,
-        'delta': round((probability - baseline_probability) * 100, 2),
+        'delta': round((baseline_probability - probability) * 100, 2),
+        'before': {
+            'riskLevel': baseline_prediction['risk_level'],
+            'riskProbability': round(baseline_probability, 6),
+            'classProbabilities': baseline_prediction['class_probabilities'],
+        },
+        'after': {
+            'riskLevel': simulated_prediction['risk_level'],
+            'riskProbability': round(probability, 6),
+            'classProbabilities': simulated_prediction['class_probabilities'],
+        },
+        'demoMode': bool(demo_model),
+        'label': 'DEMO / RULE-GENERATED TRAINING DATA' if demo_model else 'MODEL PREDICTED',
+        'modelVersion': simulated_prediction['model_version'],
     }
 
 
@@ -7108,9 +7911,18 @@ def risk_feature_importance(user: CurrentTeacher, db: Session = Depends(get_db))
     features_by_student, _ = student_feature_batch(students, db)
     rows = [features_by_student[student.id] for student in students]
     try:
-        return global_importance(rows)
+        demo_model = early_warning_uses_demo_model(db)
+        artifact_path = demo_preview_artifact_path() if demo_model else selected_model_artifact(db)
+        result = global_importance(rows, artifact_path)
+        result['dataStatus'] = 'unvalidated-demo-model' if demo_model else 'validated-model'
+        return result
     except FileNotFoundError as exc:
         raise HTTPException(status_code=503, detail='Risk model is not trained. Run the documented training command first.') from exc
+    except (ValueError, KeyError, AttributeError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail='Risk feature importance is unavailable because the active model does not support the marks-free explanation contract.',
+        ) from exc
 
 
 @app.get(f'{settings.api_v1_prefix}/assignments', response_model=list[AssignmentOut])
@@ -7611,6 +8423,7 @@ def export_report(user: CurrentTeacher, db: Session = Depends(get_db), report_ty
     features_by_student: dict[int, dict[str, float]] = {}
     momentum_by_student: dict[int, dict[str, dict[str, Any]]] = {}
     current_predictions: dict[int, dict[str, Any]] = {}
+    current_risk_data: dict[int, dict[str, Any]] = {}
     if report_type in {'risk', 'class'}:
         features_by_student, momentum_by_student = student_feature_batch(students, db)
         risk_views = student_risk_views_from_features(students, features_by_student, db)
@@ -7618,18 +8431,27 @@ def export_report(user: CurrentTeacher, db: Session = Depends(get_db), report_ty
             student.id: prediction
             for student, (_, prediction) in zip(students, risk_views)
         }
+        current_risk_data = {
+            student.id: values
+            for student, (values, _) in zip(students, risk_views)
+        }
     if report_type == 'risk':
-        writer.writerow(['student_id', 'name', 'department', 'risk_level', 'risk_class_probability', 'attendance', 'assessment', 'current_gpa', 'momentum_signal'])
+        writer.writerow(['student_id', 'name', 'department', 'data_origin', 'risk_status', 'risk_level', 'risk_class_probability', 'attendance', 'assessment', 'current_gpa', 'momentum_signal'])
         for student in students:
             prediction = current_predictions[student.id]
+            risk_data = current_risk_data[student.id]
             features = features_by_student[student.id]
             momentum = momentum_by_student[student.id].get('assessment', calculate_momentum([]))
-            writer.writerow([student.student_id, student.full_name, student.department, prediction['risk_level'], prediction['risk_probability'], features['attendance'], features['assessment'], student.current_gpa, momentum['classification']])
+            writer.writerow([student.student_id, student.full_name, student.department, student.data_origin, risk_data['risk_status'], prediction['risk_level'], prediction['risk_probability'], features['attendance'], student.assessment, student.current_gpa, momentum['classification']])
     elif report_type == 'class':
         writer.writerow(['metric', 'count'])
         writer.writerow(['students', len(students)])
         for level in ('HIGH', 'MEDIUM', 'LOW'):
             writer.writerow([f'risk_{level.lower()}', sum(prediction['risk_level'] == level for prediction in current_predictions.values())])
+        writer.writerow(['unscored_students', sum(
+            values['risk_status'] not in {'available', 'unvalidated-demo-model'}
+            for values in current_risk_data.values()
+        )])
     elif report_type == 'assignments':
         writer.writerow(['assignment_id', 'title', 'course', 'status', 'assigned', 'submitted', 'pending', 'late', 'graded', 'due_date'])
         for assignment in db.query(Assignment).order_by(Assignment.id).all():

@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import TeacherRecoveryPage from './page';
 
 const mocks = vi.hoisted(() => ({ api: vi.fn() }));
-vi.mock('@/lib/api', () => ({ api: mocks.api }));
+vi.mock('@/lib/api', () => ({ api: mocks.api, readCachedApiData: () => null }));
 
 const student = { id: 4, student_id: 'S-004', full_name: 'Student Four', section: 'A' };
 const task = {

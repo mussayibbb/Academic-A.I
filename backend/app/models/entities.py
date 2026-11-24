@@ -39,8 +39,10 @@ class Student(Timestamps, Base):
     email: Mapped[str | None] = mapped_column(String(320), unique=True)
     program: Mapped[str | None] = mapped_column(String(160))
     year: Mapped[str | None] = mapped_column(String(30))
+    semester: Mapped[str | None] = mapped_column(String(40), index=True)
     section: Mapped[str | None] = mapped_column(String(40), index=True)
     department: Mapped[str | None] = mapped_column(String(160), index=True)
+    data_origin: Mapped[str] = mapped_column(String(32), default='LEGACY / UNVERIFIED', nullable=False)
     risk_level: Mapped[str] = mapped_column(String(20), default='LOW', index=True)
     risk_probability: Mapped[float] = mapped_column(Float, default=0.0)
     previous_gpa: Mapped[float] = mapped_column(Float, default=0.0)
@@ -719,6 +721,7 @@ class AcademicDataImportBatch(Timestamps, Base):
     rejected_rows: Mapped[int] = mapped_column(Integer, default=0)
     duplicate_rows: Mapped[int] = mapped_column(Integer, default=0)
     validation_errors: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    source_provenance: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
 class AcademicDataImportRow(Timestamps, Base):

@@ -4,17 +4,21 @@ import { motion, useReducedMotion } from 'framer-motion';
 import {
   ArrowRight, CalendarClock, CheckCheck, ClipboardList, CircleDot, Clock3, Sparkles, UsersRound,
 } from 'lucide-react';
+import dynamic from 'next/dynamic';
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
-import AcademicSolarSystem from '@/components/AcademicSolarSystem';
 import { useSpotlight } from '@/components/useSpotlight';
 import { Empty, ErrorNotice, Metric, PageHeading, PanelTitle, RiskBadge } from '@/components/ui';
-import { api } from '@/lib/api';
+import { api, readCachedApiData } from '@/lib/api';
 import { formatRiskProbability } from '@/lib/risk';
 
-type Student = { id: number; full_name: string; student_id: string; program?: string; department?: string; risk_level: string; risk_probability: number; attendance: number; current_gpa: number };
+const AcademicSolarSystem = dynamic(() => import('@/components/AcademicSolarSystem'), {
+  ssr: false,
+});
+
+type Student = { id: number; full_name: string; student_id: string; program?: string; department?: string; data_origin?: string; risk_level: string; risk_probability: number; risk_status?: string; attendance: number; current_gpa: number };
 type Assignment = { id: number; title: string; subject: string; course?: string; due_date?: string | null };
-type Dashboard = { teacher_name: string; summary: { students: number; assignments: number; submissions: number; pending_reviews: number; intervention_drafts: number; high_risk: number; medium_risk: number; low_risk: number }; students_needing_attention: Student[]; assignments: Assignment[]; upcoming_deadlines: Assignment[] };
+type Dashboard = { teacher_name: string; risk_status?: string; risk_status_message?: string | null; summary: { students: number; assignments: number; submissions: number; pending_reviews: number; intervention_drafts: number; high_risk: number; medium_risk: number; low_risk: number; risk_scored_students: number }; students_needing_attention: Student[]; assignments: Assignment[]; upcoming_deadlines: Assignment[] };
 type Submission = { id: number; status: string; assignment_id: number; submitted_at?: string | null; grade?: number | null };
 
 const dayPart = () => {
@@ -23,8 +27,8 @@ const dayPart = () => {
 };
 
 export default function TeacherDashboard() {
-  const [data, setData] = useState<Dashboard | null>(null);
-  const [submissions, setSubmissions] = useState<Submission[]>([]);
+  const [data, setData] = useState<Dashboard | null>(() => readCachedApiData<Dashboard>('/api/v1/dashboard/teacher'));
+  const [submissions, setSubmissions] = useState<Submission[]>(() => readCachedApiData<Submission[]>('/api/v1/submissions') ?? []);
   const [error, setError] = useState('');
   const reduceMotion = useReducedMotion();
   const spotlightHandlers = useSpotlight();
@@ -40,9 +44,10 @@ export default function TeacherDashboard() {
 
   const attentionCount = data.summary.high_risk + data.summary.medium_risk;
   const totalStudents = data.summary.students;
-  const highShare = totalStudents ? data.summary.high_risk / totalStudents : 0;
-  const mediumShare = totalStudents ? data.summary.medium_risk / totalStudents : 0;
-  const lowShare = totalStudents ? data.summary.low_risk / totalStudents : 0;
+  const scoredStudents = data.summary.risk_scored_students;
+  const highShare = scoredStudents ? data.summary.high_risk / scoredStudents : 0;
+  const mediumShare = scoredStudents ? data.summary.medium_risk / scoredStudents : 0;
+  const lowShare = scoredStudents ? data.summary.low_risk / scoredStudents : 0;
   const priorities = [
     { name: 'Students', count: totalStudents, detail: 'in the academic workspace', icon: UsersRound, href: '/teacher/students', color: 'text-slate-100' },
     { name: 'Needs a closer look', count: attentionCount, detail: 'high or medium predicted risk', icon: CircleDot, href: '/teacher/early-warnings', color: 'text-rose-200' },
@@ -52,9 +57,10 @@ export default function TeacherDashboard() {
 
   return <div className="page-content space-y-6 sm:space-y-7">
     <div className="flex flex-wrap items-end justify-between gap-4">
-      <PageHeading eyebrow="Faculty workspace · demonstration data" title={`${dayPart()}, ${data.teacher_name.split(' ')[1] ?? data.teacher_name}`} description="Start with the students and coursework that could use a little more attention." />
-      <span className="mb-7 inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[.035] px-3 py-1.5 text-[9px] font-semibold tracking-[.12em] text-slate-400"><span aria-hidden="true" className="size-1.5 rounded-full bg-rose-400" /> FICTIONAL DEMO RECORDS</span>
+      <PageHeading eyebrow="Faculty workspace · student records" title={`${dayPart()}, ${data.teacher_name.split(' ')[1] ?? data.teacher_name}`} description="Start with current academic records and the model-supported signals that need review." />
+      <span className="mb-7 inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[.035] px-3 py-1.5 text-[9px] font-semibold tracking-[.12em] text-slate-400"><span aria-hidden="true" className="size-1.5 rounded-full bg-rose-400" /> {data.risk_status === 'unvalidated-demo-model' ? 'DEMO MODEL PREVIEW' : 'FACULTY WORKSPACE'}</span>
     </div>
+    {data.risk_status_message && <p role="status" className="rounded-lg border border-amber-200/20 bg-amber-200/[.04] p-3 text-xs leading-5 text-amber-100">{data.risk_status_message}</p>}
 
     <motion.section
       initial={reduceMotion ? false : { opacity: 0, y: 12 }}
@@ -82,11 +88,11 @@ export default function TeacherDashboard() {
           animate={{ opacity: 1, scale: 1 }}
           transition={{ duration: .7, ease: 'easeOut', delay: .08 }}
           role="img"
-          aria-label={`Recorded risk distribution: ${totalStudents} students; ${data.summary.high_risk} high risk, ${data.summary.medium_risk} medium risk, ${data.summary.low_risk} low risk`}
+          aria-label={`Current risk distribution: ${scoredStudents} scored students; ${data.summary.high_risk} high risk, ${data.summary.medium_risk} medium risk, ${data.summary.low_risk} low risk`}
           className="solar-system-visualization relative mx-auto w-full"
         >
           <AcademicSolarSystem
-            totalStudents={totalStudents}
+            totalStudents={scoredStudents}
             highRisk={data.summary.high_risk}
             mediumRisk={data.summary.medium_risk}
             lowRisk={data.summary.low_risk}
@@ -117,9 +123,9 @@ export default function TeacherDashboard() {
         <div className="flex flex-wrap items-end justify-between gap-3 border-b border-white/[.07] px-5 py-4"><div><p className="eyebrow">Faculty review · current records</p><h2 className="mt-1 text-lg font-semibold tracking-tight text-white">Students needing attention</h2></div><Link href="/teacher/students" className="text-xs text-rose-200 transition hover:text-white">Open directory <ArrowRight size={13} className="ml-1 inline" /></Link></div>
         <div className="hidden grid-cols-[minmax(150px,1.2fr)_minmax(90px,.65fr)_minmax(120px,.8fr)_minmax(130px,1fr)_40px] gap-4 px-5 py-3 text-[9px] font-medium uppercase tracking-[.15em] text-slate-600 sm:grid"><span>Student</span><span>Risk</span><span>Class confidence</span><span>Review signal</span><span /></div>
         {data.students_needing_attention.slice(0, 7).map((student, index) => <motion.div key={student.id} initial={reduceMotion ? false : { opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: reduceMotion ? 0 : index * .035 }} className="grid gap-2 border-t border-white/[.06] px-4 py-3.5 transition-colors hover:bg-white/[.025] sm:grid-cols-[minmax(150px,1.2fr)_minmax(90px,.65fr)_minmax(120px,.8fr)_minmax(130px,1fr)_40px] sm:items-center sm:gap-4 sm:px-5">
-          <div className="min-w-0"><Link href={`/teacher/recovery/students/${student.id}`} className="block truncate text-xs font-medium text-slate-100 hover:text-rose-200">{student.full_name}</Link><div className="mt-1 truncate font-mono text-[9px] text-slate-600">{student.student_id}</div></div>
+          <div className="min-w-0"><Link href={`/teacher/recovery/students/${student.id}`} className="block truncate text-xs font-medium text-slate-100 hover:text-rose-200">{student.full_name}</Link><div className="mt-1 truncate font-mono text-[9px] text-slate-600">{student.student_id}</div><div className="mt-1 text-[9px] text-slate-500">{student.data_origin ?? 'Source unavailable'}</div></div>
           <div className="flex items-center gap-2"><span className="text-[9px] text-slate-600 sm:hidden">Risk</span><RiskBadge level={student.risk_level} /></div>
-          <div className="text-xs tabular-nums text-slate-300"><span className="mr-2 text-[9px] text-slate-600 sm:hidden">Confidence</span>{formatRiskProbability(student.risk_level, student.risk_probability)}</div>
+          <div className="text-xs tabular-nums text-slate-300"><span className="mr-2 text-[9px] text-slate-600 sm:hidden">Confidence</span>{student.risk_status === 'unvalidated-demo-model' ? 'Unvalidated demo preview' : formatRiskProbability(student.risk_level, student.risk_probability)}</div>
           <div className="text-[11px] text-slate-500">{student.attendance < 75 ? 'Attendance below 75%' : 'Academic indicators to review'}</div>
           <Link aria-label={`Open recovery profile for ${student.full_name}`} href={`/teacher/recovery/students/${student.id}`} className="hidden justify-self-end text-slate-600 transition hover:text-rose-200 sm:block"><ArrowRight size={15} /></Link>
         </motion.div>)}
@@ -129,7 +135,7 @@ export default function TeacherDashboard() {
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-1">
         <section {...spotlightHandlers} className="surface spotlight rounded-xl p-5">
           <PanelTitle title="Recorded risk distribution" href="/teacher/risk-monitoring" />
-          <p className="-mt-2 mb-5 text-[10px] text-slate-500">Current saved student classifications · {totalStudents} records</p>
+          <p className="-mt-2 mb-5 text-[10px] text-slate-500">Current model-supported classifications · {scoredStudents} of {totalStudents} student records</p>
           <div className="space-y-4">
             {([['High risk', data.summary.high_risk, highShare, 'bg-rose-500'], ['Medium risk', data.summary.medium_risk, mediumShare, 'bg-slate-400'], ['Low risk', data.summary.low_risk, lowShare, 'bg-slate-200']] as const).map(([label, count, share, color]) => <div key={label}><div className="mb-1.5 flex items-center justify-between text-[11px]"><span className="text-slate-400">{label}</span><span className="tabular-nums text-slate-300">{count}</span></div><div className="h-1.5 overflow-hidden rounded-full bg-white/[.07]"><motion.div initial={reduceMotion ? false : { width: 0 }} animate={{ width: `${share * 100}%` }} transition={{ duration: .7, ease: 'easeOut' }} className={`h-full rounded-full ${color}`} /></div></div>)}
           </div>

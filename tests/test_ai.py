@@ -1,12 +1,15 @@
 import pandas as pd
 import pytest
+from pathlib import Path
 from sklearn.preprocessing import LabelEncoder
 
 from ai.risk.features import FEATURE_CONTRACT, FEATURES, load_training_data
-from ai.risk.predict import DEFAULT_ARTIFACT, load_artifact, predict
+from ai.risk.predict import DEFAULT_ARTIFACT, load_artifact, predict, predict_many
 from ai.risk.train import train
-from ai.explainability.service import explain_student
+from ai.explainability.service import explain_student, global_importance
 from backend.app.services.momentum import calculate_momentum
+
+CANDIDATE_ARTIFACT = Path(__file__).resolve().parents[1] / 'models' / 'candidates' / 'risk_model_candidate.joblib'
 
 
 def test_momentum_requires_history_and_classifies_trend():
@@ -21,12 +24,14 @@ def test_training_persists_evaluated_model_and_predicts(tmp_path):
     rows = []
     for index in range(60):
         high = index % 3 == 0
+        medium = index % 3 == 1
         values = {name: float(index % 7 + 1) for name in FEATURES}
         values.update({
-            'attendance': 60 if high else 94,
-            'assessment': 48 if high else 86,
-            'current_gpa': 2 if high else 3.7,
-            'risk_label': 'HIGH' if high else 'LOW',
+            'attendance': 60.0 if high else 78.0 if medium else 94.0,
+            'assignment_submission_rate': 0.3 if high else 0.6 if medium else 0.9,
+            'missing_submissions': 2.0 if high else 1.0 if medium else 0.0,
+            'activity_per_week': 6.0 if high else 10.0 if medium else 14.0,
+            'attendance_change': -8.0 if high else -2.0 if medium else 1.0,
         })
         rows.append(values)
     source = tmp_path / 'training.csv'
@@ -70,6 +75,26 @@ def test_training_persists_evaluated_model_and_predicts(tmp_path):
         result['class_probabilities'][other_class],
         abs=1e-5,
     )
+
+
+def test_batch_predictions_match_individual_model_outputs():
+    artifact = load_artifact(CANDIDATE_ARTIFACT)
+    rows = [
+        {name: float(value) for name, value in zip(FEATURES, row)}
+        for row in artifact['background'][:8]
+    ]
+
+    individual = [predict(row, CANDIDATE_ARTIFACT) for row in rows]
+    batched = predict_many(rows, CANDIDATE_ARTIFACT)
+
+    assert len(batched) == len(individual)
+    for expected, actual in zip(individual, batched):
+        assert actual['risk_level'] == expected['risk_level']
+        assert actual['risk_probability'] == pytest.approx(expected['risk_probability'], abs=1e-12)
+        assert actual['class_probabilities'] == pytest.approx(expected['class_probabilities'], abs=1e-12)
+        assert actual['risk_probability_semantics'] == expected['risk_probability_semantics']
+        assert actual['risk_level_policy'] == expected['risk_level_policy']
+        assert actual['model_version'] == expected['model_version']
 
 
 def artifact_classes(model_path):
@@ -122,20 +147,99 @@ def test_feature_loader_ignores_identity_and_target_proxy(tmp_path):
 
 
 def test_fa_marks_are_documented_context_not_current_model_features():
-    artifact = load_artifact(DEFAULT_ARTIFACT)
+    artifact = load_artifact(CANDIDATE_ARTIFACT)
     assert set(artifact['metadata']['features']) == set(FEATURES)
     assert FEATURE_CONTRACT['fa1']['model_input'] is False
     assert FEATURE_CONTRACT['fa2']['model_input'] is False
     assert FEATURE_CONTRACT['fa1']['scope'] == FEATURE_CONTRACT['fa2']['scope'] == 'subject'
 
 
+def test_global_importance_reuses_only_identical_rows_for_the_same_model(monkeypatch):
+    import numpy as np
+    from types import SimpleNamespace
+
+    calls = 0
+
+    def explain(classifier, background, rows, class_index):
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(values=np.full((len(rows), len(FEATURES)), class_index + 1.0))
+
+    monkeypatch.setattr('ai.explainability.service._explain_class_probability', explain)
+    rows = [
+        {name: float(index + offset) for index, name in enumerate(FEATURES)}
+        for offset in (0, 1)
+    ]
+
+    first = global_importance(rows, CANDIDATE_ARTIFACT)
+    first_calls = calls
+    first['features'].clear()
+
+    assert global_importance(rows, CANDIDATE_ARTIFACT)['features']
+    assert calls == first_calls
+
+    changed_rows = [{**rows[0], 'attendance': rows[0]['attendance'] + 0.25}, rows[1]]
+    global_importance(changed_rows, CANDIDATE_ARTIFACT)
+    assert calls > first_calls
+
+
+def test_global_importance_uses_marks_free_candidate_contract(monkeypatch):
+    import numpy as np
+    from types import SimpleNamespace
+
+    captured_widths = []
+
+    def explain(classifier, background, rows, class_index):
+        captured_widths.append(rows.shape[1])
+        return SimpleNamespace(values=np.full((len(rows), len(FEATURES)), 0.01 * (class_index + 1)))
+
+    monkeypatch.setattr('ai.explainability.service._explain_class_probability', explain)
+    rows = [
+        {
+            **{name: float(index + offset + 1) for index, name in enumerate(FEATURES)},
+            'previous_gpa': 4.0,
+            'current_gpa': 4.0,
+            'assessment': 100.0,
+            'assessment_change': 100.0,
+            'fa1': 25.0,
+            'fa2': 25.0,
+        }
+        for offset in range(2)
+    ]
+
+    result = global_importance(rows, CANDIDATE_ARTIFACT)
+
+    assert captured_widths and set(captured_widths) == {len(FEATURES)}
+    assert {item['name'] for item in result['features']} == set(FEATURES)
+    assert all(np.isfinite(item['importance']) and item['importance'] >= 0 for item in result['features'])
+    assert result['model_version'] == load_artifact(CANDIDATE_ARTIFACT)['metadata']['model_version']
+
+
+def test_global_importance_rejects_artifact_with_incompatible_feature_contract(monkeypatch):
+    artifact = load_artifact(CANDIDATE_ARTIFACT)
+    incompatible = dict(artifact)
+    incompatible['metadata'] = {
+        **artifact['metadata'],
+        'features': [
+            'attendance', 'assessment', 'previous_gpa', 'current_gpa',
+            'assignments_completed', 'activity_per_week', 'missing_submissions',
+            'attendance_change', 'assessment_change', 'momentum_score',
+        ],
+    }
+    monkeypatch.setattr('ai.explainability.service.load_artifact', lambda _path: incompatible)
+    rows = [{name: float(index + 1) for index, name in enumerate(FEATURES)}]
+
+    with pytest.raises(ValueError, match='feature contract'):
+        global_importance(rows, CANDIDATE_ARTIFACT)
+
+
 def test_existing_artifact_has_genuine_high_prediction_with_matching_shap_target():
-    artifact = load_artifact(DEFAULT_ARTIFACT)
+    artifact = load_artifact(CANDIDATE_ARTIFACT)
     for row in artifact['background']:
         features = {name: float(value) for name, value in zip(FEATURES, row)}
-        prediction = predict(features)
+        prediction = predict(features, CANDIDATE_ARTIFACT)
         if prediction['risk_level'] == 'HIGH':
-            explanation = explain_student(features, target_class=prediction['risk_level'])
+            explanation = explain_student(features, CANDIDATE_ARTIFACT, target_class=prediction['risk_level'])
             assert explanation['target_class'] == prediction['risk_level'] == 'HIGH'
             assert explanation['target'] == 'P(HIGH)'
             assert explanation['model_version'] == prediction['model_version']

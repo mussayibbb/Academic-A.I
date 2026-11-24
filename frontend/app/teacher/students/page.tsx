@@ -1,22 +1,30 @@
 'use client';
 
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
-import { ArrowDown, ArrowRight, ArrowUp, ClipboardCheck, Download, Eye, LayoutGrid, Search, SlidersHorizontal, Sparkles, Table2, UserRoundSearch, X } from 'lucide-react';
+import { ArrowDown, ArrowRight, ArrowUp, ClipboardCheck, Download, Eye, LayoutGrid, Pencil, Plus, Search, SlidersHorizontal, Sparkles, Table2, Trash2, Upload, UserRoundSearch, X } from 'lucide-react';
 import Link from 'next/link';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Empty, ErrorNotice, Metric, PageHeading, RiskBadge } from '@/components/ui';
 import { API_BASE, api, readToken } from '@/lib/api';
 import { formatRiskProbability } from '@/lib/risk';
+import StudentManagementDialog from '@/components/students/StudentManagementDialog';
+import type { StudentDirectoryOptions, StudentRecord, StudentStatistics } from '@/lib/students';
 
-type Student = { id: number; student_id: string; full_name: string; program?: string; year?: string; department?: string; section?: string; risk_level: string; risk_probability: number; attendance: number; current_gpa: number; momentum_trend?: string; assignments_completed: number };
+type Student = StudentRecord;
 type DirectoryResponse = { items: Student[]; total: number };
+const emptyOptions: StudentDirectoryOptions = { departments: [], programs: [], semesters: [], sections: [], courses: [] };
+const hasCurrentRisk = (student: Student) => student.risk_status === 'available' || student.risk_status === 'unvalidated-demo-model';
 
 export default function StudentsPage() {
   const [items, setItems] = useState<Student[]>([]);
   const [total, setTotal] = useState(0);
+  const [statistics, setStatistics] = useState<StudentStatistics | null>(null);
+  const [options, setOptions] = useState<StudentDirectoryOptions>(emptyOptions);
   const [search, setSearch] = useState('');
   const [risk, setRisk] = useState('');
   const [department, setDepartment] = useState('');
+  const [program, setProgram] = useState('');
+  const [semester, setSemester] = useState('');
   const [section, setSection] = useState('');
   const [course, setCourse] = useState('');
   const [momentum, setMomentum] = useState('');
@@ -25,7 +33,13 @@ export default function StudentsPage() {
   const [descending, setDescending] = useState(false);
   const [page, setPage] = useState(0);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [view, setView] = useState<'cards' | 'table'>('cards');
+  const [managementMode, setManagementMode] = useState<'create' | 'edit' | 'import' | null>(null);
+  const [editingStudent, setEditingStudent] = useState<Student | undefined>();
+  const [deleteTarget, setDeleteTarget] = useState<Student | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [refreshIndex, setRefreshIndex] = useState(0);
   const [intelligenceStudent, setIntelligenceStudent] = useState<Student | null>(null);
   const reduceMotion = useReducedMotion() ?? false;
   const intelligenceTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -39,6 +53,8 @@ export default function StudentsPage() {
     if (search.trim()) params.set('search', search.trim());
     if (risk) params.set('risk', risk);
     if (department) params.set('department', department);
+    if (program) params.set('program', program);
+    if (semester) params.set('semester', semester);
     if (section) params.set('section', section);
     if (course) params.set('course', course);
     if (momentum) params.set('momentum', momentum);
@@ -46,11 +62,32 @@ export default function StudentsPage() {
     if (attendanceBand === 'watch') { params.set('attendance_min', '75'); params.set('attendance_max', '84.99'); }
     if (attendanceBand === 'steady') params.set('attendance_min', '85');
     return params.toString();
-  }, [page, search, risk, department, section, course, momentum, attendanceBand, sort, descending]);
+  }, [page, search, risk, department, program, semester, section, course, momentum, attendanceBand, sort, descending]);
 
   useEffect(() => {
-    api<DirectoryResponse>(`/api/v1/students?${query}`).then((result) => { setItems(result.items); setTotal(result.total); setError(''); }).catch((requestError: Error) => setError(requestError.message));
-  }, [query]);
+    let active = true;
+    Promise.all([
+      api<DirectoryResponse>(`/api/v1/students?${query}`),
+      api<StudentStatistics>('/api/v1/students/stats'),
+    ]).then(([result, nextStatistics]) => {
+      if (!active) return;
+      setItems(result.items);
+      setTotal(result.total);
+      setStatistics(nextStatistics);
+      setError('');
+    }).catch((requestError: Error) => {
+      if (active) setError(requestError.message);
+    });
+    return () => { active = false; };
+  }, [query, refreshIndex]);
+
+  useEffect(() => {
+    let active = true;
+    api<StudentDirectoryOptions>('/api/v1/students/options')
+      .then((result) => { if (active) setOptions(result); })
+      .catch((requestError: Error) => { if (active) setError(requestError.message); });
+    return () => { active = false; };
+  }, []);
 
   useEffect(() => {
     if (!intelligenceStudent) return;
@@ -72,6 +109,15 @@ export default function StudentsPage() {
     return () => window.removeEventListener('keydown', closeOnEscape);
   }, [intelligenceStudent]);
 
+  useEffect(() => {
+    if (!deleteTarget) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !deleteBusy) setDeleteTarget(null);
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [deleteTarget, deleteBusy]);
+
   const containDrawerFocus = (event: React.KeyboardEvent<HTMLElement>) => {
     if (event.key !== 'Tab') return;
     const focusable = intelligenceDrawerRef.current?.querySelectorAll<HTMLElement>(
@@ -91,27 +137,74 @@ export default function StudentsPage() {
   };
 
   const toggleSort = (key: string) => { if (sort === key) setDescending(!descending); else { setSort(key); setDescending(false); } };
+  const closeManagementDialog = useCallback(() => { setManagementMode(null); setEditingStudent(undefined); }, []);
+  const recordChanged = useCallback((message: string) => {
+    setNotice(message);
+    setRefreshIndex((value) => value + 1);
+    api<StudentDirectoryOptions>('/api/v1/students/options')
+      .then(setOptions)
+      .catch((requestError: Error) => setError(requestError.message));
+  }, []);
+  const deleteStudent = async () => {
+    if (!deleteTarget) return;
+    setDeleteBusy(true);
+    setError('');
+    try {
+      await api<{ deleted: boolean }>(`/api/v1/students/${deleteTarget.id}`, { method: 'DELETE' });
+      setNotice(`${deleteTarget.full_name} was removed from the student directory.`);
+      setDeleteTarget(null);
+      setRefreshIndex((value) => value + 1);
+    } catch (requestError) {
+      setError((requestError as Error).message);
+    } finally {
+      setDeleteBusy(false);
+    }
+  };
   const exportCsv = async () => {
-    const response = await fetch(`${API_BASE}/api/v1/reports/export.csv`, { headers: { Authorization: `Bearer ${readToken() ?? ''}` } });
-    if (!response.ok) { setError('Could not export this report.'); return; }
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(await response.blob());
-    link.download = 'student-risk-report.csv';
-    link.click();
-    URL.revokeObjectURL(link.href);
+    const params = new URLSearchParams();
+    if (search.trim()) params.set('search', search.trim());
+    if (department) params.set('department', department);
+    if (program) params.set('program', program);
+    if (semester) params.set('semester', semester);
+    if (section) params.set('section', section);
+    if (course) params.set('course', course);
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/students/export.csv?${params}`, { headers: { Authorization: `Bearer ${readToken() ?? ''}` } });
+      if (!response.ok) throw new Error('Could not export these student records.');
+      const objectUrl = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = 'student-records.csv';
+      link.click();
+      URL.revokeObjectURL(objectUrl);
+    } catch (requestError) {
+      setError((requestError as Error).message);
+    }
   };
 
   return <div className="fade-up">
-    <PageHeading eyebrow="Student directory · demo data" title="Students" description="Find the right student and understand the signals that changed." action={<div className="flex flex-wrap items-center gap-2">
+    <PageHeading eyebrow="Student directory · verified records" title="Students" description="Manage academic records, preserve provenance, and review the current risk picture." action={<div className="flex flex-wrap items-center gap-2">
       <div role="group" aria-label="Student directory view" className="inline-flex h-10 items-center rounded-lg border border-white/10 bg-white/[.025] p-1">
         <button ref={viewToggleRef} type="button" aria-pressed={view === 'cards'} onClick={() => setView('cards')} className={`inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs transition ${view === 'cards' ? 'bg-rose-500/15 text-rose-100' : 'text-slate-400 hover:text-white'}`}><LayoutGrid size={14} /> Cards</button>
         <button type="button" aria-pressed={view === 'table'} onClick={() => setView('table')} className={`inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs transition ${view === 'table' ? 'bg-rose-500/15 text-rose-100' : 'text-slate-400 hover:text-white'}`}><Table2 size={14} /> Table</button>
       </div>
+      <button type="button" onClick={() => { setEditingStudent(undefined); setManagementMode('import'); }} className="inline-flex h-10 items-center gap-2 rounded-lg border border-white/10 px-3 text-xs font-medium text-slate-200 hover:bg-white/5"><Upload size={15} /> Import CSV</button>
       <button type="button" onClick={exportCsv} className="inline-flex h-10 items-center gap-2 rounded-lg border border-white/10 px-3 text-xs font-medium text-slate-200 hover:bg-white/5"><Download size={15} /> Export CSV</button>
+      <button type="button" onClick={() => { setEditingStudent(undefined); setManagementMode('create'); }} className="inline-flex h-10 items-center gap-2 rounded-lg bg-rose-600 px-3 text-xs font-semibold text-white hover:bg-rose-500"><Plus size={15} /> Add student</button>
     </div>} />
-    <section aria-label="Student directory summary" className="mb-4 grid gap-3 sm:grid-cols-2">
-      <Metric label="Student records" value={total} detail="Total records matching current filters" color="amber" />
-      <Metric label="On this page" value={items.length} detail={`Page ${page + 1} · ${pageSize} records per page`} color="rose" />
+    {notice && <p role="status" className="mb-3 rounded-lg border border-emerald-200/15 bg-emerald-200/[.035] p-3 text-xs text-emerald-100">{notice}</p>}
+    {statistics?.prediction_status === 'unvalidated-demo-model' && <p role="status" className="mb-3 rounded-lg border border-amber-200/20 bg-amber-200/[.04] p-3 text-xs leading-5 text-amber-100">{statistics.prediction_message} Student origin is shown on every record; do not use demo previews for institutional decisions.</p>}
+    {statistics?.prediction_status === 'unavailable' && <p role="status" className="mb-3 rounded-lg border border-rose-200/20 bg-rose-200/[.04] p-3 text-xs leading-5 text-rose-100">Risk counts are unavailable: {statistics.prediction_message ?? 'The active model could not be loaded.'}</p>}
+    {statistics?.prediction_status === 'partial' && <p role="status" className="mb-3 rounded-lg border border-amber-200/20 bg-amber-200/[.04] p-3 text-xs leading-5 text-amber-100">{statistics.prediction_message}</p>}
+    <section aria-label="Student directory summary" className="mb-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <Metric label="Student records" value={statistics?.total ?? '—'} detail="Total saved student records" color="amber" />
+      <Metric label="High risk" value={statistics?.high_risk ?? '—'} detail="Current classifier output" color="rose" />
+      <Metric label="Medium risk" value={statistics?.medium_risk ?? '—'} detail="Current classifier output" color="amber" />
+      <Metric label="Low risk" value={statistics?.low_risk ?? '—'} detail="Current classifier output" color="mint" />
+      <Metric label="At risk / attention" value={statistics?.attention ?? '—'} detail="High and medium classifications" color="rose" />
+      <Metric label="Average attendance" value={statistics?.average_attendance == null ? '—' : `${statistics.average_attendance.toFixed(1)}%`} detail="Across saved records" color="cyan" />
+      <Metric label="Average GPA" value={statistics?.average_gpa?.toFixed(2) ?? '—'} detail="Current GPA values" color="amber" />
+      <Metric label="Recently added" value={statistics?.recently_added ?? '—'} detail="Records added in the last 30 days" color="cyan" />
     </section>
     <div className="surface rounded-xl p-4 sm:p-5">
       <p className="mb-3 text-xs text-slate-500">Risk is the classifier&apos;s most probable class; its probability is shown alongside it.</p>
@@ -119,9 +212,11 @@ export default function StudentsPage() {
         <label className="relative min-w-52 flex-1"><Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" /><span className="sr-only">Search students</span><input value={search} onChange={(event) => { setSearch(event.target.value); setPage(0); }} placeholder="Search name or student ID" className="h-10 w-full rounded-lg border border-white/10 bg-[#0b1320] pl-9 pr-3 text-sm outline-none focus:border-cyan-200/50" /></label>
         <div className="flex flex-wrap items-center gap-2"><SlidersHorizontal size={15} className="mr-1 hidden text-slate-500 sm:block" />
           <select aria-label="Filter by risk" value={risk} onChange={(event) => { setRisk(event.target.value); setPage(0); }} className="h-10 rounded-lg border border-white/10 bg-[#0b1320] px-3 text-xs text-slate-300"><option value="">All risks</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option></select>
-          <select aria-label="Filter by department" value={department} onChange={(event) => { setDepartment(event.target.value); setPage(0); }} className="h-10 max-w-40 rounded-lg border border-white/10 bg-[#0b1320] px-3 text-xs text-slate-300"><option value="">All departments</option>{['Engineering', 'Sciences', 'Humanities', 'Business'].map((value) => <option key={value}>{value}</option>)}</select>
-          <select aria-label="Filter by course" value={course} onChange={(event) => { setCourse(event.target.value); setPage(0); }} className="h-10 rounded-lg border border-white/10 bg-[#0b1320] px-3 text-xs text-slate-300"><option value="">All courses</option><option value="AF-101-A">AF-101-A</option></select>
-            <select aria-label="Filter by section" value={section} onChange={(event) => { setSection(event.target.value); setPage(0); }} className="h-10 rounded-lg border border-white/10 bg-[#0b1320] px-3 text-xs text-slate-300"><option value="">All sections</option>{['A', 'B', 'C', 'D'].map((value) => <option key={value}>{value}</option>)}</select>
+          <select aria-label="Filter by department" value={department} onChange={(event) => { setDepartment(event.target.value); setPage(0); }} className="h-10 max-w-40 rounded-lg border border-white/10 bg-[#0b1320] px-3 text-xs text-slate-300"><option value="">All departments</option>{options.departments.map((value) => <option key={value}>{value}</option>)}</select>
+          <select aria-label="Filter by program" value={program} onChange={(event) => { setProgram(event.target.value); setPage(0); }} className="h-10 max-w-40 rounded-lg border border-white/10 bg-[#0b1320] px-3 text-xs text-slate-300"><option value="">All programs</option>{options.programs.map((value) => <option key={value}>{value}</option>)}</select>
+          <select aria-label="Filter by semester" value={semester} onChange={(event) => { setSemester(event.target.value); setPage(0); }} className="h-10 rounded-lg border border-white/10 bg-[#0b1320] px-3 text-xs text-slate-300"><option value="">All semesters</option>{options.semesters.map((value) => <option key={value}>{value}</option>)}</select>
+          <select aria-label="Filter by course" value={course} onChange={(event) => { setCourse(event.target.value); setPage(0); }} className="h-10 rounded-lg border border-white/10 bg-[#0b1320] px-3 text-xs text-slate-300"><option value="">All courses</option>{options.courses.map((value) => <option key={value.id} value={value.code}>{value.code}</option>)}</select>
+          <select aria-label="Filter by section" value={section} onChange={(event) => { setSection(event.target.value); setPage(0); }} className="h-10 rounded-lg border border-white/10 bg-[#0b1320] px-3 text-xs text-slate-300"><option value="">All sections</option>{options.sections.map((value) => <option key={value}>{value}</option>)}</select>
           <select aria-label="Filter by momentum" value={momentum} onChange={(event) => { setMomentum(event.target.value); setPage(0); }} className="h-10 rounded-lg border border-white/10 bg-[#0b1320] px-3 text-xs text-slate-300"><option value="">All momentum</option>{['IMPROVING', 'STABLE', 'DECLINING', 'VOLATILE', 'INSUFFICIENT_DATA'].map((value) => <option key={value}>{value}</option>)}</select>
           <select aria-label="Filter by attendance" value={attendanceBand} onChange={(event) => { setAttendanceBand(event.target.value); setPage(0); }} className="h-10 rounded-lg border border-white/10 bg-[#0b1320] px-3 text-xs text-slate-300"><option value="">All attendance</option><option value="low">Below 75%</option><option value="watch">75–84%</option><option value="steady">85% and above</option></select>
         </div>
@@ -149,33 +244,38 @@ export default function StudentsPage() {
                   <div className="min-w-0">
                     <h2 className="truncate text-sm font-semibold text-white sm:text-base">{student.full_name}</h2>
                     <p className="mt-1 font-mono text-[10px] text-slate-500">{student.student_id}</p>
-                    <p className="mt-1 text-[11px] text-slate-400">{student.department ?? student.program ?? '—'} <span className="text-slate-600">·</span> Year {student.year ?? '—'} <span className="text-slate-600">·</span> Section {student.section ?? '—'}</p>
+                    <p className="mt-1 text-[11px] text-slate-400">{student.department ?? student.program ?? '—'} <span className="text-slate-600">·</span> Year {student.year ?? '—'} <span className="text-slate-600">·</span> {student.semester ?? 'Semester not set'} <span className="text-slate-600">·</span> Section {student.section ?? '—'}</p>
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
-                    <RiskBadge level={student.risk_level} />
-                    <span className="rounded-md border border-white/[.08] bg-white/[.025] px-2 py-1 text-[10px] text-slate-300">{formatRiskProbability(student.risk_level, student.risk_probability)}</span>
+                    <span className="rounded-md border border-white/[.08] bg-white/[.025] px-2 py-1 text-[9px] text-slate-400">{student.data_origin}</span>
+                    <RiskBadge level={hasCurrentRisk(student) ? student.risk_level : 'UNAVAILABLE'} />
+                    <span className="rounded-md border border-white/[.08] bg-white/[.025] px-2 py-1 text-[10px] text-slate-300">{!hasCurrentRisk(student) ? 'Unavailable' : student.risk_status === 'unvalidated-demo-model' ? 'Demo preview' : formatRiskProbability(student.risk_level, student.risk_probability)}</span>
                   </div>
                 </div>
                 <dl className="mt-4 grid grid-cols-2 gap-x-3 gap-y-3 border-t border-white/[.07] pt-3 sm:grid-cols-4 xl:grid-cols-5">
                   <div><dt className="text-[9px] uppercase tracking-[.12em] text-slate-500">Attendance</dt><dd className={`mt-1 text-xs font-medium ${student.attendance < 75 ? 'text-rose-200' : 'text-slate-200'}`}>{student.attendance.toFixed(0)}%</dd></div>
-                  <div><dt className="text-[9px] uppercase tracking-[.12em] text-slate-500">Performance</dt><dd className="mt-1 text-xs font-medium text-slate-200">{student.current_gpa.toFixed(2)} GPA</dd></div>
+                  <div><dt className="text-[9px] uppercase tracking-[.12em] text-slate-500">Assessment</dt><dd className="mt-1 text-xs font-medium text-slate-200">{student.assessment.toFixed(0)}%</dd></div>
+                  <div><dt className="text-[9px] uppercase tracking-[.12em] text-slate-500">Current GPA</dt><dd className="mt-1 text-xs font-medium text-slate-200">{student.current_gpa.toFixed(2)}</dd></div>
+                  <div><dt className="text-[9px] uppercase tracking-[.12em] text-slate-500">Previous GPA</dt><dd className="mt-1 text-xs font-medium text-slate-200">{student.previous_gpa.toFixed(2)}</dd></div>
                   <div><dt className="text-[9px] uppercase tracking-[.12em] text-slate-500">Learning momentum</dt><dd className={`mt-1 text-xs font-medium ${student.momentum_trend === 'DECLINING' ? 'text-rose-200' : student.momentum_trend === 'IMPROVING' ? 'text-emerald-200' : 'text-slate-200'}`}>{student.momentum_trend?.replace('_', ' ') ?? '—'}</dd></div>
                   <div><dt className="text-[9px] uppercase tracking-[.12em] text-slate-500">Assignment engagement</dt><dd className="mt-1 text-xs font-medium text-slate-200">{student.assignments_completed} completed</dd></div>
                   <div className="col-span-2 flex flex-wrap items-center gap-2 sm:col-span-4 xl:col-span-1 xl:justify-end">
                     <button type="button" onClick={(event) => { intelligenceTriggerRef.current = event.currentTarget; setIntelligenceStudent(student); }} className="inline-flex min-h-9 items-center gap-1.5 rounded-lg border border-rose-300/20 px-3 text-[10px] font-medium text-rose-100 transition hover:bg-rose-300/[.08] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300/60"><Sparkles size={13} /> View intelligence</button>
                     <Link href={`/teacher/recovery/students/${student.id}`} aria-label={`Open recovery profile for ${student.full_name}`} className="inline-flex min-h-9 items-center gap-1.5 rounded-lg bg-rose-600 px-3 text-[10px] font-medium text-white transition hover:bg-rose-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300/60"><ClipboardCheck size={13} /> Recovery profile <ArrowRight size={12} /></Link>
                     <Link href={`/teacher/students/${student.id}`} aria-label={`View ${student.full_name}`} className="inline-flex min-h-9 items-center gap-1.5 rounded-lg border border-white/10 px-3 text-[10px] font-medium text-slate-300 transition hover:border-white/20 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300/60"><Eye size={13} /> Student 360</Link>
+                    <button type="button" onClick={() => { setEditingStudent(student); setManagementMode('edit'); }} aria-label={`Edit ${student.full_name}`} className="inline-flex min-h-9 items-center gap-1.5 rounded-lg border border-white/10 px-3 text-[10px] text-slate-300 hover:bg-white/5"><Pencil size={12} /> Edit</button>
+                    <button type="button" onClick={() => setDeleteTarget(student)} aria-label={`Delete ${student.full_name}`} className="inline-flex min-h-9 items-center gap-1.5 rounded-lg border border-rose-300/15 px-3 text-[10px] text-rose-200 hover:bg-rose-300/[.06]"><Trash2 size={12} /> Delete</button>
                   </div>
                 </dl>
               </div>
             </div>
           </motion.article>;
         })}
-      </div> : <div className="mt-4 overflow-x-auto"><table className="w-full min-w-[1030px] text-left text-xs"><thead className="border-b border-white/8 text-[10px] uppercase tracking-[.1em] text-slate-500"><tr>
-        {([['full_name', 'Student'], ['student_id', 'Student ID'], ['department', 'Program'], ['risk_level', 'Risk'], ['risk_probability', 'Class probability'], ['attendance', 'Attendance'], ['current_gpa', 'Performance'], ['momentum_trend', 'Momentum'], ['assignments_completed', 'Assignment engagement']] as const).map(([key, label]) => <th key={key} className="pb-3 pr-4 font-medium"><button type="button" onClick={() => toggleSort(key === 'student_id' || key === 'department' || key === 'momentum_trend' ? 'full_name' : key)} className="inline-flex items-center gap-1 hover:text-white">{label}{sort === key && (descending ? <ArrowDown size={11} /> : <ArrowUp size={11} />)}</button></th>)}<th className="pb-3 text-right font-medium">Actions</th>
-      </tr></thead><tbody>{items.map((student) => <tr key={student.id} className="border-b border-white/5 transition hover:bg-white/[.025]"><td className="py-3.5 pr-4"><Link href={`/teacher/students/${student.id}`} className="font-medium text-slate-100 hover:text-cyan-200">{student.full_name}</Link><div className="mt-1 text-[10px] text-slate-500">Year {student.year ?? '—'} · Section {student.section ?? '—'}</div></td><td className="py-3.5 pr-4 font-mono text-slate-400">{student.student_id}</td><td className="py-3.5 pr-4 text-slate-400">{student.department ?? student.program ?? '—'}</td><td className="py-3.5 pr-4"><RiskBadge level={student.risk_level} /></td><td className="py-3.5 pr-4 text-slate-300">{formatRiskProbability(student.risk_level, student.risk_probability)}</td><td className="py-3.5 pr-4"><span className={student.attendance < 75 ? 'text-rose-200' : 'text-slate-300'}>{student.attendance.toFixed(0)}%</span></td><td className="py-3.5 pr-4 text-slate-300">{student.current_gpa.toFixed(2)} GPA</td><td className="py-3.5 pr-4"><span className={student.momentum_trend === 'DECLINING' ? 'text-rose-200' : student.momentum_trend === 'IMPROVING' ? 'text-emerald-200' : 'text-slate-300'}>{student.momentum_trend?.replace('_', ' ') ?? '—'}</span></td><td className="py-3.5 pr-4 text-slate-300">{student.assignments_completed} completed</td><td className="py-3.5 text-right"><div className="inline-flex gap-2"><Link href={`/teacher/recovery/students/${student.id}`} aria-label={`Open recovery profile for ${student.full_name}`} className="inline-flex items-center gap-1 rounded-md bg-rose-600 px-2.5 py-1.5 text-[10px] text-white hover:bg-rose-500"><ClipboardCheck size={12} />Recovery</Link><Link href={`/teacher/students/${student.id}`} aria-label={`View ${student.full_name}`} className="inline-flex rounded-md border border-white/10 px-2.5 py-1.5 text-[10px] text-slate-300 hover:border-cyan-200/30 hover:text-cyan-100">Student 360</Link></div></td></tr>)}</tbody></table></div>}
+      </div> : <div className="mt-4 overflow-x-auto"><table className="w-full min-w-[1500px] text-left text-xs"><thead className="border-b border-white/8 text-[10px] uppercase tracking-[.1em] text-slate-500"><tr>
+        {([['full_name', 'Student'], ['student_id', 'Student ID'], ['department', 'Department'], ['semester', 'Semester'], ['risk_level', 'Risk'], ['risk_probability', 'Class probability'], ['attendance', 'Attendance'], ['current_gpa', 'Current GPA'], ['assignments_completed', 'Assignments']] as const).map(([key, label]) => <th key={key} className="pb-3 pr-4 font-medium"><button type="button" onClick={() => toggleSort(key)} className="inline-flex items-center gap-1 hover:text-white">{label}{sort === key && (descending ? <ArrowDown size={11} /> : <ArrowUp size={11} />)}</button></th>)}<th className="pb-3 pr-4 font-medium">Email</th><th className="pb-3 pr-4 font-medium">Section</th><th className="pb-3 pr-4 font-medium">Assessment</th><th className="pb-3 pr-4 font-medium">Previous GPA</th><th className="pb-3 pr-4 font-medium">Origin</th><th className="pb-3 text-right font-medium">Actions</th>
+      </tr></thead><tbody>{items.map((student) => <tr key={student.id} className="border-b border-white/5 transition hover:bg-white/[.025]"><td className="py-3.5 pr-4"><Link href={`/teacher/students/${student.id}`} className="font-medium text-slate-100 hover:text-cyan-200">{student.full_name}</Link><div className="mt-1 text-[10px] text-slate-500">Year {student.year ?? '—'}</div></td><td className="py-3.5 pr-4 font-mono text-slate-400">{student.student_id}</td><td className="py-3.5 pr-4 text-slate-400">{student.department ?? student.program ?? '—'}</td><td className="py-3.5 pr-4 text-slate-400">{student.semester ?? '—'}</td><td className="py-3.5 pr-4"><RiskBadge level={hasCurrentRisk(student) ? student.risk_level : 'UNAVAILABLE'} /></td><td className="py-3.5 pr-4 text-slate-300">{!hasCurrentRisk(student) ? 'Unavailable' : student.risk_status === 'unvalidated-demo-model' ? 'Demo preview' : formatRiskProbability(student.risk_level, student.risk_probability)}</td><td className="py-3.5 pr-4"><span className={student.attendance < 75 ? 'text-rose-200' : 'text-slate-300'}>{student.attendance.toFixed(0)}%</span></td><td className="py-3.5 pr-4 text-slate-300">{student.current_gpa.toFixed(2)}</td><td className="py-3.5 pr-4 text-slate-300">{student.assignments_completed}</td><td className="py-3.5 pr-4 text-slate-400">{student.email ?? '—'}</td><td className="py-3.5 pr-4 text-slate-400">{student.section ?? '—'}</td><td className="py-3.5 pr-4 text-slate-300">{student.assessment.toFixed(0)}%</td><td className="py-3.5 pr-4 text-slate-300">{student.previous_gpa.toFixed(2)}</td><td className="py-3.5 pr-4"><span className="text-[9px] text-slate-400">{student.data_origin}</span></td><td className="py-3.5 text-right"><div className="inline-flex gap-2"><Link href={`/teacher/recovery/students/${student.id}`} aria-label={`Open recovery profile for ${student.full_name}`} className="inline-flex items-center gap-1 rounded-md bg-rose-600 px-2.5 py-1.5 text-[10px] text-white hover:bg-rose-500"><ClipboardCheck size={12} />Recovery</Link><Link href={`/teacher/students/${student.id}`} aria-label={`View ${student.full_name}`} className="inline-flex rounded-md border border-white/10 px-2.5 py-1.5 text-[10px] text-slate-300 hover:border-cyan-200/30 hover:text-cyan-100">360</Link><button type="button" onClick={() => { setEditingStudent(student); setManagementMode('edit'); }} aria-label={`Edit ${student.full_name}`} className="rounded-md border border-white/10 px-2 py-1.5 text-slate-300"><Pencil size={12} /></button><button type="button" onClick={() => setDeleteTarget(student)} aria-label={`Delete ${student.full_name}`} className="rounded-md border border-rose-300/15 px-2 py-1.5 text-rose-200"><Trash2 size={12} /></button></div></td></tr>)}</tbody></table></div>}
       {!error && !items.length && <div className="py-8"><Empty title="No students match these filters" detail="Try adjusting the risk, attendance, or department filters." /></div>}
-      <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-white/8 pt-4"><div className="text-xs text-slate-500"><UserRoundSearch size={14} className="mr-1.5 inline" />{total.toLocaleString()} students · fictional dataset</div><div className="flex items-center gap-2"><button type="button" disabled={page === 0} onClick={() => setPage(page - 1)} className="rounded-md border border-white/10 px-3 py-2 text-xs text-slate-300 disabled:opacity-40">Previous</button><span className="min-w-20 text-center text-xs text-slate-500">Page {page + 1} / {Math.max(1, Math.ceil(total / pageSize))}</span><button type="button" disabled={(page + 1) * pageSize >= total} onClick={() => setPage(page + 1)} className="rounded-md border border-white/10 px-3 py-2 text-xs text-slate-300 disabled:opacity-40">Next</button></div></div>
+      <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-white/8 pt-4"><div className="text-xs text-slate-500"><UserRoundSearch size={14} className="mr-1.5 inline" />{total.toLocaleString()} matching records · {statistics?.by_origin['DEMO DATA'] ?? 0} demo · {statistics?.by_origin['INSTITUTIONAL IMPORT'] ?? 0} institutional</div><div className="flex items-center gap-2"><button type="button" disabled={page === 0} onClick={() => setPage(page - 1)} className="rounded-md border border-white/10 px-3 py-2 text-xs text-slate-300 disabled:opacity-40">Previous</button><span className="min-w-20 text-center text-xs text-slate-500">Page {page + 1} / {Math.max(1, Math.ceil(total / pageSize))}</span><button type="button" disabled={(page + 1) * pageSize >= total} onClick={() => setPage(page + 1)} className="rounded-md border border-white/10 px-3 py-2 text-xs text-slate-300 disabled:opacity-40">Next</button></div></div>
     </div>
     <AnimatePresence>
       {intelligenceStudent && <motion.div className="fixed inset-0 z-[70] overflow-hidden" initial={reduceMotion ? false : { opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: reduceMotion ? 0 : .18 }}>
@@ -199,7 +299,7 @@ export default function StudentsPage() {
           <div className="flex-1 space-y-5 overflow-y-auto p-5 sm:p-6">
             <section className="rounded-xl border border-rose-300/15 bg-rose-300/[.035] p-4">
               <p className="text-[9px] uppercase tracking-[.15em] text-slate-500">Current model output</p>
-              <div className="mt-3 flex flex-wrap items-center justify-between gap-3"><RiskBadge level={intelligenceStudent.risk_level} /><span className="text-sm font-semibold text-slate-100">{formatRiskProbability(intelligenceStudent.risk_level, intelligenceStudent.risk_probability)}</span></div>
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-3"><RiskBadge level={hasCurrentRisk(intelligenceStudent) ? intelligenceStudent.risk_level : 'UNAVAILABLE'} /><span className="text-sm font-semibold text-slate-100">{!hasCurrentRisk(intelligenceStudent) ? 'Unavailable' : intelligenceStudent.risk_status === 'unvalidated-demo-model' ? 'Demo preview' : formatRiskProbability(intelligenceStudent.risk_level, intelligenceStudent.risk_probability)}</span></div>
               <p className="mt-3 text-[10px] leading-5 text-slate-500">The displayed probability belongs to the predicted class. This directory view does not include a feature-contribution explanation.</p>
             </section>
             <section>
@@ -225,5 +325,24 @@ export default function StudentsPage() {
         </motion.aside>
       </motion.div>}
     </AnimatePresence>
+    {managementMode && <StudentManagementDialog
+      key={`${managementMode}-${editingStudent?.id ?? 'new'}`}
+      mode={managementMode}
+      student={editingStudent}
+      options={options}
+      onClose={closeManagementDialog}
+      onChanged={recordChanged}
+    />}
+    {deleteTarget && <div className="fixed inset-0 z-[80] grid place-items-center bg-black/70 p-4 backdrop-blur-sm">
+      <section role="alertdialog" aria-modal="true" aria-labelledby="delete-student-title" className="w-full max-w-md rounded-2xl border border-rose-200/15 bg-[#111214] p-5 shadow-2xl">
+        <p className="eyebrow text-rose-200">Delete student</p>
+        <h2 id="delete-student-title" className="mt-2 text-lg font-semibold text-white">Remove {deleteTarget.full_name}?</h2>
+        <p className="mt-3 text-xs leading-5 text-slate-400">This permanently deletes the student record and its linked academic and risk history. The source classification is {deleteTarget.data_origin}.</p>
+        <div className="mt-5 flex justify-end gap-2">
+          <button type="button" disabled={deleteBusy} onClick={() => setDeleteTarget(null)} className="rounded-lg border border-white/10 px-4 py-2.5 text-xs text-slate-300 disabled:opacity-50">Cancel</button>
+          <button type="button" disabled={deleteBusy} onClick={() => void deleteStudent()} className="rounded-lg bg-rose-600 px-4 py-2.5 text-xs font-semibold text-white disabled:opacity-50">{deleteBusy ? 'Deleting…' : 'Delete permanently'}</button>
+        </div>
+      </section>
+    </div>}
   </div>;
 }

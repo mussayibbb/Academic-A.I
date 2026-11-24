@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,11 +14,18 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder
 
-from ai.risk.features import FEATURES, TARGET, load_training_data
+from ai.risk.features import (
+    FEATURE_CONTRACT,
+    FEATURE_CONTRACT_VERSION,
+    FEATURES,
+    TARGET,
+    TARGET_PROVENANCE,
+    load_training_data,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATA = ROOT / 'data' / 'processed' / 'DSstudents_processed.csv'
-DEFAULT_ARTIFACT = ROOT / 'models' / 'risk' / 'risk_model.joblib'
+DEFAULT_ARTIFACT = ROOT / 'models' / 'candidates' / 'risk_model_candidate.joblib'
 
 
 def build_candidates() -> dict[str, Any]:
@@ -39,6 +47,8 @@ def train(input_path: Path = DEFAULT_DATA, artifact_path: Path = DEFAULT_ARTIFAC
     import pandas as pd
 
     source = pd.read_csv(input_path)
+    dataset_bytes = input_path.read_bytes()
+    dataset_checksum = hashlib.sha256(dataset_bytes).hexdigest()
     counts = labels.value_counts()
     if counts.min() < 2:
         raise ValueError('Each risk class needs at least two rows for a stratified evaluation split')
@@ -53,9 +63,20 @@ def train(input_path: Path = DEFAULT_DATA, artifact_path: Path = DEFAULT_ARTIFAC
         expected = label_encoder.inverse_transform(y_test.astype(int))
         metrics = {
             'accuracy': float(accuracy_score(expected, predicted)),
+            'precision_macro': float(precision_score(expected, predicted, average='macro', zero_division=0)),
+            'recall_macro': float(recall_score(expected, predicted, average='macro', zero_division=0)),
+            'f1_macro': float(f1_score(expected, predicted, average='macro', zero_division=0)),
             'precision_weighted': float(precision_score(expected, predicted, average='weighted', zero_division=0)),
             'recall_weighted': float(recall_score(expected, predicted, average='weighted', zero_division=0)),
             'f1_weighted': float(f1_score(expected, predicted, average='weighted', zero_division=0)),
+            'per_class': {
+                label: {
+                    'precision': float(precision_score(expected, predicted, labels=[label], average='macro', zero_division=0)),
+                    'recall': float(recall_score(expected, predicted, labels=[label], average='macro', zero_division=0)),
+                    'f1': float(f1_score(expected, predicted, labels=[label], average='macro', zero_division=0)),
+                }
+                for label in label_encoder.classes_.tolist()
+            },
             'labels': label_encoder.classes_.tolist(),
             'confusion_matrix': confusion_matrix(expected, predicted, labels=label_encoder.classes_).tolist(),
         }
@@ -70,15 +91,30 @@ def train(input_path: Path = DEFAULT_DATA, artifact_path: Path = DEFAULT_ARTIFAC
         'training_rows': int(len(features)),
         'evaluation_rows': int(len(x_test)),
         'features': FEATURES,
+        'feature_contract': FEATURE_CONTRACT,
+        'feature_contract_version': FEATURE_CONTRACT_VERSION,
         'target': TARGET,
+        'target_label_provenance': TARGET_PROVENANCE,
+        'target_definition': 'Transparent rule-generated three-class label from attendance, assignment submission, missing assignments, LMS engagement and attendance change.',
         'class_labels': label_encoder.classes_.tolist(),
         'evaluation': results,
         'dataset': str(input_path.resolve()),
+        'dataset_filename': input_path.name,
+        'dataset_fingerprint': dataset_checksum,
+        'dataset_checksum': dataset_checksum,
+        'dataset_row_count': int(len(source)),
         'demo_data': bool(source.get('data_origin', pd.Series(dtype=str)).eq('DEMO DATA').any()),
     }
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     transformed_background = selected.named_steps['imputer'].transform(features.sample(min(40, len(features)), random_state=42))
-    joblib.dump({'pipeline': selected, 'metadata': metadata, 'background': transformed_background, 'label_encoder': label_encoder}, artifact_path)
+    joblib.dump({
+        'pipeline': selected,
+        'metadata': metadata,
+        'feature_contract': FEATURES,
+        'feature_contract_version': FEATURE_CONTRACT_VERSION,
+        'background': transformed_background,
+        'label_encoder': label_encoder,
+    }, artifact_path)
     artifact_path.with_suffix('.metrics.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
     return metadata
 

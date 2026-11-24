@@ -1,22 +1,28 @@
 'use client';
 
 import { ArrowDownRight, ArrowUpRight, Minus, TrendingUp } from 'lucide-react';
+import dynamic from 'next/dynamic';
 import Link from 'next/link';
 import { useEffect, useMemo, useState } from 'react';
-import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { Empty, ErrorNotice, Metric, PageHeading, RiskBadge } from '@/components/ui';
-import { api } from '@/lib/api';
+import { api, readCachedApiData } from '@/lib/api';
+
+const TeacherRiskHistoryChart = dynamic(() => import('@/components/charts/TeacherRiskHistoryChart'), {
+  ssr: false,
+  loading: () => <div className="skeleton h-full w-full rounded-lg" aria-hidden="true" />,
+});
 
 type MonitorData = {
   distribution: Record<string, number>;
   momentum: Record<string, number>;
   transitions: { student_id: number; name: string; from: string; to: string; recorded_at: string }[];
   history_note: string;
-  history: { student_id: number; risk_level: string; recorded_at: string }[];
+  history: { student_id: number; data_origin?: string; risk_level: string; recorded_at: string }[];
+  risk_status?: string;
 };
 
 export default function RiskMonitoringPage() {
-  const [data, setData] = useState<MonitorData | null>(null);
+  const [data, setData] = useState<MonitorData | null>(() => readCachedApiData<MonitorData>('/api/v1/risk/monitoring'));
   const [error, setError] = useState('');
 
   useEffect(() => {
@@ -42,6 +48,8 @@ export default function RiskMonitoringPage() {
   return <div className="page-content">
     <PageHeading eyebrow="Risk monitoring · dated records" title="Risk, in motion" description="Track recorded changes between levels and review the context behind each snapshot." />
 
+    {data.risk_status === 'unvalidated-demo-model' && <p role="status" className="rounded-lg border border-amber-200/20 bg-amber-200/[.05] p-3 text-xs leading-5 text-amber-100">Unvalidated demo preview. Only records marked DEMO DATA are included; do not use these classifications as institutional decisions.</p>}
+
     <section aria-label="Current risk classifications" className="grid gap-3 sm:grid-cols-3">
       <Metric label="High risk" value={data.distribution.HIGH ?? 0} detail="Current student classifications" color="rose" />
       <Metric label="Medium risk" value={data.distribution.MEDIUM ?? 0} detail="Current student classifications" color="amber" />
@@ -60,17 +68,7 @@ export default function RiskMonitoringPage() {
       <section aria-labelledby="snapshot-heading" className="surface min-w-0 rounded-xl p-5 sm:p-6">
         <p className="eyebrow">Historical records</p><h2 id="snapshot-heading" className="mt-1 text-base font-semibold">Recorded risk snapshots</h2><p className="mt-1 text-xs leading-5 text-slate-500">{data.history_note}</p>
         {trend.length ? <div role="img" aria-label="Stacked bar chart of dated student risk snapshots" className="mt-4 h-72">
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={trend}>
-              <CartesianGrid stroke="rgba(255,255,255,.08)" vertical={false} />
-              <XAxis dataKey="date" tick={{ fill: '#9299a2', fontSize: 10 }} axisLine={false} tickLine={false} />
-              <YAxis tick={{ fill: '#9299a2', fontSize: 10 }} axisLine={false} tickLine={false} />
-              <Tooltip contentStyle={{ background: '#25282d', border: '1px solid #454a52', borderRadius: 8, color: '#f7f8fa', fontSize: 11 }} />
-              <Bar dataKey="HIGH" stackId="risk" fill="#e11d32" radius={[3, 3, 0, 0]} />
-              <Bar dataKey="MEDIUM" stackId="risk" fill="#747b85" />
-              <Bar dataKey="LOW" stackId="risk" fill="#e6e8eb" />
-            </BarChart>
-          </ResponsiveContainer>
+          <TeacherRiskHistoryChart data={trend} />
         </div> : <div className="mt-5"><Empty title="No risk snapshots yet" detail="Risk history appears once model predictions are saved." /></div>}
         <div className="mt-2 flex flex-wrap gap-4 text-[10px] text-slate-400"><span><i aria-hidden="true" className="mr-1.5 inline-block size-1.5 rounded-full bg-rose-500" />High</span><span><i aria-hidden="true" className="mr-1.5 inline-block size-1.5 rounded-full bg-slate-500" />Medium</span><span><i aria-hidden="true" className="mr-1.5 inline-block size-1.5 rounded-full bg-slate-200" />Low</span></div>
       </section>

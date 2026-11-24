@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import StudentRecoveryRoadmapCards from './StudentRecoveryRoadmapCards';
 
 const mocks = vi.hoisted(() => ({ api: vi.fn() }));
-vi.mock('@/lib/api', () => ({ api: mocks.api }));
+vi.mock('@/lib/api', () => ({ api: mocks.api, readCachedApiData: () => null }));
 
 const focus = {
   policy: { threshold_score: 12, threshold_maximum: 25, active_for_classification: true },

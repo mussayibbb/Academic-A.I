@@ -27,7 +27,16 @@ def load_artifact(artifact_path: Path = DEFAULT_ARTIFACT) -> dict[str, Any]:
 def predict_many(features_rows: list[dict[str, float]], artifact_path: Path = DEFAULT_ARTIFACT) -> list[dict[str, Any]]:
     if not features_rows:
         return []
+    forbidden = {
+        'student_id', 'risk_level', 'risk_probability', 'fa1', 'fa2',
+        'previous_gpa', 'current_gpa', 'assessment', 'assessment_change',
+        'momentum_score', 'percentage', 'grade', 'mark', 'score',
+        'midterm', 'final', 'examination', 'cgpa',
+    }
     for features in features_rows:
+        unexpected = sorted(set(features) & forbidden)
+        if unexpected:
+            raise ValueError(f'Marks, identifiers, or excluded academic features are not model inputs: {", ".join(unexpected)}')
         missing = sorted(set(FEATURES) - set(features))
         if missing:
             raise ValueError(f'Missing model features: {", ".join(missing)}')

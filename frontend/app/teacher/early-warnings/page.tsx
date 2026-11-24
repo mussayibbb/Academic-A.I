@@ -23,6 +23,7 @@ type Summary = {
   signals: number;
   highPriority: number;
   watchList: number;
+  lowPriority?: number;
   recoveredThisMonth: number;
   modelRefreshedAt: string;
 };
@@ -31,6 +32,8 @@ type WarningItem = {
   studentId: number;
   name: string;
   department: string | null;
+  dataOrigin?: string;
+  riskStatus?: string;
   riskProbability: number;
   riskClass: RiskClass;
   priority: Priority;
@@ -43,6 +46,8 @@ type WarningList = {
   nextPage: number | null;
   dataStatus?: string;
   message?: string;
+  excludedNonDemoCount?: number;
+  insufficientDataCount?: number;
 };
 
 type Factor = {
@@ -59,6 +64,8 @@ type WarningDetail = {
   studentId: number;
   name: string;
   department: string | null;
+  dataOrigin?: string;
+  riskStatus?: string;
   riskProbability: number;
   riskClass: RiskClass;
   priority: Priority;
@@ -73,14 +80,20 @@ type WarningDetail = {
   actions: { type: string; label: string; at: string; by: number | null }[];
 };
 
-type SimulationResult = { riskProbability: number; delta: number };
+type SimulationResult = { riskProbability: number; riskClass: RiskClass; delta: number };
 
 const priorityColor = (priority: Priority) =>
   priority === 'High' ? 'var(--hi)' : priority === 'Medium' ? 'var(--md)' : 'var(--lo)';
 
+const formatProbability = (probability: number) => `${Number((probability * 100).toFixed(2))}%`;
+const formatPoints = (points: number) => {
+  const rounded = Number(points.toFixed(2));
+  return `${rounded > 0 ? '+' : ''}${rounded}`;
+};
+
 const supportedRecoveryFactors = new Set([
-  'attendance', 'assessment', 'missing_submissions', 'activity_per_week',
-  'attendance_change', 'assessment_change', 'momentum_score', 'current_gpa',
+  'attendance', 'missing_submissions', 'activity_per_week',
+  'attendance_change', 'assignment_submission_rate', 'assignments_completed',
 ]);
 
 function PredictedRisk({ value }: { value: number }) {
@@ -105,7 +118,7 @@ function PredictedRisk({ value }: { value: number }) {
     frame = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frame);
   }, [value]);
-  return <>{Math.round(shown * 100)}%</>;
+  return <>{formatProbability(shown)}</>;
 }
 
 function CountUp({ value }: { value: number }) {
@@ -191,7 +204,11 @@ export default function EarlyWarningsPage() {
       const data = await api<WarningList>(`/api/v1/early-warnings?${params}`);
       if (requestId !== requestRef.current) return;
       setSummary(data.summary);
-      setDataNotice(data.dataStatus === 'unvalidated-demo-model' ? data.message ?? 'Validated risk data is unavailable.' : '');
+      setDataNotice(
+        data.dataStatus === 'unvalidated-demo-model'
+          ? `DEMO / RULE-GENERATED PREVIEW — ${data.message ?? 'Predictions use synthetic CSV training data.'}`
+          : data.message ?? '',
+      );
       setItems((current) => replace ? data.items : [...current, ...data.items]);
       setNextPage(data.nextPage);
       if (data.items.length) setSelectedId((current) => current ?? data.items[0].studentId);
@@ -232,7 +249,7 @@ export default function EarlyWarningsPage() {
         if (!active) return;
         setDetail(data);
         setActions(data.actions);
-        setSimulationResult({ riskProbability: data.riskProbability, delta: 0 });
+        setSimulationResult({ riskProbability: data.riskProbability, riskClass: data.riskClass, delta: 0 });
         setSimulations(Object.fromEntries(data.factors.slice(0, 3)
           .filter((factor) => supportedRecoveryFactors.has(factor.key))
           .map((factor) => [factor.key, 0])));
@@ -243,8 +260,17 @@ export default function EarlyWarningsPage() {
       .finally(() => {
         if (active) setDetailLoading(false);
       });
-    return () => { active = false; };
+    return () => {
+      active = false;
+      if (simTimer.current) clearTimeout(simTimer.current);
+      simAbortRef.current?.abort();
+      simRequestRef.current += 1;
+    };
   }, [selectedId]);
+
+  useEffect(() => {
+    if (simulationResult) console.log('[early-warnings] final simulation state', simulationResult);
+  }, [simulationResult]);
 
   useEffect(() => {
     const element = rowsRef.current;
@@ -270,12 +296,19 @@ export default function EarlyWarningsPage() {
       const recoveries = Object.fromEntries(
         Object.entries(values).map(([feature, value]) => [feature, value / 100]),
       );
+      const payload = { recoveries };
+      console.log('[early-warnings] simulation payload', payload);
       api<{ riskProbability: number; riskClass: RiskClass; delta: number }>(
         `/api/v1/early-warnings/${selectedId}/simulate`,
-        { method: 'POST', body: JSON.stringify({ recoveries }), signal: controller.signal },
+        { method: 'POST', body: JSON.stringify(payload), signal: controller.signal },
       ).then((result) => {
         if (requestId === simRequestRef.current) {
-          setSimulationResult({ riskProbability: result.riskProbability, delta: result.delta });
+          console.log('[early-warnings] simulation response', result);
+          setSimulationResult({
+            riskProbability: result.riskProbability,
+            riskClass: result.riskClass,
+            delta: result.delta,
+          });
           setSimulationError('');
         }
       }).catch((requestError: Error) => {
@@ -285,7 +318,7 @@ export default function EarlyWarningsPage() {
       }).finally(() => {
         if (requestId === simRequestRef.current) setSimulationLoading(false);
       });
-    }, 150);
+    }, 300);
   };
 
   const performAction = async (
@@ -348,7 +381,7 @@ export default function EarlyWarningsPage() {
     setComposerDate(new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16));
   };
 
-  const riskProbability = detail ? Math.round(detail.riskProbability * 100) : 0;
+  const riskProbability = detail ? detail.riskProbability * 100 : 0;
   const riskColor = detail ? priorityColor(detail.priority) : 'var(--lo)';
 
   return (
@@ -385,11 +418,11 @@ export default function EarlyWarningsPage() {
       <section className="ew-stats" aria-label="Summary">
         <div className="ew-stat"><b><CountUp value={summary?.signals ?? 0} /></b><span>Signals detected</span></div>
         <div className="ew-stat high"><b><CountUp value={summary?.highPriority ?? 0} /></b><span>High-priority students</span></div>
-        <div className="ew-stat watch"><b><CountUp value={summary?.watchList ?? 0} /></b><span>On the watch list</span></div>
+        <div className="ew-stat watch"><b><CountUp value={summary?.watchList ?? 0} /></b><span>On the watch list · {summary?.lowPriority ?? 0} low-risk</span></div>
         <div className="ew-stat"><b><CountUp value={summary?.recoveredThisMonth ?? 0} /></b><span>Recovered this month</span></div>
       </section>
 
-      {dataNotice && <div className="ew-card" role="status"><strong>Validated risk estimates unavailable</strong><p className="ew-lead">{dataNotice}</p></div>}
+      {dataNotice && <div className="ew-card" role="status"><strong>DEMO / RULE-GENERATED PREVIEW</strong><p className="ew-lead">{dataNotice}</p></div>}
       {error && <div className="ew-card"><strong>Could not load early warnings</strong><p className="ew-lead">{error}</p><button className="ew-chip" onClick={() => loadList(1, true)}>Retry</button></div>}
 
       <div className="ew-split">
@@ -406,11 +439,11 @@ export default function EarlyWarningsPage() {
                 role="option"
                 aria-selected={item.studentId === selectedId}
                 className={`ew-row ${item.priority.toLowerCase()} ${item.studentId === selectedId ? 'on' : ''}`}
-                style={{ '--row-c': color, '--row-p': Math.round(item.riskProbability * 100), animationDelay: `${index * 70}ms` } as React.CSSProperties}
+                style={{ '--row-c': color, '--row-p': item.riskProbability * 100, animationDelay: `${index * 70}ms` } as React.CSSProperties}
                 onClick={() => setSelectedId(item.studentId)}
               >
-                <span className="ew-pct"><span>{Math.round(item.riskProbability * 100)}%</span></span>
-                <span><strong>{item.name}</strong><small>{item.department ?? 'Department not set'} · {item.topFactor}</small></span>
+                <span className="ew-pct"><span>{formatProbability(item.riskProbability)}</span></span>
+                <span><strong>{item.name}</strong><small>{item.dataOrigin ?? 'Source unavailable'} · {item.department ?? 'Department not set'} · {item.topFactor}</small></span>
                 <span className="ew-tag">{item.priority}</span>
               </button>;
             })}
@@ -430,9 +463,9 @@ export default function EarlyWarningsPage() {
                   <circle cx="65" cy="65" r="54" fill="none" stroke="var(--ew-line)" strokeWidth="10" />
                   <circle cx="65" cy="65" r="54" fill="none" stroke={riskColor} strokeWidth="10" strokeLinecap="round" strokeDasharray={339.292} strokeDashoffset={339.292 * (1 - riskProbability / 100)} style={{ transition: 'stroke-dashoffset 1.2s cubic-bezier(.2,.8,.2,1)' }} />
                 </svg>
-                <div><b>{riskProbability}%</b><span>chance of danger zone</span></div>
+                <div><b>{formatProbability(detail.riskProbability)}</b><span>chance of danger zone</span></div>
               </div>
-              <div><h2>{detail.name}</h2><div className="ew-meta">{detail.department ?? 'Department not set'} · {detail.priority} priority · predicted class: {detail.riskClass}</div>
+              <div><h2>{detail.name}</h2><div className="ew-meta">{detail.dataOrigin ?? 'Source unavailable'} · {detail.department ?? 'Department not set'} · {detail.priority} priority · predicted class: {detail.riskClass}</div>
                 <div className="ew-chipline"><span>Model confidence <b>{Math.round(detail.confidence * 100)}%</b></span><span>This week <b>{detail.weekChange >= 0 ? '▲' : '▼'} {Math.abs(detail.weekChange)} pts</b></span><span>{detail.signalsUsed} signals used</span></div>
                 <div className="ew-zone"><i /></div><div className="ew-zl"><span>Normal</span><span>Watch</span><span>Danger</span></div>
               </div>
@@ -452,7 +485,7 @@ export default function EarlyWarningsPage() {
             <div className="ew-card">
               <h3>Precautions to bring them back to normal</h3><p className="ew-lead">Start with the factors that add the most risk.</p>
               <div className="ew-prec">{detail.precautions.map((precaution, index) => <div key={precaution.factorKey} style={{ animationDelay: `${index * 120}ms` }}><span aria-hidden="true">✓</span><span>{precaution.text}</span></div>)}</div>
-              <div className="ew-proj"><div>In 14 days with no action<b style={{ color: 'var(--hi)' }}>{Math.round(detail.forecast.noAction * 100)}%</b></div><div>In 14 days if this plan is followed<b style={{ color: 'var(--lo)' }}>{Math.round(detail.forecast.withPlan * 100)}%</b></div></div>
+              <div className="ew-proj"><div>In 14 days with no action<b style={{ color: 'var(--hi)' }}>{formatProbability(detail.forecast.noAction)}</b></div><div>In 14 days if this plan is followed<b style={{ color: 'var(--lo)' }}>{formatProbability(detail.forecast.withPlan)}</b></div></div>
             </div>
 
             <div className="ew-card">
@@ -462,7 +495,9 @@ export default function EarlyWarningsPage() {
                 return <div className="ew-sl" key={factor.key}>
                   <label htmlFor={`recovery-${factor.key}`}>{factor.label} recovers</label>
                   <input id={`recovery-${factor.key}`} type="range" min="0" max="100" value={value} onChange={(event) => {
-                    const next = { ...simulations, [factor.key]: Number(event.target.value) };
+                    const sliderValue = Number(event.target.value);
+                    console.log('[early-warnings] slider value', { feature: factor.key, value: sliderValue });
+                    const next = { ...simulations, [factor.key]: sliderValue };
                     setSimulations(next);
                     runSimulation(next);
                   }} />
@@ -470,13 +505,13 @@ export default function EarlyWarningsPage() {
                 </div>;
               })}
               {simulationResult !== null && detail && (() => {
-                const score = Math.round(simulationResult.riskProbability * 100);
-                const color = score >= 75 ? 'var(--hi)' : score >= 40 ? 'var(--md)' : 'var(--lo)';
-                const tag = score >= 75 ? 'Danger' : score >= 40 ? 'Watch' : 'Normal';
-                return <div className="ew-sres" aria-live="polite" style={{ opacity: simulationLoading ? 0.55 : 1 }}>
+                const probability = simulationResult.riskProbability;
+                const color = probability >= 0.75 ? 'var(--hi)' : probability >= 0.4 ? 'var(--md)' : 'var(--lo)';
+                const tag = simulationResult.riskClass === 'At risk' ? 'Danger' : simulationResult.riskClass;
+                return <div className="ew-sres" aria-live="polite" aria-busy={simulationLoading} style={{ opacity: simulationLoading ? 0.55 : 1 }}>
                   <span className="ew-simline">Predicted risk</span>
-                  <div className="ew-sres-row"><b style={{ color }}><PredictedRisk value={simulationResult.riskProbability} /></b><div className="ew-bar"><i style={{ width: `${score}%`, backgroundColor: color }} /></div><span className="ew-tag" style={{ '--row-c': color } as React.CSSProperties}>{tag}</span></div>
-                  <div className="ew-simline">Currently {Math.round(detail.riskProbability * 100)}%. This scenario changes it by {simulationResult.delta > 0 ? '+' : ''}{Math.round(simulationResult.delta)} pts.</div>
+                  <div className="ew-sres-row"><b style={{ color }}><PredictedRisk value={probability} /></b><div className="ew-bar"><i style={{ width: `${probability * 100}%`, backgroundColor: color }} /></div><span className="ew-tag" style={{ '--row-c': color } as React.CSSProperties}>{tag}</span></div>
+                  <div className="ew-simline">Currently {formatProbability(detail.riskProbability)}. This scenario changes it by {formatPoints(simulationResult.delta)} pts.</div>
                 </div>;
               })()}
               {simulationLoading && <p className="ew-simline" role="status">Updating prediction…</p>}

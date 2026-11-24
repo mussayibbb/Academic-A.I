@@ -21,8 +21,8 @@ def client(tmp_path, monkeypatch):
         other_user = User(email='other@example.com', full_name='Student Two', role='STUDENT', password_hash=hash_password('other-pass'))
         db.add_all([teacher, student_user, other_user])
         db.flush()
-        student = Student(student_id='T-001', full_name='Student One', section='A', risk_level='HIGH', risk_probability=0.8)
-        other = Student(student_id='T-002', full_name='Student Two', section='B', risk_level='LOW', risk_probability=0.1)
+        student = Student(student_id='T-001', full_name='Student One', section='A', risk_level='HIGH', risk_probability=0.8, attendance=80, assignments_completed=4, data_origin='DEMO DATA')
+        other = Student(student_id='T-002', full_name='Student Two', section='B', risk_level='LOW', risk_probability=0.1, attendance=82, assignments_completed=3, data_origin='DEMO DATA')
         db.add_all([student, other])
         db.flush()
         student.user_id = student_user.id

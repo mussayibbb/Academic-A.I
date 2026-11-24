@@ -3,7 +3,7 @@
 import { FileSpreadsheet, UploadCloud } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { ErrorNotice, PageHeading } from '@/components/ui';
-import { API_BASE, api, readToken } from '@/lib/api';
+import { API_BASE, api, clearApiCache, readToken } from '@/lib/api';
 
 type DatasetType = 'marks' | 'assessments' | 'attendance' | 'learning_activities' | 'subject_records' | 'risk_outcomes' | 'production_feature_snapshots';
 type ImportResult = {
@@ -71,12 +71,13 @@ export default function AcademicDataPage() {
     form.set('dataset_type', datasetType);
     form.set('file', file);
     try {
+      clearApiCache();
       const response = await fetch(`${API_BASE}/api/v1/academic-data/import`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${readToken() ?? ''}` },
         body: form,
         cache: 'no-store',
-      });
+      }).finally(clearApiCache);
       const body = await response.json() as ImportResult | { detail?: string | { message?: string; validation_errors?: ImportResult['validation_errors'] } };
       if (!response.ok) {
         const detail = (body as { detail?: string | { message?: string } }).detail;

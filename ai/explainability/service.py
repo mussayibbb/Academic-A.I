@@ -1,4 +1,6 @@
+from functools import lru_cache
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import numpy as np
@@ -7,6 +9,32 @@ import shap
 
 from ai.risk.features import FEATURES
 from ai.risk.predict import DEFAULT_ARTIFACT, load_artifact
+
+_GLOBAL_IMPORTANCE_LOCK = Lock()
+
+
+def _validated_pipeline(artifact: dict[str, Any]) -> tuple[Any, Any]:
+    pipeline = artifact.get('pipeline')
+    metadata = artifact.get('metadata')
+    if pipeline is None or not isinstance(metadata, dict):
+        raise ValueError('The risk artifact is missing its pipeline or metadata.')
+
+    expected_features = list(FEATURES)
+    declared_features = metadata.get('features')
+    bundle_features = artifact.get('feature_contract')
+    fitted_features = getattr(pipeline.named_steps.get('imputer'), 'feature_names_in_', None)
+    if not isinstance(declared_features, list) or declared_features != expected_features:
+        raise ValueError('The risk artifact feature contract is incompatible with the explainability feature contract.')
+    if bundle_features is not None and list(bundle_features) != expected_features:
+        raise ValueError('The risk artifact feature contract is incompatible with the explainability feature contract.')
+    if fitted_features is not None and list(fitted_features) != expected_features:
+        raise ValueError('The fitted risk pipeline feature contract is incompatible with explainability.')
+    if getattr(pipeline, 'n_features_in_', len(expected_features)) != len(expected_features):
+        raise ValueError('The fitted risk pipeline input width is incompatible with explainability.')
+    classifier = pipeline.named_steps.get('classifier')
+    if classifier is None or not callable(getattr(classifier, 'predict_proba', None)):
+        raise ValueError('The risk artifact classifier does not support probability explanations.')
+    return pipeline, classifier
 
 
 def _explain_class_probability(classifier: Any, background: np.ndarray, rows: np.ndarray, class_index: int) -> shap.Explanation:
@@ -19,8 +47,7 @@ def _explain_class_probability(classifier: Any, background: np.ndarray, rows: np
 
 def _explain(frame: pd.DataFrame, artifact_path: Path = DEFAULT_ARTIFACT, target_class: str | None = None) -> tuple[dict[str, Any], np.ndarray]:
     artifact = load_artifact(artifact_path)
-    pipeline = artifact['pipeline']
-    classifier = pipeline.named_steps['classifier']
+    pipeline, classifier = _validated_pipeline(artifact)
     transformed = pipeline.named_steps['imputer'].transform(frame[FEATURES])
     classes = [str(label).upper() for label in artifact['label_encoder'].inverse_transform(np.asarray(classifier.classes_, dtype=int))]
     probabilities = classifier.predict_proba(transformed)[0]
@@ -61,13 +88,19 @@ def explain_student(features: dict[str, float], artifact_path: Path = DEFAULT_AR
     return explanation
 
 
-def global_importance(rows: list[dict[str, float]], artifact_path: Path = DEFAULT_ARTIFACT) -> dict[str, Any]:
-    if not rows:
-        raise ValueError('At least one feature row is required')
-    frame = pd.DataFrame([{name: float(row[name]) for name in FEATURES} for row in rows], columns=FEATURES)
-    artifact = load_artifact(artifact_path)
-    pipeline = artifact['pipeline']
-    classifier = pipeline.named_steps['classifier']
+@lru_cache(maxsize=8)
+def _cached_global_importance(
+    row_values: tuple[tuple[float, ...], ...],
+    artifact_path: str,
+    modified_ns: int,
+    artifact_size: int,
+) -> dict[str, Any]:
+    frame = pd.DataFrame(
+        [dict(zip(FEATURES, values)) for values in row_values],
+        columns=FEATURES,
+    )
+    artifact = load_artifact(Path(artifact_path))
+    pipeline, classifier = _validated_pipeline(artifact)
     transformed = pipeline.named_steps['imputer'].transform(frame[FEATURES])
     predicted_classes = np.argmax(classifier.predict_proba(transformed), axis=1)
     values = np.zeros((len(frame), len(FEATURES)))
@@ -79,4 +112,25 @@ def global_importance(rows: list[dict[str, float]], artifact_path: Path = DEFAUL
     return {
         'target': 'probability of each row predicted class',
         'features': [{'name': name, 'importance': float(score)} for name, score in sorted(zip(FEATURES, scores), key=lambda item: item[1], reverse=True)],
+        'model_version': artifact['metadata']['model_version'],
+    }
+
+
+def global_importance(rows: list[dict[str, float]], artifact_path: Path = DEFAULT_ARTIFACT) -> dict[str, Any]:
+    if not rows:
+        raise ValueError('At least one feature row is required')
+    row_values = tuple(tuple(float(row[name]) for name in FEATURES) for row in rows)
+    resolved_path = artifact_path.resolve()
+    stat = resolved_path.stat()
+    with _GLOBAL_IMPORTANCE_LOCK:
+        result = _cached_global_importance(
+            row_values,
+            str(resolved_path),
+            stat.st_mtime_ns,
+            stat.st_size,
+        )
+    return {
+        'target': result['target'],
+        'features': [feature.copy() for feature in result['features']],
+        'model_version': result['model_version'],
     }
