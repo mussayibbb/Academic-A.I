@@ -93,10 +93,11 @@ def test_academic_import_migration_applies_to_sqlite_without_touching_project_db
         assert 'import_batch_id' in {column['name'] for column in inspector.get_columns(table_name)}
 
 
+
 def test_twenty_five_mark_policy_migration_preserves_policy_and_mark_history(monkeypatch, tmp_path):
     from datetime import datetime
 
-    from backend.app.models import Assessment, Course, Mark, Student, Subject, SubjectFocusPolicy
+    from backend.app.models import Assessment, Course, Mark, Subject, SubjectFocusPolicy
 
     database_path = tmp_path / 'subject-policy.db'
     database_url = f'sqlite:///{database_path.as_posix()}'
@@ -108,7 +109,29 @@ def test_twenty_five_mark_policy_migration_preserves_policy_and_mark_history(mon
     with Session(engine) as db:
         subject = db.query(Subject).filter_by(code='EVS').one()
         course = Course(name='Policy Test', code='POLICY-TEST', subject=subject)
-        student = Student(student_id='policy-001', full_name='Policy Student', risk_level='HIGH')
+
+        student_id = db.execute(text(
+            'INSERT INTO students '
+            '(student_id, full_name, risk_level, risk_probability, previous_gpa, current_gpa, '
+            'attendance, assessment, assignments_completed, momentum, created_at, updated_at) '
+            'VALUES (:student_id, :full_name, :risk_level, :risk_probability, :previous_gpa, '
+            ':current_gpa, :attendance, :assessment, :assignments_completed, :momentum, '
+            ':created_at, :updated_at)'
+        ), {
+            'student_id': 'policy-001',
+            'full_name': 'Policy Student',
+            'risk_level': 'HIGH',
+            'risk_probability': 0.8,
+            'previous_gpa': 2.0,
+            'current_gpa': 1.8,
+            'attendance': 70.0,
+            'assessment': 45.0,
+            'assignments_completed': 50.0,
+            'momentum': -0.2,
+            'created_at': datetime(2026, 10, 1),
+            'updated_at': datetime(2026, 10, 1),
+        }).lastrowid
+
         assessment = Assessment(
             course=course,
             title='Historical FA',
@@ -116,15 +139,15 @@ def test_twenty_five_mark_policy_migration_preserves_policy_and_mark_history(mon
             maximum_marks_verified=True,
         )
         mark = Mark(
-            student=student,
+            student_id=student_id,
             assessment=assessment,
             score=11,
             official_result='FAIL',
             recorded_at=datetime(2026, 10, 1),
         )
+
         db.add_all([
             course,
-            student,
             assessment,
             mark,
             SubjectFocusPolicy(
@@ -142,6 +165,7 @@ def test_twenty_five_mark_policy_migration_preserves_policy_and_mark_history(mon
     with Session(engine) as db:
         policies = db.query(SubjectFocusPolicy).order_by(SubjectFocusPolicy.version).all()
         historical_mark = db.get(Mark, mark_id)
+
         assert [(policy.version, policy.threshold_score, policy.threshold_maximum) for policy in policies] == [
             (1, 12, 20),
             (2, 10, 25),
@@ -158,7 +182,7 @@ def test_twenty_five_mark_policy_migration_preserves_policy_and_mark_history(mon
 def test_subject_scoped_recovery_migration_preserves_legacy_records(monkeypatch, tmp_path):
     from datetime import datetime
 
-    from backend.app.models import Assessment, Course, Mark, Student
+    from backend.app.models import Assessment, Course, Mark
 
     database_path = tmp_path / 'legacy-recovery.db'
     database_url = f'sqlite:///{database_path.as_posix()}'
@@ -305,7 +329,7 @@ def test_subject_scoped_recovery_migration_preserves_legacy_records(monkeypatch,
 
     with Session(engine) as db:
         assessment_course = db.get(Course, course_id)
-        assessed_student = db.get(Student, student_id)
+        
         historical_assessment = Assessment(
             course_id=assessment_course.id,
             title='Historical FA',
@@ -315,7 +339,7 @@ def test_subject_scoped_recovery_migration_preserves_legacy_records(monkeypatch,
         db.add(historical_assessment)
         db.flush()
         historical_mark = Mark(
-            student_id=assessed_student.id,
+            student_id=student_id,
             assessment_id=historical_assessment.id,
             score=11,
             official_result='FAIL',

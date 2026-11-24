@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from sklearn.preprocessing import LabelEncoder
 
-from ai.risk.features import FEATURES
+from ai.risk.features import FEATURE_CONTRACT_VERSION, FEATURES
 from ai.risk.predict import DEFAULT_ARTIFACT, load_artifact
 from backend.app.models import AuditLog, ModelDeploymentEvent, ModelDeploymentState, ModelRegistryEntry, RiskPrediction, User
 from backend.app.services.auth import create_access_token, hash_password
@@ -43,7 +43,7 @@ def create_candidate(client, monkeypatch, artifact_directory: Path, *, features=
         'dataset_id': 'fixture-dataset',
         'dataset_fingerprint': 'c' * 64,
         'feature_contract': selected_features,
-        'feature_contract_version': 'risk-features-v1',
+        'feature_contract_version': FEATURE_CONTRACT_VERSION,
         'target_definition': 'Fixture-only independent target',
         'aggregation_strategy': 'fixture-compatible-input',
         'algorithm': 'logistic_regression',
@@ -68,7 +68,7 @@ def create_candidate(client, monkeypatch, artifact_directory: Path, *, features=
             model_version=version,
             model_type='classification',
             feature_schema=selected_features,
-            feature_contract_version='risk-features-v1',
+            feature_contract_version=FEATURE_CONTRACT_VERSION,
             training_dataset_version='fixture-v1',
             training_dataset_hash='c' * 64,
             algorithm='logistic_regression',
@@ -241,9 +241,12 @@ def test_local_deploy_switches_inference_and_rollback_restores_verified_fallback
     assert deployed.json()['active_model_version'] == candidate_version
 
     prediction = client.post('/api/v1/risk/predict', json={
-        'attendance': 80, 'assessment': 70, 'previous_gpa': 3, 'current_gpa': 3,
-        'assignments_completed': 4, 'activity_per_week': 3, 'missing_submissions': 0,
-        'attendance_change': 0, 'assessment_change': 0, 'momentum_score': 0,
+        'attendance': 80,
+        'assignments_completed': 4,
+        'activity_per_week': 3,
+        'missing_submissions': 0,
+        'attendance_change': 0,
+        'assignment_submission_rate': 0.85,
     }, headers=headers)
     assert prediction.status_code == 200, prediction.text
     assert prediction.json()['model_version'] == candidate_version
@@ -263,9 +266,12 @@ def test_local_deploy_switches_inference_and_rollback_restores_verified_fallback
     candidate_path = tmp_path / 'candidate-artifacts' / 'local-fixture-v1.joblib'
     candidate_path.write_bytes(b'changed after approval')
     unsafe_prediction = client.post('/api/v1/risk/predict', json={
-        'attendance': 80, 'assessment': 70, 'previous_gpa': 3, 'current_gpa': 3,
-        'assignments_completed': 4, 'activity_per_week': 3, 'missing_submissions': 0,
-        'attendance_change': 0, 'assessment_change': 0, 'momentum_score': 0,
+        'attendance': 80,
+        'assignments_completed': 4,
+        'activity_per_week': 3,
+        'missing_submissions': 0,
+        'attendance_change': 0,
+        'assignment_submission_rate': 0.85,
     }, headers=headers)
     assert unsafe_prediction.status_code == 503
     assert 'SHA-256' in unsafe_prediction.json()['detail']
@@ -279,9 +285,12 @@ def test_local_deploy_switches_inference_and_rollback_restores_verified_fallback
     assert rolled_back.json()['rollback_of_event_id'] == promote_event['id']
 
     fallback_prediction = client.post('/api/v1/risk/predict', json={
-        'attendance': 80, 'assessment': 70, 'previous_gpa': 3, 'current_gpa': 3,
-        'assignments_completed': 4, 'activity_per_week': 3, 'missing_submissions': 0,
-        'attendance_change': 0, 'assessment_change': 0, 'momentum_score': 0,
+        'attendance': 80,
+        'assignments_completed': 4,
+        'activity_per_week': 3,
+        'missing_submissions': 0,
+        'attendance_change': 0,
+        'assignment_submission_rate': 0.85,
     }, headers=headers)
     assert fallback_prediction.status_code == 200
     assert fallback_prediction.json()['model_version'] == production_version

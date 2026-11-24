@@ -154,8 +154,15 @@ def verify_candidate_artifact(
         raise DeploymentArtifactError('Candidate dataset and target provenance metadata is incomplete.')
     if entry.training_dataset_hash != entry.dataset_fingerprint:
         raise DeploymentArtifactError('Registry training dataset hash does not match the candidate dataset fingerprint.')
-    if entry.algorithm != 'logistic_regression' or metadata.get('algorithm') != entry.algorithm:
-        raise DeploymentArtifactError('Candidate algorithm metadata is incompatible with the supported local inference adapter.')
+    supported_algorithms = {'random_forest', 'logistic_regression'}
+
+    if (
+    entry.algorithm not in supported_algorithms
+    or metadata.get('algorithm') != entry.algorithm
+    ):
+     raise DeploymentArtifactError(
+        'Candidate algorithm metadata is incompatible with the supported local inference adapter.'
+    )
     return path, artifact
 
 

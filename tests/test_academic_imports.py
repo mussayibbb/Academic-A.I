@@ -7,6 +7,8 @@ from ai.risk.predict import DEFAULT_ARTIFACT, load_artifact, predict as predict_
 from ai.risk.preprocess import build_rows
 from backend.app.database import get_db
 from backend.app.main import app, student_features
+from backend.app.models import InternalAssessmentMark
+from backend.app.services.student_cohort_imports import import_student_cohort
 from backend.app.models import (
     Assignment,
     AssignmentStudent,
@@ -73,7 +75,7 @@ def test_valid_csv_import_is_tracked_and_updates_canonical_features(client, teac
         assert db.query(Assessment).one().import_batch_id == result['batch_id']
         observation = db.query(AcademicMomentum).filter(AcademicMomentum.import_batch_id == result['batch_id']).one()
         assert observation.value == 90
-        assert student_features(student, db)['assessment'] == 90
+        assert 'assessment' not in student_features(student, db)
         assert student.assessment == 0
 
 
@@ -310,7 +312,7 @@ def test_imported_records_match_training_features_and_reach_risk_analytics(clien
     assert directory.status_code == 200
     directory_student = directory.json()['items'][0]
     assert directory_student['attendance'] == imported_features['attendance']
-    assert directory_student['assessment'] == imported_features['assessment']
+    assert directory_student['assessment'] == 50
     assert directory_student['risk_level'] == prediction['risk_level']
     monitoring = client.get('/api/v1/risk/monitoring', headers=headers)
     dashboard = client.get('/api/v1/dashboard/teacher', headers=headers)
@@ -644,3 +646,82 @@ def test_import_commit_failure_rolls_back_all_database_updates(client, teacher_t
         assert db.query(AcademicDataImportRow).count() == 0
         assert db.query(Attendance).count() == 0
         assert db.query(AcademicMomentum).count() == 0
+
+def test_student_cohort_import_preserves_null_marks_and_tracks_batch(client):
+    factory = app.state.test_session_factory
+
+    headers = [
+        "student_id", "usn", "name", "department", "course",
+        "branch", "semester", "previous_cgpa", "current_cgpa",
+    ]
+
+    subjects = [
+        "ai", "evs", "network", "research_methodology",
+        "software_engineering", "toc",
+    ]
+
+    for stage in (1, 2):
+        headers.extend(
+            f"internal_{stage}_{subject}_marks_out_of_25"
+            for subject in subjects
+        )
+
+    values = [
+        "COHORT001", "TEST26CS001", "Test Student",
+        "Computer Science and Engineering", "B.Tech",
+        "CSE", "5th Semester", "7.2", "7.5",
+    ]
+
+    values.extend(["18", "", "17", "19", "20", "21"])
+    values.extend(["", "", "", "", "", ""])
+
+    content = (
+        ",".join(headers) + "\n"
+        + ",".join(values) + "\n"
+    ).encode("utf-8")
+
+    with factory() as db:
+        teacher = db.query(User).filter_by(
+            email="teacher@example.com"
+        ).one()
+
+        db.add_all([
+            Subject(code="CN", name="Computer Networks"),
+            Subject(code="EVS", name="Environmental Studies"),
+            Subject(code="RM", name="Research Methodology"),
+            Subject(code="SE", name="Software Engineering"),
+            Subject(code="TOC", name="Theory of Computation"),
+        ])
+        db.commit()
+
+        result = import_student_cohort(
+            db,
+            user_id=teacher.id,
+            filename="cohort.csv",
+            content=content,
+        )
+        db.commit()
+
+        assert result["imported_rows"] == 1
+        assert result["internal_mark_records"] == 12
+        assert result["created_subjects"] == ["AI"]
+
+        student = db.query(Student).filter_by(
+            student_id="COHORT001"
+        ).one()
+
+        marks = db.query(InternalAssessmentMark).filter_by(
+            student_id=student.id
+        ).all()
+
+        assert len(marks) == 12
+        assert sum(mark.marks is None for mark in marks) == 7
+
+        assert student.previous_cgpa == 7.2
+        assert student.current_cgpa == 7.5
+        assert student.course_id is None
+        assert student.data_origin == "SYNTHETIC DEMO"
+
+        assert db.query(AcademicDataImportBatch).filter_by(
+            id=result["batch_id"]
+        ).one().imported_rows == 1

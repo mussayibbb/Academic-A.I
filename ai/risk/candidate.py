@@ -1,3 +1,4 @@
+
 import hashlib
 import json
 from datetime import datetime, timezone
@@ -9,9 +10,10 @@ import joblib
 import numpy as np
 import pandas as pd
 import shap
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
 from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -29,8 +31,15 @@ from ai.risk.phase3 import OUTCOME_CLASSES, temporal_split
 
 
 FORBIDDEN_FEATURES = {
-    'student_id', 'student_identifier', 'risk_target', 'risk_level', 'risk_probability',
-    'risk_observed_at', 'outcome_source', 'academic_period', 'subject_code',
+    'student_id',
+    'student_identifier',
+    'risk_target',
+    'risk_level',
+    'risk_probability',
+    'risk_observed_at',
+    'outcome_source',
+    'academic_period',
+    'subject_code',
 }
 
 
@@ -41,11 +50,21 @@ def _package_version(package: str) -> str | None:
         return None
 
 
-def _metrics(expected: np.ndarray, predicted: np.ndarray, probabilities: np.ndarray, labels: list[str]) -> dict[str, Any]:
+def _metrics(
+    expected: np.ndarray,
+    predicted: np.ndarray,
+    probabilities: np.ndarray,
+    labels: list[str],
+) -> dict[str, Any]:
     support = np.bincount(expected, minlength=len(labels))
+
     precision, recall, f1, _ = precision_recall_fscore_support(
-        expected, predicted, labels=np.arange(len(labels)), zero_division=0,
+        expected,
+        predicted,
+        labels=np.arange(len(labels)),
+        zero_division=0,
     )
+
     per_class = {
         label: {
             'precision': float(precision[index]) if support[index] else None,
@@ -55,38 +74,97 @@ def _metrics(expected: np.ndarray, predicted: np.ndarray, probabilities: np.ndar
         }
         for index, label in enumerate(labels)
     }
+
     one_hot = np.eye(len(labels), dtype=float)[expected]
+
     try:
-        roc_auc = float(roc_auc_score(expected, probabilities, labels=np.arange(len(labels)), multi_class='ovr', average='macro')) if len(np.unique(expected)) == len(labels) else None
+        roc_auc = (
+            float(
+                roc_auc_score(
+                    expected,
+                    probabilities,
+                    labels=np.arange(len(labels)),
+                    multi_class='ovr',
+                    average='macro',
+                )
+            )
+            if len(np.unique(expected)) == len(labels)
+            else None
+        )
     except ValueError:
         roc_auc = None
+
     try:
-        pr_auc = float(average_precision_score(one_hot, probabilities, average='macro')) if len(np.unique(expected)) == len(labels) else None
+        pr_auc = (
+            float(average_precision_score(one_hot, probabilities, average='macro'))
+            if len(np.unique(expected)) == len(labels)
+            else None
+        )
     except ValueError:
         pr_auc = None
+
     predicted_confidence = np.max(probabilities, axis=1)
     predicted_class = np.argmax(probabilities, axis=1)
+
     ece = 0.0
+
     for lower in np.linspace(0, 0.9, 10):
         upper = lower + 0.1
-        mask = (predicted_confidence >= lower) & (predicted_confidence < upper if upper < 1 else predicted_confidence <= 1)
+
+        mask = (
+            (predicted_confidence >= lower)
+            & (
+                predicted_confidence < upper
+                if upper < 1
+                else predicted_confidence <= 1
+            )
+        )
+
         if mask.any():
             accuracy = np.mean(expected[mask] == predicted_class[mask])
             confidence = np.mean(predicted_confidence[mask])
             ece += float(mask.mean() * abs(accuracy - confidence))
+
     return {
         'sample_count': int(len(expected)),
-        'class_distribution': {label: int(support[index]) for index, label in enumerate(labels)},
+        'class_distribution': {
+            label: int(support[index])
+            for index, label in enumerate(labels)
+        },
         'accuracy': float(accuracy_score(expected, predicted)),
-        'macro_f1': float(f1_score(expected, predicted, labels=np.unique(expected), average='macro', zero_division=0)),
-        'weighted_f1': float(f1_score(expected, predicted, labels=np.arange(len(labels)), average='weighted', zero_division=0)),
-        'balanced_accuracy': float(balanced_accuracy_score(expected, predicted)),
+        'macro_f1': float(
+            f1_score(
+                expected,
+                predicted,
+                labels=np.unique(expected),
+                average='macro',
+                zero_division=0,
+            )
+        ),
+        'weighted_f1': float(
+            f1_score(
+                expected,
+                predicted,
+                labels=np.arange(len(labels)),
+                average='weighted',
+                zero_division=0,
+            )
+        ),
+        'balanced_accuracy': float(
+            balanced_accuracy_score(expected, predicted)
+        ),
         'per_class': per_class,
-        'confusion_matrix': confusion_matrix(expected, predicted, labels=np.arange(len(labels))).tolist(),
+        'confusion_matrix': confusion_matrix(
+            expected,
+            predicted,
+            labels=np.arange(len(labels)),
+        ).tolist(),
         'labels': labels,
         'roc_auc_ovr_macro': roc_auc,
         'pr_auc_ovr_macro': pr_auc,
-        'multiclass_brier_score': float(np.mean(np.sum((probabilities - one_hot) ** 2, axis=1))),
+        'multiclass_brier_score': float(
+            np.mean(np.sum((probabilities - one_hot) ** 2, axis=1))
+        ),
         'expected_calibration_error_10_bins': ece,
     }
 
@@ -102,30 +180,61 @@ def _subgroup_evaluation(
 ) -> dict[str, Any]:
     evaluated: dict[str, dict[str, Any]] = {}
     withheld: dict[str, dict[str, int]] = {}
-    candidate_groups = ('academic_period', 'subject_or_aggregation', 'department', 'section')
+
+    candidate_groups = (
+        'academic_period',
+        'subject_or_aggregation',
+        'department',
+        'section',
+    )
+
     for column in candidate_groups:
         if column not in frame:
             continue
+
         evaluated[column] = {}
         withheld[column] = {}
+
         if frame[column].isna().all():
             withheld[column]['UNSPECIFIED'] = int(len(frame))
             continue
+
         values = frame[column].fillna('UNSPECIFIED').astype(str)
+
         for value in sorted(values.unique()):
             mask = values.to_numpy() == value
             sample_count = int(mask.sum())
+
             if value == 'UNSPECIFIED' or sample_count < min_samples:
                 withheld[column][value] = sample_count
                 continue
-            metrics = _metrics(expected[mask], predicted[mask], probabilities[mask], labels)
+
+            metrics = _metrics(
+                expected[mask],
+                predicted[mask],
+                probabilities[mask],
+                labels,
+            )
+
             evaluated[column][value] = metrics
+
     return {
         'minimum_sample_count': min_samples,
         'split': 'test',
-        'evaluated': {name: values for name, values in evaluated.items() if values},
-        'withheld_for_insufficient_sample': {name: values for name, values in withheld.items() if values},
-        'interpretation': 'Descriptive held-out subgroup performance only; no fairness or causal claim is made.',
+        'evaluated': {
+            name: values
+            for name, values in evaluated.items()
+            if values
+        },
+        'withheld_for_insufficient_sample': {
+            name: values
+            for name, values in withheld.items()
+            if values
+        },
+        'interpretation': (
+            'Descriptive held-out subgroup performance only; '
+            'no fairness or causal claim is made.'
+        ),
     }
 
 
@@ -143,78 +252,242 @@ def train_candidate(
     target_definition: str,
     aggregation_strategy: str,
     random_seed: int = 42,
-    algorithm: str = 'logistic_regression',
+    algorithm: str = 'random_forest',
     feature_contract_version: str = 'phase3-candidate-explicit-v1',
 ) -> dict[str, Any]:
+
     if not feature_contract or len(feature_contract) != len(set(feature_contract)):
         raise ValueError('An explicit, non-empty feature contract is required.')
-    if feature_contract_version not in {'phase3-candidate-explicit-v1', FEATURE_CONTRACT_VERSION}:
+
+    if feature_contract_version not in {
+        'phase3-candidate-explicit-v1',
+        FEATURE_CONTRACT_VERSION,
+    }:
         raise ValueError('Unsupported candidate feature-contract version.')
-    if feature_contract_version == FEATURE_CONTRACT_VERSION and feature_contract != FEATURES:
-        raise ValueError('The production feature-contract version requires the exact ordered live feature contract.')
-    if any(name.casefold() in FORBIDDEN_FEATURES for name in feature_contract):
-        raise ValueError('The feature contract contains identity, target, or grouping leakage fields.')
+
+    if (
+        feature_contract_version == FEATURE_CONTRACT_VERSION
+        and feature_contract != FEATURES
+    ):
+        raise ValueError(
+            'The production feature-contract version requires '
+            'the exact ordered live feature contract.'
+        )
+
+    if any(
+        name.casefold() in FORBIDDEN_FEATURES
+        for name in feature_contract
+    ):
+        raise ValueError(
+            'The feature contract contains identity, target, '
+            'or grouping leakage fields.'
+        )
+
     if not target_definition.strip() or not aggregation_strategy.strip():
-        raise ValueError('An explicit target definition and aggregation strategy are required.')
-    if algorithm != 'logistic_regression':
-        raise ValueError('Unsupported candidate algorithm; currently only logistic_regression is implemented.')
-    if len(dataset_fingerprint) != 64 or any(character not in '0123456789abcdef' for character in dataset_fingerprint.casefold()):
-        raise ValueError('dataset_fingerprint must be a SHA-256 hexadecimal string.')
-    required = {*feature_contract, target_column, period_column, identity_column}
+        raise ValueError(
+            'An explicit target definition and aggregation strategy are required.'
+        )
+
+    supported_algorithms = {
+        'random_forest',
+        'logistic_regression',
+    }
+
+    if algorithm not in supported_algorithms:
+        raise ValueError('Unsupported candidate algorithm.')
+
+    if (
+        len(dataset_fingerprint) != 64
+        or any(
+            character not in '0123456789abcdef'
+            for character in dataset_fingerprint.casefold()
+        )
+    ):
+        raise ValueError(
+            'dataset_fingerprint must be a SHA-256 hexadecimal string.'
+        )
+
+    required = {
+        *feature_contract,
+        target_column,
+        period_column,
+        identity_column,
+    }
+
     missing = sorted(required - set(frame.columns))
+
     if missing:
-        raise ValueError(f'Candidate dataset is missing required columns: {", ".join(missing)}')
+        raise ValueError(
+            f'Candidate dataset is missing required columns: {", ".join(missing)}'
+        )
+
     if frame.empty:
         raise ValueError('Candidate dataset contains no eligible observations.')
+
     if frame[[identity_column, period_column]].duplicated().any():
-        raise ValueError('Duplicate student-period rows are not allowed; explicitly aggregate subject observations first.')
+        raise ValueError(
+            'Duplicate student-period rows are not allowed; '
+            'explicitly aggregate subject observations first.'
+        )
+
     if frame[target_column].isna().any():
         raise ValueError('Candidate dataset contains missing targets.')
-    periods = sorted(frame[period_column].astype(str).unique().tolist())
+
+    periods = sorted(
+        frame[period_column].astype(str).unique().tolist()
+    )
+
     split = temporal_split(periods)
+
     masks = {
-        'training': frame[period_column].astype(str).isin(split['training_periods']),
-        'validation': frame[period_column].astype(str).isin(split['validation_periods']),
-        'test': frame[period_column].astype(str).isin(split['test_periods']),
+        'training': frame[period_column].astype(str).isin(
+            split['training_periods']
+        ),
+        'validation': frame[period_column].astype(str).isin(
+            split['validation_periods']
+        ),
+        'test': frame[period_column].astype(str).isin(
+            split['test_periods']
+        ),
     }
+
     if any(not mask.any() for mask in masks.values()):
-        raise ValueError('Temporal train, validation, and test splits must each contain observations.')
-    features = frame[feature_contract].apply(pd.to_numeric, errors='coerce')
+        raise ValueError(
+            'Temporal train, validation, and test splits '
+            'must each contain observations.'
+        )
+
+    features = frame[feature_contract].apply(
+        pd.to_numeric,
+        errors='coerce',
+    )
+
     if features.isna().all(axis=0).any():
-        empty_columns = features.columns[features.isna().all(axis=0)].tolist()
-        raise ValueError(f'Candidate feature(s) have no training observations: {", ".join(empty_columns)}')
+        empty_columns = features.columns[
+            features.isna().all(axis=0)
+        ].tolist()
+
+        raise ValueError(
+            'Candidate feature(s) have no training observations: '
+            f'{", ".join(empty_columns)}'
+        )
+
     labels = frame[target_column].astype(str).str.upper()
+
     if not set(labels.unique()) <= set(OUTCOME_CLASSES):
-        raise ValueError('Candidate target contains an unsupported risk class.')
+        raise ValueError(
+            'Candidate target contains an unsupported risk class.'
+        )
+
     training_labels = labels[masks['training']]
+
     encoder = LabelEncoder().fit(training_labels)
+
     try:
-        encoded = {name: encoder.transform(labels[mask]) for name, mask in masks.items()}
+        encoded = {
+            name: encoder.transform(labels[mask])
+            for name, mask in masks.items()
+        }
     except ValueError as exc:
-        raise ValueError('A validation or test period contains a class absent from earlier training periods.') from exc
+        raise ValueError(
+            'A validation or test period contains a class '
+            'absent from earlier training periods.'
+        ) from exc
+
     if len(encoder.classes_) < 2:
-        raise ValueError('Temporal training observations must contain at least two risk classes.')
+        raise ValueError(
+            'Temporal training observations must contain '
+            'at least two risk classes.'
+        )
+
     label_names = encoder.classes_.tolist()
+
+    # Select candidate algorithm.
+    if algorithm == 'random_forest':
+        classifier = RandomForestClassifier(
+            n_estimators=300,
+            min_samples_leaf=2,
+            class_weight='balanced',
+            random_state=random_seed,
+            n_jobs=-1,
+        )
+
+        hyperparameters = {
+            'n_estimators': 300,
+            'min_samples_leaf': 2,
+            'class_weight': 'balanced',
+            'random_state': random_seed,
+            'n_jobs': -1,
+        }
+
+    else:
+        classifier = LogisticRegression(
+            max_iter=2000,
+            class_weight='balanced',
+            random_state=random_seed,
+        )
+
+        hyperparameters = {
+            'max_iter': 2000,
+            'class_weight': 'balanced',
+            'random_state': random_seed,
+        }
 
     pipeline = Pipeline([
         ('imputer', SimpleImputer(strategy='median')),
-        ('classifier', LogisticRegression(max_iter=2000, class_weight='balanced', random_state=random_seed)),
+        ('classifier', classifier),
     ])
-    pipeline.fit(features.loc[masks['training'], feature_contract], encoded['training'])
+
+    # Train only on the temporal training split.
+    pipeline.fit(
+        features.loc[masks['training'], feature_contract],
+        encoded['training'],
+    )
+
     split_metrics: dict[str, dict[str, Any]] = {}
     split_predictions: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
     for name in ('validation', 'test'):
-        split_features = features.loc[masks[name], feature_contract]
+        split_features = features.loc[
+            masks[name],
+            feature_contract,
+        ]
+
         expected = encoded[name]
-        predicted = pipeline.predict(split_features).astype(int)
-        probabilities = pipeline.predict_proba(split_features)
-        split_metrics[name] = _metrics(expected, predicted, probabilities, label_names)
-        split_predictions[name] = (predicted, probabilities)
+
+        predicted = pipeline.predict(
+            split_features
+        ).astype(int)
+
+        probabilities = pipeline.predict_proba(
+            split_features
+        )
+
+        split_metrics[name] = _metrics(
+            expected,
+            predicted,
+            probabilities,
+            label_names,
+        )
+
+        split_predictions[name] = (
+            predicted,
+            probabilities,
+        )
 
     trained_at = datetime.now(timezone.utc).isoformat()
-    model_version = f'candidate-{dataset_fingerprint[:12]}-{algorithm}-{datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")}'
-    classifier = pipeline.named_steps['classifier']
-    validation_features = features.loc[masks['validation'], feature_contract]
+
+    model_version = (
+        f'candidate-{dataset_fingerprint[:12]}-'
+        f'{algorithm}-'
+        f'{datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")}'
+    )
+
+    validation_features = features.loc[
+        masks['validation'],
+        feature_contract,
+    ]
+
     permutation = permutation_importance(
         pipeline,
         validation_features,
@@ -223,16 +496,29 @@ def train_candidate(
         n_repeats=10,
         random_state=random_seed,
     )
+
     feature_importance = {
-        'method': 'validation-period permutation importance; scoring=macro_f1',
+        'method': (
+            'validation-period permutation importance; '
+            'scoring=macro_f1'
+        ),
         'split': 'validation',
         'sample_count': int(len(validation_features)),
         'features': {
-            name: {'mean': float(mean), 'std': float(std)}
-            for name, mean, std in zip(feature_contract, permutation.importances_mean, permutation.importances_std)
+            name: {
+                'mean': float(mean),
+                'std': float(std),
+            }
+            for name, mean, std in zip(
+                feature_contract,
+                permutation.importances_mean,
+                permutation.importances_std,
+            )
         },
     }
+
     test_predicted, test_probabilities = split_predictions['test']
+
     subgroup_evaluation = _subgroup_evaluation(
         frame.loc[masks['test']].reset_index(drop=True),
         encoded['test'],
@@ -240,6 +526,7 @@ def train_candidate(
         test_probabilities,
         label_names,
     )
+
     metadata: dict[str, Any] = {
         'model_version': model_version,
         'dataset_id': dataset_id,
@@ -253,41 +540,81 @@ def train_candidate(
         'validation_periods': split['validation_periods'],
         'test_periods': split['test_periods'],
         'algorithm': algorithm,
-        'hyperparameters': {'max_iter': 2000, 'class_weight': 'balanced', 'random_state': random_seed},
+        'hyperparameters': hyperparameters,
         'random_seed': random_seed,
         'training_timestamp': trained_at,
         'software_versions': {
-            'python': '.'.join(map(str, __import__('sys').version_info[:3])),
+            'python': '.'.join(
+                map(str, __import__('sys').version_info[:3])
+            ),
             'scikit_learn': _package_version('scikit-learn'),
             'numpy': _package_version('numpy'),
             'pandas': _package_version('pandas'),
             'shap': _package_version('shap'),
         },
-        'sample_counts': {name: int(mask.sum()) for name, mask in masks.items()},
-        'class_distribution': {label: int((training_labels == label).sum()) for label in label_names},
+        'sample_counts': {
+            name: int(mask.sum())
+            for name, mask in masks.items()
+        },
+        'class_distribution': {
+            label: int((training_labels == label).sum())
+            for label in label_names
+        },
         'validation_metrics': split_metrics['validation'],
         'test_metrics': split_metrics['test'],
         'feature_importance': feature_importance,
         'subgroup_evaluation': subgroup_evaluation,
-        'shap_metadata': {'method': 'permutation SHAP on candidate pipeline class probability', 'generated': False},
+        'shap_metadata': {
+            'method': 'permutation SHAP on candidate pipeline class probability',
+            'generated': False,
+        },
         'status': 'candidate',
     }
+
     output_directory = Path(output_directory).resolve()
-    output_directory.mkdir(parents=True, exist_ok=True)
+    output_directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
     artifact_path = output_directory / f'{model_version}.joblib'
-    background = features.loc[masks['training'], feature_contract].sample(min(40, int(masks['training'].sum())), random_state=random_seed).to_numpy(dtype=float)
-    joblib.dump({
-        'pipeline': pipeline,
-        'label_encoder': encoder,
-        'metadata': metadata,
-        'feature_contract': feature_contract,
-        'background': background,
-    }, artifact_path)
-    artifact_hash = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+
+    background = features.loc[
+        masks['training'],
+        feature_contract,
+    ].sample(
+        min(40, int(masks['training'].sum())),
+        random_state=random_seed,
+    ).to_numpy(dtype=float)
+
+    joblib.dump(
+        {
+            'pipeline': pipeline,
+            'label_encoder': encoder,
+            'metadata': metadata,
+            'feature_contract': feature_contract,
+            'background': background,
+        },
+        artifact_path,
+    )
+
+    artifact_hash = hashlib.sha256(
+        artifact_path.read_bytes()
+    ).hexdigest()
+
     metadata['artifact_identifier'] = artifact_path.name
     metadata['artifact_hash'] = artifact_hash
-    artifact_path.with_suffix('.metrics.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
-    return {'artifact_path': artifact_path, 'artifact_hash': artifact_hash, 'metadata': metadata}
+
+    artifact_path.with_suffix('.metrics.json').write_text(
+        json.dumps(metadata, indent=2),
+        encoding='utf-8',
+    )
+
+    return {
+        'artifact_path': artifact_path,
+        'artifact_hash': artifact_hash,
+        'metadata': metadata,
+    }
 
 
 def evaluate_common_test_set(
@@ -296,115 +623,376 @@ def evaluate_common_test_set(
     candidate_artifact_path: Path,
     production_artifact_path: Path,
 ) -> dict[str, Any]:
+
     if frame.empty:
-        raise ValueError('A common test set must contain at least one observation.')
+        raise ValueError(
+            'A common test set must contain at least one observation.'
+        )
+
     required_provenance = {
-        *FEATURES, 'risk_target', 'student_identifier', 'academic_period',
-        'independent_outcome_id', 'source_row_checksum', 'source_checksum',
-        'outcome_source', 'outcome_checksum',
+        *FEATURES,
+        'risk_target',
+        'student_identifier',
+        'academic_period',
+        'independent_outcome_id',
+        'source_row_checksum',
+        'source_checksum',
+        'outcome_source',
+        'outcome_checksum',
     }
-    missing = sorted(required_provenance - set(frame.columns))
+
+    missing = sorted(
+        required_provenance - set(frame.columns)
+    )
+
     if missing:
-        raise ValueError(f'Common test set is missing required provenance or feature columns: {", ".join(missing)}')
-    if frame[['student_identifier', 'academic_period']].duplicated().any():
-        raise ValueError('Common test set contains duplicate student-period rows.')
-    if frame[['independent_outcome_id', 'source_row_checksum', 'source_checksum']].isna().any().any():
-        raise ValueError('Common test set is missing source snapshot or independent outcome identity.')
-    if frame['risk_target'].isna().any() or not set(frame['risk_target'].astype(str).str.upper()) <= set(OUTCOME_CLASSES):
-        raise ValueError('Common test set contains missing or unsupported independent outcomes.')
+        raise ValueError(
+            'Common test set is missing required provenance '
+            f'or feature columns: {", ".join(missing)}'
+        )
+
+    if frame[
+        ['student_identifier', 'academic_period']
+    ].duplicated().any():
+        raise ValueError(
+            'Common test set contains duplicate student-period rows.'
+        )
+
+    if frame[
+        [
+            'independent_outcome_id',
+            'source_row_checksum',
+            'source_checksum',
+        ]
+    ].isna().any().any():
+        raise ValueError(
+            'Common test set is missing source snapshot '
+            'or independent outcome identity.'
+        )
+
+    if (
+        frame['risk_target'].isna().any()
+        or not set(
+            frame['risk_target'].astype(str).str.upper()
+        ) <= set(OUTCOME_CLASSES)
+    ):
+        raise ValueError(
+            'Common test set contains missing or unsupported independent outcomes.'
+        )
 
     candidate = joblib.load(candidate_artifact_path)
     production = joblib.load(production_artifact_path)
-    for name, artifact in (('candidate', candidate), ('production', production)):
-        if not isinstance(artifact, dict) or not isinstance(artifact.get('pipeline'), Pipeline):
-            raise ValueError(f'The {name} artifact does not contain a compatible pipeline.')
+
+    for name, artifact in (
+        ('candidate', candidate),
+        ('production', production),
+    ):
+        if (
+            not isinstance(artifact, dict)
+            or not isinstance(artifact.get('pipeline'), Pipeline)
+        ):
+            raise ValueError(
+                f'The {name} artifact does not contain a compatible pipeline.'
+            )
+
         metadata = artifact.get('metadata')
+
         if not isinstance(metadata, dict):
-            raise ValueError(f'The {name} artifact does not contain model metadata.')
+            raise ValueError(
+                f'The {name} artifact does not contain model metadata.'
+            )
+
         artifact_contract = artifact.get('feature_contract')
+
         if name == 'production' and artifact_contract is None:
-            artifact_contract = metadata.get('feature_contract', FEATURES)
+            artifact_contract = metadata.get(
+                'feature_contract',
+                FEATURES,
+            )
+
         if artifact_contract != FEATURES:
-            raise ValueError(f'The {name} artifact does not use the ordered production feature contract.')
+            raise ValueError(
+                f'The {name} artifact does not use '
+                'the ordered production feature contract.'
+            )
+
         encoder = artifact.get('label_encoder')
-        if encoder is None or set(map(str, getattr(encoder, 'classes_', []))) != set(OUTCOME_CLASSES):
-            raise ValueError(f'The {name} artifact does not support all independent outcome classes.')
-        if not callable(getattr(artifact['pipeline'], 'predict_proba', None)):
-            raise ValueError(f'The {name} artifact does not provide class probabilities.')
-        if getattr(artifact['pipeline'], 'n_features_in_', len(FEATURES)) != len(FEATURES):
-            raise ValueError(f'The {name} artifact has an incompatible feature width.')
 
-    features = frame[FEATURES].apply(pd.to_numeric, errors='coerce')
-    if features.isna().any().any() or not np.isfinite(features.to_numpy(dtype=float)).all():
-        raise ValueError('Common test set features must all be finite numeric values.')
-    class_index = {label: index for index, label in enumerate(OUTCOME_CLASSES)}
-    expected = frame['risk_target'].astype(str).str.upper().map(class_index).to_numpy(dtype=int)
+        if (
+            encoder is None
+            or set(
+                map(str, getattr(encoder, 'classes_', []))
+            ) != set(OUTCOME_CLASSES)
+        ):
+            raise ValueError(
+                f'The {name} artifact does not support all independent outcome classes.'
+            )
 
-    def common_probabilities(artifact: dict[str, Any]) -> np.ndarray:
+        if not callable(
+            getattr(artifact['pipeline'], 'predict_proba', None)
+        ):
+            raise ValueError(
+                f'The {name} artifact does not provide class probabilities.'
+            )
+
+        if (
+            getattr(
+                artifact['pipeline'],
+                'n_features_in_',
+                len(FEATURES),
+            ) != len(FEATURES)
+        ):
+            raise ValueError(
+                f'The {name} artifact has an incompatible feature width.'
+            )
+
+    features = frame[FEATURES].apply(
+        pd.to_numeric,
+        errors='coerce',
+    )
+
+    if (
+        features.isna().any().any()
+        or not np.isfinite(
+            features.to_numpy(dtype=float)
+        ).all()
+    ):
+        raise ValueError(
+            'Common test set features must all be finite numeric values.'
+        )
+
+    class_index = {
+        label: index
+        for index, label in enumerate(OUTCOME_CLASSES)
+    }
+
+    expected = (
+        frame['risk_target']
+        .astype(str)
+        .str.upper()
+        .map(class_index)
+        .to_numpy(dtype=int)
+    )
+
+    def common_probabilities(
+        artifact: dict[str, Any],
+    ) -> np.ndarray:
+
         pipeline = artifact['pipeline']
         encoder: LabelEncoder = artifact['label_encoder']
-        encoded_classes = np.asarray(pipeline.classes_, dtype=int)
-        labels = encoder.inverse_transform(encoded_classes)
-        raw = np.asarray(pipeline.predict_proba(features[FEATURES]), dtype=float)
-        normalized = np.zeros((len(frame), len(OUTCOME_CLASSES)), dtype=float)
+
+        encoded_classes = np.asarray(
+            pipeline.classes_,
+            dtype=int,
+        )
+
+        labels = encoder.inverse_transform(
+            encoded_classes
+        )
+
+        raw = np.asarray(
+            pipeline.predict_proba(features[FEATURES]),
+            dtype=float,
+        )
+
+        normalized = np.zeros(
+            (len(frame), len(OUTCOME_CLASSES)),
+            dtype=float,
+        )
+
         for column, label in enumerate(labels):
-            normalized[:, class_index[str(label).upper()]] = raw[:, column]
+            normalized[
+                :,
+                class_index[str(label).upper()],
+            ] = raw[:, column]
+
         return normalized
 
     candidate_probabilities = common_probabilities(candidate)
     production_probabilities = common_probabilities(production)
-    candidate_predicted = np.argmax(candidate_probabilities, axis=1)
-    production_predicted = np.argmax(production_probabilities, axis=1)
-    identity_rows = frame[[
-        'student_identifier', 'academic_period', 'independent_outcome_id',
-        'source_row_checksum', 'source_checksum', 'outcome_source',
-        'outcome_checksum', 'risk_target',
-    ]].sort_values(['student_identifier', 'academic_period']).to_dict(orient='records')
-    identity_hash = hashlib.sha256(json.dumps(
-        identity_rows, sort_keys=True, separators=(',', ':'), default=str,
-    ).encode('utf-8')).hexdigest()
+
+    candidate_predicted = np.argmax(
+        candidate_probabilities,
+        axis=1,
+    )
+
+    production_predicted = np.argmax(
+        production_probabilities,
+        axis=1,
+    )
+
+    identity_rows = frame[
+        [
+            'student_identifier',
+            'academic_period',
+            'independent_outcome_id',
+            'source_row_checksum',
+            'source_checksum',
+            'outcome_source',
+            'outcome_checksum',
+            'risk_target',
+        ]
+    ].sort_values(
+        ['student_identifier', 'academic_period']
+    ).to_dict(orient='records')
+
+    identity_hash = hashlib.sha256(
+        json.dumps(
+            identity_rows,
+            sort_keys=True,
+            separators=(',', ':'),
+            default=str,
+        ).encode('utf-8')
+    ).hexdigest()
+
     return {
         'sample_count': len(frame),
-        'periods': sorted(frame['academic_period'].astype(str).unique().tolist()),
+        'periods': sorted(
+            frame['academic_period'].astype(str).unique().tolist()
+        ),
         'row_identity_sha256': identity_hash,
-        'outcome_source': 'same imported point-in-time feature rows and independent recorded outcomes',
-        'candidate': _metrics(expected, candidate_predicted, candidate_probabilities, list(OUTCOME_CLASSES)),
-        'production': _metrics(expected, production_predicted, production_probabilities, list(OUTCOME_CLASSES)),
+        'outcome_source': (
+            'same imported point-in-time feature rows '
+            'and independent recorded outcomes'
+        ),
+        'candidate': _metrics(
+            expected,
+            candidate_predicted,
+            candidate_probabilities,
+            list(OUTCOME_CLASSES),
+        ),
+        'production': _metrics(
+            expected,
+            production_predicted,
+            production_probabilities,
+            list(OUTCOME_CLASSES),
+        ),
     }
 
 
-def explain_candidate(artifact_path: Path, feature_values: dict[str, float], *, target_class: str | None = None) -> dict[str, Any]:
+def explain_candidate(
+    artifact_path: Path,
+    feature_values: dict[str, float],
+    *,
+    target_class: str | None = None,
+) -> dict[str, Any]:
+
     artifact = joblib.load(artifact_path)
+
     contract = artifact['feature_contract']
-    missing = sorted(set(contract) - set(feature_values))
-    extra = sorted(set(feature_values) - set(contract))
+
+    missing = sorted(
+        set(contract) - set(feature_values)
+    )
+
+    extra = sorted(
+        set(feature_values) - set(contract)
+    )
+
     if missing or extra:
-        raise ValueError(f'Candidate SHAP input contract mismatch; missing={missing}, unsupported={extra}')
-    frame = pd.DataFrame([{name: float(feature_values[name]) for name in contract}], columns=contract)
+        raise ValueError(
+            'Candidate SHAP input contract mismatch; '
+            f'missing={missing}, unsupported={extra}'
+        )
+
+    frame = pd.DataFrame(
+        [
+            {
+                name: float(feature_values[name])
+                for name in contract
+            }
+        ],
+        columns=contract,
+    )
+
     pipeline = artifact['pipeline']
     encoder: LabelEncoder = artifact['label_encoder']
+
     labels = encoder.classes_.tolist()
+
     probabilities = pipeline.predict_proba(frame)[0]
-    target = target_class.upper() if target_class else labels[int(np.argmax(probabilities))]
+
+    target = (
+        target_class.upper()
+        if target_class
+        else labels[int(np.argmax(probabilities))]
+    )
+
     if target not in labels:
-        raise ValueError(f'Unknown candidate SHAP target class: {target}')
+        raise ValueError(
+            f'Unknown candidate SHAP target class: {target}'
+        )
+
     target_index = labels.index(target)
-    background = np.asarray(artifact['background'], dtype=float)
+
+    background = np.asarray(
+        artifact['background'],
+        dtype=float,
+    )
 
     def class_probability(values: np.ndarray) -> np.ndarray:
-        candidate_frame = pd.DataFrame(values, columns=contract)
-        return pipeline.predict_proba(candidate_frame)[:, target_index]
+        candidate_frame = pd.DataFrame(
+            values,
+            columns=contract,
+        )
 
-    explainer = shap.Explainer(class_probability, background, feature_names=contract, algorithm='permutation')
-    explanation = explainer(frame.to_numpy(dtype=float), max_evals=2 * len(contract) + 1)
-    contributions = np.asarray(explanation.values)[0]
-    base_value = float(np.asarray(explanation.base_values).reshape(-1)[0])
-    probability = float(probabilities[target_index])
-    reconstruction = base_value + float(np.sum(contributions))
-    if not np.isclose(reconstruction, probability, atol=1e-4):
-        raise ValueError('Candidate SHAP values failed the probability additivity check.')
-    contribution_map = {name: float(value) for name, value in zip(contract, contributions)}
-    ranked = sorted(contribution_map.items(), key=lambda item: abs(item[1]), reverse=True)
+        return pipeline.predict_proba(
+            candidate_frame
+        )[:, target_index]
+
+    explainer = shap.Explainer(
+        class_probability,
+        background,
+        feature_names=contract,
+        algorithm='permutation',
+    )
+
+    explanation = explainer(
+        frame.to_numpy(dtype=float),
+        max_evals=2 * len(contract) + 1,
+    )
+
+    contributions = np.asarray(
+        explanation.values
+    )[0]
+
+    base_value = float(
+        np.asarray(
+            explanation.base_values
+        ).reshape(-1)[0]
+    )
+
+    probability = float(
+        probabilities[target_index]
+    )
+
+    reconstruction = base_value + float(
+        np.sum(contributions)
+    )
+
+    if not np.isclose(
+        reconstruction,
+        probability,
+        atol=1e-4,
+    ):
+        raise ValueError(
+            'Candidate SHAP values failed the probability additivity check.'
+        )
+
+    contribution_map = {
+        name: float(value)
+        for name, value in zip(
+            contract,
+            contributions,
+        )
+    }
+
+    ranked = sorted(
+        contribution_map.items(),
+        key=lambda item: abs(item[1]),
+        reverse=True,
+    )
+
     return {
         'model_version': artifact['metadata']['model_version'],
         'target': f'P({target})',
@@ -412,13 +1000,29 @@ def explain_candidate(artifact_path: Path, feature_values: dict[str, float], *, 
         'probability': probability,
         'base_value': base_value,
         'contributions': contribution_map,
-        'feature_values': {name: float(frame.iloc[0][name]) for name in contract},
+        'feature_values': {
+            name: float(frame.iloc[0][name])
+            for name in contract
+        },
         'summary': [
-            f'{name.replace("_", " ").capitalize()} increased the candidate P({target}).' if value > 0
-            else f'{name.replace("_", " ").capitalize()} reduced the candidate P({target}).'
+            (
+                f'{name.replace("_", " ").capitalize()} '
+                f'increased the candidate P({target}).'
+                if value > 0
+                else
+                f'{name.replace("_", " ").capitalize()} '
+                f'reduced the candidate P({target}).'
+            )
             for name, value in ranked[:5]
         ],
-        'waterfall': [{'feature': name, 'value': float(frame.iloc[0][name]), 'contribution': value} for name, value in ranked],
+        'waterfall': [
+            {
+                'feature': name,
+                'value': float(frame.iloc[0][name]),
+                'contribution': value,
+            }
+            for name, value in ranked
+        ],
         'additivity_error': reconstruction - probability,
         'shap_method': 'permutation',
     }

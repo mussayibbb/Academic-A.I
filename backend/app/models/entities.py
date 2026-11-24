@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, event, select
+from sqlalchemy import JSON, Boolean, CheckConstraint, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, event, select
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.database import Base
@@ -35,6 +35,7 @@ class Student(Timestamps, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int | None] = mapped_column(ForeignKey('users.id', ondelete='SET NULL'), unique=True)
     student_id: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    usn: Mapped[str | None] = mapped_column(String(40), unique=True, index=True)
     full_name: Mapped[str] = mapped_column(String(160), index=True)
     email: Mapped[str | None] = mapped_column(String(320), unique=True)
     program: Mapped[str | None] = mapped_column(String(160))
@@ -45,8 +46,11 @@ class Student(Timestamps, Base):
     data_origin: Mapped[str] = mapped_column(String(32), default='LEGACY / UNVERIFIED', nullable=False)
     risk_level: Mapped[str] = mapped_column(String(20), default='LOW', index=True)
     risk_probability: Mapped[float] = mapped_column(Float, default=0.0)
-    previous_gpa: Mapped[float] = mapped_column(Float, default=0.0)
-    current_gpa: Mapped[float] = mapped_column(Float, default=0.0)
+    branch: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    previous_gpa: Mapped[float | None] = mapped_column(Float, nullable=True)
+    current_gpa: Mapped[float | None] = mapped_column(Float, nullable=True)
+    previous_cgpa: Mapped[float | None] = mapped_column(Float, nullable=True)
+    current_cgpa: Mapped[float | None] = mapped_column(Float, nullable=True)
     attendance: Mapped[float] = mapped_column(Float, default=0.0)
     assessment: Mapped[float] = mapped_column(Float, default=0.0)
     assignments_completed: Mapped[float] = mapped_column(Float, default=0.0)
@@ -394,6 +398,44 @@ class Mark(Timestamps, Base):
     recorded_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     student: Mapped[Student] = relationship(back_populates='marks')
     assessment: Mapped[Assessment] = relationship(back_populates='marks')
+
+
+class InternalAssessmentMark(Timestamps, Base):
+    __tablename__ = 'internal_assessment_marks'
+    __table_args__ = (
+        UniqueConstraint(
+            'student_id',
+            'subject_id',
+            'assessment_stage',
+            name='uq_internal_mark_student_subject_stage',
+        ),
+        CheckConstraint(
+            "assessment_stage IN ('INTERNAL_1', 'INTERNAL_2')",
+            name='ck_internal_mark_assessment_stage',
+        ),
+        CheckConstraint(
+            'marks IS NULL OR (marks >= 0 AND marks <= 25)',
+            name='ck_internal_mark_range',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    student_id: Mapped[int] = mapped_column(
+        ForeignKey('students.id', ondelete='CASCADE'),
+        index=True,
+    )
+    subject_id: Mapped[int] = mapped_column(
+        ForeignKey('subjects.id', ondelete='RESTRICT'),
+        index=True,
+    )
+    assessment_stage: Mapped[str] = mapped_column(String(20), index=True)
+    marks: Mapped[float | None] = mapped_column(Float, nullable=True)
+    import_batch_id: Mapped[int | None] = mapped_column(
+        ForeignKey('academic_data_import_batches.id', ondelete='SET NULL'),
+        index=True,
+    )
+    student: Mapped[Student] = relationship()
+    subject: Mapped[Subject] = relationship()
 
 
 class SubjectFocusPolicy(Base):

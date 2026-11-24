@@ -576,14 +576,26 @@ def test_demo_model_lists_details_and_simulation_from_candidate(
     assert simulation_data['after']['riskLevel'] in {'HIGH', 'MEDIUM', 'LOW'}
 
 
-def test_candidate_is_not_silently_selected_as_active_production_artifact():
+def test_demo_preview_is_separate_from_active_production_artifact():
     production = load_artifact(DEFAULT_ARTIFACT)
-    candidate_path = Path(__file__).resolve().parents[1] / 'models' / 'candidates' / 'risk_model_candidate.joblib'
+    candidate_path = (
+        Path(__file__).resolve().parents[1]
+        / 'models'
+        / 'candidates'
+        / 'risk_model_candidate.joblib'
+    )
     candidate = load_artifact(candidate_path)
 
     assert DEFAULT_ARTIFACT.resolve() != candidate_path.resolve()
-    assert production['metadata']['features'] != candidate['metadata']['features']
-    assert candidate['metadata']['target_label_provenance'] == 'transparent_rule_generated_demo_label'
+
+    assert production['metadata']['features'] == FEATURES
+    assert candidate['metadata']['features'] == FEATURES
+
+    assert (
+        candidate['metadata']['target_label_provenance']
+        == 'transparent_rule_generated_demo_label'
+    )
+    assert candidate['metadata']['demo_data'] is True
 
 
 def test_feature_importance_api_uses_candidate_and_only_canonical_features(

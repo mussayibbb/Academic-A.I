@@ -15,6 +15,7 @@ from backend.app.models.entities import (
     Course,
     Feedback,
     Intervention,
+    InternalAssessmentMark,
     InterventionDraft,
     InterventionReview,
     LearningActivity,

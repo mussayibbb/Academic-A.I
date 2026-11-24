@@ -1,22 +1,101 @@
 {
-  "model_version": "risk-20261122T140646Z",
+  "model_version": "risk-20261123T133328Z",
   "selected_model": "logistic_regression",
-  "trained_at": "2026-11-22T14:06:46.236155+00:00",
-  "training_rows": 248,
-  "evaluation_rows": 62,
+  "trained_at": "2026-11-23T13:33:28.820556+00:00",
+  "training_rows": 150,
+  "evaluation_rows": 38,
   "features": [
     "attendance",
-    "assessment",
-    "previous_gpa",
-    "current_gpa",
     "assignments_completed",
     "activity_per_week",
     "missing_submissions",
     "attendance_change",
-    "assessment_change",
-    "momentum_score"
+    "assignment_submission_rate"
   ],
+  "feature_contract": {
+    "attendance": {
+      "source": "Imported attendance observations or Student.attendance",
+      "meaning": "Attendance percentage.",
+      "scope": "global",
+      "model_input": true
+    },
+    "assignments_completed": {
+      "source": "Student.assignments_completed",
+      "meaning": "Assignments completed count.",
+      "scope": "global",
+      "model_input": true
+    },
+    "activity_per_week": {
+      "source": "Latest four AcademicMomentum(activity) values",
+      "meaning": "Mean weekly LMS/portal activity.",
+      "scope": "global",
+      "model_input": true
+    },
+    "missing_submissions": {
+      "source": "AssignmentStudent and Submission",
+      "meaning": "Assigned submissions minus submitted, late, or graded submissions.",
+      "scope": "global",
+      "model_input": true
+    },
+    "attendance_change": {
+      "source": "AcademicMomentum(attendance)",
+      "meaning": "Recent attendance percent change.",
+      "scope": "global",
+      "model_input": true
+    },
+    "assignment_submission_rate": {
+      "source": "Submitted, late, or graded submissions divided by assigned submissions",
+      "meaning": "Assignment submission percentage.",
+      "scope": "global",
+      "model_input": true
+    },
+    "fa1": {
+      "source": "StudentSubjectAcademicRecord.fa1",
+      "meaning": "Marks-related formative assessment 1.",
+      "scope": "subject",
+      "model_input": false
+    },
+    "fa2": {
+      "source": "StudentSubjectAcademicRecord.fa2",
+      "meaning": "Marks-related formative assessment 2.",
+      "scope": "subject",
+      "model_input": false
+    },
+    "previous_gpa": {
+      "source": "Student.previous_gpa",
+      "meaning": "Academic GPA; excluded from model.",
+      "scope": "global",
+      "model_input": false
+    },
+    "current_gpa": {
+      "source": "Student.current_gpa",
+      "meaning": "Academic GPA; excluded from model.",
+      "scope": "global",
+      "model_input": false
+    },
+    "assessment": {
+      "source": "Assessment observations",
+      "meaning": "Academic performance score; excluded from model.",
+      "scope": "global",
+      "model_input": false
+    },
+    "assessment_change": {
+      "source": "AcademicMomentum(assessment)",
+      "meaning": "Assessment-derived trend; excluded from model.",
+      "scope": "global",
+      "model_input": false
+    },
+    "momentum_score": {
+      "source": "Attendance and assessment trends",
+      "meaning": "Academic trend derived in part from assessment marks; excluded from model.",
+      "scope": "global",
+      "model_input": false
+    }
+  },
+  "feature_contract_version": "risk-features-v2",
   "target": "risk_label",
+  "target_label_provenance": "transparent_rule_generated_demo_label",
+  "target_definition": "Transparent rule-generated three-class label from attendance, assignment submission, missing assignments, LMS engagement and attendance change.",
   "class_labels": [
     "HIGH",
     "LOW",
@@ -24,10 +103,30 @@
   ],
   "evaluation": {
     "logistic_regression": {
-      "accuracy": 1.0,
-      "precision_weighted": 1.0,
-      "recall_weighted": 1.0,
-      "f1_weighted": 1.0,
+      "accuracy": 0.8947368421052632,
+      "precision_macro": 0.9055555555555556,
+      "recall_macro": 0.8952991452991453,
+      "f1_macro": 0.897888198757764,
+      "precision_weighted": 0.9030701754385964,
+      "recall_weighted": 0.8947368421052632,
+      "f1_weighted": 0.8963452108532198,
+      "per_class": {
+        "HIGH": {
+          "precision": 1.0,
+          "recall": 0.9166666666666666,
+          "f1": 0.9565217391304348
+        },
+        "LOW": {
+          "precision": 0.9166666666666666,
+          "recall": 0.8461538461538461,
+          "f1": 0.88
+        },
+        "MEDIUM": {
+          "precision": 0.8,
+          "recall": 0.9230769230769231,
+          "f1": 0.8571428571428571
+        }
+      },
       "labels": [
         "HIGH",
         "LOW",
@@ -35,27 +134,47 @@
       ],
       "confusion_matrix": [
         [
-          13,
+          11,
           0,
-          0
+          1
         ],
         [
           0,
-          28,
-          0
+          11,
+          2
         ],
         [
           0,
-          0,
-          21
+          1,
+          12
         ]
       ]
     },
     "random_forest": {
-      "accuracy": 1.0,
-      "precision_weighted": 1.0,
-      "recall_weighted": 1.0,
-      "f1_weighted": 1.0,
+      "accuracy": 0.8947368421052632,
+      "precision_macro": 0.9055555555555556,
+      "recall_macro": 0.8952991452991453,
+      "f1_macro": 0.897888198757764,
+      "precision_weighted": 0.9030701754385964,
+      "recall_weighted": 0.8947368421052632,
+      "f1_weighted": 0.8963452108532198,
+      "per_class": {
+        "HIGH": {
+          "precision": 1.0,
+          "recall": 0.9166666666666666,
+          "f1": 0.9565217391304348
+        },
+        "LOW": {
+          "precision": 0.9166666666666666,
+          "recall": 0.8461538461538461,
+          "f1": 0.88
+        },
+        "MEDIUM": {
+          "precision": 0.8,
+          "recall": 0.9230769230769231,
+          "f1": 0.8571428571428571
+        }
+      },
       "labels": [
         "HIGH",
         "LOW",
@@ -63,23 +182,27 @@
       ],
       "confusion_matrix": [
         [
-          13,
+          11,
           0,
-          0
+          1
         ],
         [
           0,
-          28,
-          0
+          11,
+          2
         ],
         [
           0,
-          0,
-          21
+          1,
+          12
         ]
       ]
     }
   },
   "dataset": "C:\\Users\\mussa\\academic-ai-for-impact\\data\\processed\\DSstudents_processed.csv",
+  "dataset_filename": "DSstudents_processed.csv",
+  "dataset_fingerprint": "d9d4e7c6a5f79292b911211e08afe346f9edad6608ef29a695f6502fe67dc47a",
+  "dataset_checksum": "d9d4e7c6a5f79292b911211e08afe346f9edad6608ef29a695f6502fe67dc47a",
+  "dataset_row_count": 150,
   "demo_data": true
 }

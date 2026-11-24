@@ -16,10 +16,13 @@ export type StudentRecord = {
   risk_status_message?: string | null;
   attendance: number;
   assessment: number;
-  previous_gpa: number;
-  current_gpa: number;
+  previous_gpa: number | null;
+  current_gpa: number | null;
+  previous_cgpa?: number | null;
+  current_cgpa?: number | null;
   assignments_completed: number;
   momentum_trend?: string;
+  branch?: string | null;
 };
 
 export type StudentDirectoryOptions = {

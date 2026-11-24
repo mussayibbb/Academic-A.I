@@ -1,4 +1,4 @@
-import csv
+﻿import csv
 import hashlib
 import io
 from datetime import datetime, timezone
@@ -31,15 +31,11 @@ from backend.app.services.model_deployment import verify_candidate_artifact
 def _feature_values() -> dict[str, float]:
     return {
         'attendance': 82.0,
-        'assessment': 74.0,
-        'previous_gpa': 3.1,
-        'current_gpa': 3.2,
         'assignments_completed': 6.0,
         'activity_per_week': 2.5,
         'missing_submissions': 1.0,
         'attendance_change': -1.5,
-        'assessment_change': 2.0,
-        'momentum_score': 0.25,
+        'assignment_submission_rate': 0.85,
     }
 
 
@@ -95,7 +91,7 @@ def test_snapshot_import_requires_all_dated_features_and_preserves_immutable_pro
         db.rollback()
 
         missing_date = {name: '2026-09-01T00:00:00Z' for name in FEATURES}
-        missing_date['momentum_score'] = ''
+        missing_date['assignment_submission_rate'] = ''
         rejected = import_academic_data(
             db,
             user_id=teacher.id,
@@ -130,7 +126,7 @@ def test_explicit_cutoff_requires_timezone_and_normalizes_equivalent_instants(cl
 @pytest.mark.parametrize('timestamp', ['2026-09-01T09:00:00', 'not-a-timestamp'])
 def test_snapshot_import_rejects_naive_or_invalid_temporal_evidence(client, timestamp):
     dates = {name: '2026-09-01T00:00:00Z' for name in FEATURES}
-    dates['assessment'] = timestamp
+    dates['attendance'] = timestamp
     with client.app.state.test_session_factory() as db:
         teacher = db.query(User).filter_by(email='teacher@example.com').one()
         result = import_academic_data(
@@ -243,7 +239,7 @@ def test_feature_snapshot_conflicts_are_rejected_without_overwriting_existing_ev
             content=_snapshot_csv(values=original),
             dataset_type='production_feature_snapshots',
         )
-        changed = {**original, 'assessment': 99.0}
+        changed = {**original, 'attendance': 99.0}
         result = import_academic_data(
             db,
             user_id=teacher.id,
@@ -260,9 +256,9 @@ def test_feature_snapshot_conflicts_are_rejected_without_overwriting_existing_ev
 
 @pytest.mark.parametrize(('feature', 'value'), [
     ('attendance', 101.0),
-    ('previous_gpa', 4.1),
+    ('assignment_submission_rate', 1.01),
     ('missing_submissions', -1.0),
-    ('momentum_score', 'nan'),
+    ('activity_per_week', 'nan'),
 ])
 def test_snapshot_import_rejects_invalid_production_feature_values(client, feature, value):
     values = {**_feature_values(), feature: value}
@@ -388,7 +384,7 @@ def test_teacher_api_blocks_training_and_export_includes_contract_for_synthetic_
     ]
     exported = client.get('/api/v1/ml/phase3/dataset', params=query, headers=headers)
     assert exported.status_code == 200
-    assert 'attendance,assessment,previous_gpa,current_gpa' in exported.text.splitlines()[0]
+    assert ','.join(FEATURES) in exported.text.splitlines()[0]
     assert exported.headers['x-training-eligible'] == 'false'
 
     readiness = client.get('/api/v1/ml/phase3/readiness', headers=headers)
@@ -426,15 +422,11 @@ def _synthetic_training_frame() -> pd.DataFrame:
                 'outcome_source': 'synthetic test fixture only',
                 'source_filename': 'synthetic-test-fixture.csv',
                 'attendance': float(50 + class_index * 15 + student_number % 5 + period_index),
-                'assessment': float(45 + class_index * 18 + student_number % 7 + period_index),
-                'previous_gpa': float(1.2 + class_index * 0.8 + (student_number % 4) / 10),
-                'current_gpa': float(1.3 + class_index * 0.8 + (student_number % 3) / 10),
                 'assignments_completed': float(2 + class_index * 2 + student_number % 4),
                 'activity_per_week': float(1 + class_index + (student_number % 5) / 2),
                 'missing_submissions': float(6 - class_index * 2 + student_number % 3),
                 'attendance_change': float(-2 + class_index * 2 + period_index / 10),
-                'assessment_change': float(-3 + class_index * 3 + period_index / 10),
-                'momentum_score': float(-0.5 + class_index * 0.5 + period_index / 10),
+                'assignment_submission_rate': float(0.35 + class_index * 0.25 + (student_number % 5 + period_index) / 100),
             })
     return pd.DataFrame(rows)
 
@@ -499,3 +491,4 @@ def test_synthetic_candidate_artifact_passes_strict_contract_and_common_test_set
     assert len(comparison['row_identity_sha256']) == 64
     assert comparison['candidate']['sample_count'] == comparison['production']['sample_count'] == 60
     assert comparison['candidate']['labels'] == comparison['production']['labels'] == ['HIGH', 'MEDIUM', 'LOW']
+

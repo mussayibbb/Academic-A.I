@@ -4,6 +4,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 
+
 class StudentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -16,7 +17,9 @@ class StudentOut(BaseModel):
     semester: str | None = None
     section: str | None = None
     department: str | None = None
+    branch: str | None = None
     course_id: int | None = None
+
     data_origin: str = 'LEGACY / UNVERIFIED'
     risk_level: str = 'LOW'
     risk_probability: float = Field(default=0.0, description='Probability of the predicted risk_level class.')
@@ -24,8 +27,12 @@ class StudentOut(BaseModel):
     risk_status: str = 'available'
     risk_status_message: str | None = None
     class_probabilities: dict[str, float] = Field(default_factory=dict)
-    previous_gpa: float = 0.0
-    current_gpa: float = 0.0
+
+    previous_gpa: float | None = None
+    current_gpa: float | None = None
+    previous_cgpa: float | None = None
+    current_cgpa: float | None = None
+
     attendance: float = 0.0
     assessment: float = 0.0
     assignments_completed: float = 0.0
@@ -40,13 +47,20 @@ class StudentSelfOut(BaseModel):
     full_name: str
     program: str | None = None
     year: str | None = None
+    semester: str | None = None
     section: str | None = None
     department: str | None = None
-    previous_gpa: float = 0.0
-    current_gpa: float = 0.0
+    branch: str | None = None
+
+    previous_gpa: float | None = None
+    current_gpa: float | None = None
+    previous_cgpa: float | None = None
+    current_cgpa: float | None = None
+
     attendance: float = 0.0
     assessment: float = 0.0
     assignments_completed: float = 0.0
+
 
 
 class AssignmentCreate(BaseModel):

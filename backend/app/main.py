@@ -1,4 +1,4 @@
-from datetime import date, datetime, timedelta, timezone
+﻿from datetime import date, datetime, timedelta, timezone
 import hashlib
 import csv
 import io
@@ -186,6 +186,7 @@ from backend.app.services.model_deployment import (
     verify_candidate_artifact,
 )
 from backend.app.services.academic_imports import ImportValidationError, import_academic_data
+from backend.app.services.student_cohort_imports import import_student_cohort
 from backend.app.services.early_warning_snapshots import weekly_snapshot_trend
 from ai.risk.academic_dataset import DATASET_FIELDS, build_observation_rows, readiness_report
 from ai.risk.phase3 import (
@@ -304,7 +305,7 @@ def early_warning_authorized_student(db: Session, user: User, student_id: int) -
         or (student.course_id is None and student.section in sections)
     )
     if not authorized:
-        raise HTTPException(status_code=403, detail='Student is outside the teacher’s assigned scope.')
+        raise HTTPException(status_code=403, detail='Student is outside the teacherâ€™s assigned scope.')
     return student
 
 
@@ -1147,6 +1148,50 @@ async def upload_academic_data(
         db.commit()
     return result
 
+
+@app.post(f'{settings.api_v1_prefix}/academic-data/cohort-import')
+async def upload_student_cohort(
+    user: CurrentTeacher,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    content = await file.read(settings.max_upload_size + 1)
+    await file.close()
+
+    if len(content) > settings.max_upload_size:
+        raise HTTPException(
+            status_code=413,
+            detail=f'File exceeds the {settings.max_upload_size}-byte upload limit.',
+        )
+
+    try:
+        result = import_student_cohort(
+            db,
+            user_id=user.id,
+            filename=file.filename or '',
+            content=content,
+        )
+    except ImportValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                'message': str(exc),
+                'validation_errors': exc.errors,
+            },
+        ) from exc
+
+    audit(
+        db,
+        user,
+        'student_cohort.imported',
+        'academic_data_import_batch',
+        result.get('batch_id'),
+    )
+
+    if not result.get('duplicate_import'):
+        db.commit()
+
+    return result
 
 @app.get(f'{settings.api_v1_prefix}/academic-data/imports')
 def list_academic_imports(user: CurrentTeacher, db: Session = Depends(get_db)) -> list[dict[str, Any]]:
@@ -2175,7 +2220,7 @@ def review_learning_answer(
         if payload.marks_awarded is None or not payload.reason:
             raise HTTPException(status_code=422, detail='A mark and reason are required for a grade override.')
         if payload.marks_awarded > question.marks:
-            raise HTTPException(status_code=422, detail=f'The override cannot exceed this question’s {question.marks:g} marks.')
+            raise HTTPException(status_code=422, detail=f'The override cannot exceed this questionâ€™s {question.marks:g} marks.')
         answer.original_marks_awarded = answer.original_marks_awarded if answer.original_marks_awarded is not None else previous_marks
         answer.marks_awarded = payload.marks_awarded
         answer.feedback = payload.feedback or answer.feedback
@@ -3118,20 +3163,28 @@ def _validate_student_course(course_id: int | None, db: Session) -> None:
 
 def _validate_student_unique_fields(
     student_id: str | None,
+    usn: str | None,
     email: str | None,
     db: Session,
     *,
     exclude_student_id: int | None = None,
 ) -> None:
     student_id_query = db.query(Student.id).filter(func.lower(Student.student_id) == student_id.lower()) if student_id else None
+    usn_query = db.query(Student.id).filter(func.lower(Student.usn) == usn.lower()) if usn else None
     email_query = db.query(Student.id).filter(func.lower(Student.email) == email.lower()) if email else None
+
     if exclude_student_id is not None:
         if student_id_query is not None:
             student_id_query = student_id_query.filter(Student.id != exclude_student_id)
+        if usn_query is not None:
+            usn_query = usn_query.filter(Student.id != exclude_student_id)
         if email_query is not None:
             email_query = email_query.filter(Student.id != exclude_student_id)
+
     if student_id_query is not None and student_id_query.first():
         raise HTTPException(status_code=409, detail='That student ID is already in use.')
+    if usn_query is not None and usn_query.first():
+        raise HTTPException(status_code=409, detail='That USN is already in use.')
     if email_query is not None and email_query.first():
         raise HTTPException(status_code=409, detail='That email address is already in use.')
 
@@ -3308,19 +3361,29 @@ def student_management_stats(user: CurrentTeacher, db: Session = Depends(get_db)
         prediction_message = str(exc.detail)
 
     now = datetime.utcnow()
+
+    gpa_values = [
+          student.current_gpa
+          for student in students
+          if student.current_gpa is not None 
+       ] 
+
     return StudentStatsOut(
-        total=len(students),
-        high_risk=high_risk,
-        medium_risk=medium_risk,
-        low_risk=low_risk,
-        average_attendance=round(sum(student.attendance for student in students) / len(students), 2) if students else None,
-        average_gpa=round(sum(student.current_gpa for student in students) / len(students), 2) if students else None,
-        attention=attention,
-        recently_added=sum(
-            student.created_at is not None and student.created_at >= now - timedelta(days=30)
-            for student in students
-        ),
-        by_origin=origins,
+         total=len(students),
+         high_risk=high_risk,
+         medium_risk=medium_risk,
+         low_risk=low_risk,
+         average_attendance=round(
+              sum(student.attendance for student in students) / len(students), 2
+         ) if students else None,
+          average_gpa=round(sum(gpa_values) / len(gpa_values), 2) if gpa_values else None,
+          attention=attention,
+         recently_added=sum(
+             student.created_at is not None
+             and student.created_at >= now - timedelta(days=30)
+             for student in students
+       ),
+       by_origin=origins,
         prediction_status=prediction_status,
         prediction_message=prediction_message,
     )
@@ -3333,7 +3396,7 @@ def create_student_record(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     values = payload.model_dump()
-    _validate_student_unique_fields(values['student_id'], values['email'], db)
+    _validate_student_unique_fields(values['student_id'], values['usn'], values['email'], db)
     _validate_student_course(values['course_id'], db)
     student = Student(**values, data_origin='MANUALLY ADDED')
     db.add(student)
@@ -3368,6 +3431,7 @@ def update_student_record(
         raise HTTPException(status_code=422, detail='Provide at least one student field to update.')
     _validate_student_unique_fields(
         updates.get('student_id'),
+        updates.get('usn'),
         updates.get('email'),
         db,
         exclude_student_id=student.id,

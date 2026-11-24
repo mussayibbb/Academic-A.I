@@ -150,19 +150,32 @@ def _number(value: Any, column: str) -> float:
     return result
 
 
+
 def _date(value: Any, column: str, *, require_timezone: bool = False) -> datetime:
     if isinstance(value, datetime):
         parsed = value
+        date_only = False
     else:
+        raw_value = str(value).strip()
+        date_only = bool(re.fullmatch(r'\d{4}-\d{2}-\d{2}', raw_value))
         try:
-            parsed = datetime.fromisoformat(str(value).strip().replace('Z', '+00:00'))
+            parsed = datetime.fromisoformat(raw_value.replace('Z', '+00:00'))
         except (TypeError, ValueError) as exc:
             raise ValueError(f'{column} must be an ISO date or datetime.') from exc
+
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         if require_timezone:
-            raise ValueError(f'{column} must include a timezone offset for temporal verification.')
+            if not date_only:
+                raise ValueError(
+                    f'{column} must include a timezone offset for temporal verification.'
+                )
+            # Date-only academic observations represent calendar dates.
+            return parsed.replace(tzinfo=timezone.utc)
+
         return parsed
+
     return parsed.astimezone(timezone.utc)
+
 
 
 def _audit_values(values: dict[str, Any]) -> dict[str, Any]:
@@ -328,6 +341,7 @@ def import_academic_data(db: Session, *, user_id: int, filename: str, content: b
                     'assignments_completed': (0.0, None),
                     'activity_per_week': (0.0, None),
                     'missing_submissions': (0.0, None),
+                    'assignment_submission_rate': (0.0, 1.0),
                 }
                 for feature, value in feature_values.items():
                     minimum, maximum = bounds.get(feature, (None, None))
